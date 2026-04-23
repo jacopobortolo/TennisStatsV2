@@ -149,6 +149,16 @@ class MainWindow(QMainWindow):
         self.scrape_btn.clicked.connect(self._scrape_live_data)
         bar_layout.addWidget(self.scrape_btn)
 
+        # Manual extended-stats refresh (cloud handles this hourly;
+        # this button forces a local re-scrape on demand).
+        self.ext_btn = QPushButton("📊 Refresh Extended Stats")
+        self.ext_btn.setObjectName("accentBtn")
+        self.ext_btn.setToolTip(
+            "Manually scrape extended stats for the top 150 players.\n"
+            "Normally this data comes from the cloud sync at startup.")
+        self.ext_btn.clicked.connect(self._start_background_extended_scrape)
+        bar_layout.addWidget(self.ext_btn)
+
         parent_layout.addWidget(bar)
 
         # Progress bar
@@ -315,7 +325,6 @@ class MainWindow(QMainWindow):
         if success:
             self.status_label.setText("Ready")
             self._build_pages()
-            self._start_background_extended_scrape()
         else:
             self.status_label.setText("Error loading data")
             QMessageBox.critical(self, "Error",
@@ -366,8 +375,8 @@ class MainWindow(QMainWindow):
     def _scrape_live_data(self):
         self.scrape_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
-        # Pause background extended-stats scrape so it doesn't fight the
-        # live scraper for the SQLite write lock.
+        # If a manual extended-stats scrape is running, pause it so it
+        # doesn't fight the live scraper for the SQLite write lock.
         self._ext_stop_event.set()
         if self._ext_worker and self._ext_worker.isRunning():
             self._ext_worker.quit()
@@ -419,9 +428,10 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.critical(self, "Error",
                                  f"Scraping failed:\n{error_msg}")
-        # Resume background extended-stats scraper now that live scrape
-        # has released the write lock.
-        self._start_background_extended_scrape()
+        # Note: extended stats are no longer auto-scraped here.
+        # They are kept in sync via the cloud workflow (hourly) and
+        # merged into the local DB at app startup. Use the "Refresh
+        # Extended Stats" button if you need a manual local re-scrape.
 
     def _rebuild_pages(self):
         """Destroy and recreate all pages to reflect new data."""
@@ -437,13 +447,22 @@ class MainWindow(QMainWindow):
         self._switch_page(prev_page)
 
     # ------------------------------------------------------------------
-    # Background extended stats scraping
+    # Manual extended stats scraping
     # ------------------------------------------------------------------
 
     def _start_background_extended_scrape(self):
-        """Start scraping extended stats for top 150 players in background."""
+        """Manually scrape extended stats for top 150 players (per tour).
+
+        Triggered by the toolbar button only. The cloud workflow runs
+        the same scrape hourly and the result is merged at app startup,
+        so this is a fallback / on-demand refresh.
+        """
         if not self.db:
             return
+        if self._ext_worker and self._ext_worker.isRunning():
+            self.status_label.setText("Extended stats scrape already running")
+            return
+        self.ext_btn.setEnabled(False)
         self._ext_stop_event.clear()
         self._ext_worker = DataWorker(self._ext_scrape_task, self)
         self._ext_worker.progress.connect(self._on_ext_progress)
@@ -467,11 +486,12 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"🔄 {msg}")
 
     def _on_ext_done(self, success, error_msg):
+        self.ext_btn.setEnabled(True)
         if success:
             self.status_label.setText("Ready — extended stats updated")
+            self._rebuild_pages()
         else:
-            logger.warning("Background extended stats scrape failed: %s",
-                           error_msg)
+            logger.warning("Extended stats scrape failed: %s", error_msg)
             self.status_label.setText("Ready")
 
     # ------------------------------------------------------------------

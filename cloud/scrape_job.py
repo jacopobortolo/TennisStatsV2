@@ -13,11 +13,60 @@ This script is what the GitHub Actions workflow invokes hourly.
 from __future__ import annotations
 
 import argparse
+import io
 import logging
 import sys
 from datetime import datetime
 
+import pandas as pd
+import requests
+
 logger = logging.getLogger("cloud.scrape_job")
+
+
+PLAYERS_URLS = {
+    "atp": "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/atp_players.csv",
+    "wta": "https://raw.githubusercontent.com/JeffSackmann/tennis_wta/master/wta_players.csv",
+}
+
+
+def _seed_players_if_empty(db):
+    """Populate Turso ``players`` table on first run.
+
+    The scraper's name-resolution logic (``_resolve_ranking_name``) relies on
+    ``players`` to expand truncated ranking names like 'Daniel Mérida' into
+    the full 'Daniel Mérida Aguilar' that tennisabstract uses in its URLs.
+    Without this the scrape silently misses any player whose ranking name
+    is shorter than their CSV name.
+    """
+    try:
+        rs = db.conn.execute("SELECT COUNT(*) FROM players")
+        existing = rs.fetchone()[0]
+    except Exception:
+        existing = 0
+    if existing and existing > 100:
+        logger.info("players table already seeded (%d rows)", existing)
+        return
+
+    logger.info("Seeding players table from Sackmann CSVs...")
+    for tour, url in PLAYERS_URLS.items():
+        try:
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+            df = pd.read_csv(
+                io.StringIO(resp.text),
+                dtype={"player_id": str, "dob": str, "wikidata_id": str},
+                low_memory=False,
+            )
+            if df.empty:
+                continue
+            df["tour"] = tour
+            # Use the to_sql shim installed by RemoteTennisDatabase
+            df.to_sql("players", db.conn, if_exists="append",
+                      index=False, chunksize=500)
+            logger.info("  %s: seeded %d players", tour.upper(), len(df))
+        except Exception:
+            logger.exception("Failed to seed %s players", tour)
 
 
 def main(argv=None) -> int:
@@ -28,6 +77,8 @@ def main(argv=None) -> int:
     parser.add_argument("--min-year", type=int, default=2025)
     parser.add_argument("--monday-boost", action="store_true",
                         help="(legacy, no-op — top is already full)")
+    parser.add_argument("--seed-players-only", action="store_true",
+                        help="Only seed the players table, then exit")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -47,6 +98,11 @@ def main(argv=None) -> int:
     db = RemoteTennisDatabase()
 
     try:
+        # Seed the players table on first run so name resolution works.
+        _seed_players_if_empty(db)
+        if args.seed_players_only:
+            logger.info("Seed-only mode: done.")
+            return 0
         # Cloud mode is "live-only": we don't import the 1.7M-row Sackmann
         # historical CSVs into Turso (would take hours via HTTP).  Use local
         # mode for full archive queries; cloud mode = always-fresh top-N.
