@@ -9,7 +9,7 @@ on:
       top_n:
         description: 'Top-N players to refresh'
         required: false
-        default: '150'
+        default: '1000'
       skip_extended:
         description: 'Skip extended stats pass'
         required: false
@@ -23,7 +23,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 350
 
     env:
       TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
@@ -54,12 +54,12 @@ jobs:
 
       - name: Run scrape job
         run: |
-          TOP_N="${{ github.event.inputs.top_n || '150' }}"
+          TOP_N="${{ github.event.inputs.top_n || '1000' }}"
           EXTRA=""
           if [ "${{ github.event.inputs.skip_extended }}" = "true" ]; then
             EXTRA="--no-extended"
           fi
-          python -m cloud.scrape_job --top "$TOP_N" --monday-boost $EXTRA
+          python -m cloud.scrape_job --top "$TOP_N" $EXTRA
 
       - name: Upload replica snapshot (debug)
         if: always()

@@ -22,10 +22,12 @@ logger = logging.getLogger("cloud.scrape_job")
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Cloud scrape job (Turso)")
-    parser.add_argument("--top", type=int, default=150)
+    parser.add_argument("--top", type=int, default=1000,
+                        help="Top-N players to refresh per tour (default 1000)")
     parser.add_argument("--no-extended", action="store_true")
     parser.add_argument("--min-year", type=int, default=2025)
-    parser.add_argument("--monday-boost", action="store_true")
+    parser.add_argument("--monday-boost", action="store_true",
+                        help="(legacy, no-op — top is already full)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -40,9 +42,7 @@ def main(argv=None) -> int:
     )
 
     top_n = args.top
-    if args.monday_boost and datetime.today().weekday() == 0:
-        top_n = max(top_n, 1000)
-        logger.info("Monday boost active: top_n=%d", top_n)
+    logger.info("Cloud scrape: top_n=%d per tour", top_n)
 
     db = RemoteTennisDatabase()
 
@@ -68,9 +68,10 @@ def main(argv=None) -> int:
 
         if not args.no_extended:
             for tour in ("atp", "wta"):
-                logger.info("=== %s: extended stats ===", tour.upper())
+                logger.info("=== %s: extended stats (top %d) ===",
+                            tour.upper(), top_n)
                 scrape_top_players_extended_stats(
-                    top_n=min(150, top_n), tour=tour,
+                    top_n=top_n, tour=tour,
                     progress_callback=lambda c, t, m: logger.info(
                         "  [%d/%d] %s", c, t, m),
                     db=db,
