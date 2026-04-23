@@ -69,3 +69,5 @@ jobs:
           path: replica.db
           retention-days: 3
           if-no-files-found: ignore
+
+# trigger reindex
