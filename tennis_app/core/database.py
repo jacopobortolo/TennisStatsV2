@@ -484,7 +484,7 @@ class TennisDatabase:
             (tour,)).fetchone()
         return row[0] == 1
 
-    def import_doubles_only(self, tour="atp", year_start=1968, year_end=2024):
+    def import_doubles_only(self, tour="atp", year_start=1968, year_end=None):
         """Import only doubles matches (used when singles already imported)."""
         doubles = load_doubles(tour, year_start, year_end)
         if not doubles.empty:
@@ -499,7 +499,7 @@ class TennisDatabase:
             self.conn.commit()
             logger.info("Imported %d doubles matches for %s", len(doubles), tour)
 
-    def import_data(self, tour="atp", year_start=1968, year_end=2024,
+    def import_data(self, tour="atp", year_start=1968, year_end=None,
                     progress_callback=None):
         """Import CSV data into the SQLite database."""
         if progress_callback:

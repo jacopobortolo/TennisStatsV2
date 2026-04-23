@@ -4,6 +4,7 @@ from Jeff Sackmann's GitHub repositories, plus live scraping
 from tennisabstract.com for recent data.
 """
 
+import datetime
 import os
 import re
 import time
@@ -85,7 +86,7 @@ def _parallel_download(files_to_download, data_dir, force=False,
         progress_callback(total, total, "Download complete!")
 
 
-def download_atp_data(year_start=1968, year_end=2024, force=False,
+def download_atp_data(year_start=1968, year_end=None, force=False,
                       progress_callback=None):
     """
     Download ATP match data, player list, and rankings from GitHub.
@@ -101,6 +102,8 @@ def download_atp_data(year_start=1968, year_end=2024, force=False,
     progress_callback : callable, optional
         Called with (current_step, total_steps, message) for progress updates.
     """
+    if year_end is None:
+        year_end = datetime.date.today().year
     data_dir = get_data_dir() / "atp"
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -141,9 +144,11 @@ def download_atp_data(year_start=1968, year_end=2024, force=False,
     _parallel_download(files_to_download, data_dir, force, progress_callback)
 
 
-def download_wta_data(year_start=1968, year_end=2024, force=False,
+def download_wta_data(year_start=1968, year_end=None, force=False,
                       progress_callback=None):
     """Download WTA match data, player list, and rankings from GitHub."""
+    if year_end is None:
+        year_end = datetime.date.today().year
     data_dir = get_data_dir() / "wta"
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -185,9 +190,11 @@ def load_players(tour="atp"):
     )
 
 
-def load_matches(tour="atp", year_start=1968, year_end=2025,
+def load_matches(tour="atp", year_start=1968, year_end=None,
                  include_qual=False):
     """Load match data from cached CSVs and concatenate into one DataFrame."""
+    if year_end is None:
+        year_end = datetime.date.today().year
     data_dir = get_data_dir() / tour
     dtype_map = {
         "winner_id": str, "loser_id": str,
