@@ -20,8 +20,11 @@ class MatchesPage(QWidget):
         self.db = db
         self._all_matches = []
         self._current_player = None
+        self._current_player_id = None
+        self._current_player_tour = None
         self._current_page = 1
         self._build_ui()
+        self._connect_filters()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -113,12 +116,24 @@ class MatchesPage(QWidget):
 
     def _on_player_selected(self, player):
         """Called when user selects a player from autocomplete."""
-        self._search_player(player)
-
-    def _search_player(self, player):
-        player_id = player["player_id"]
-        player_tour = player.get("tour")
+        self._current_player_id = player["player_id"]
+        self._current_player_tour = player.get("tour")
         self._current_player = f"{player['name_first']} {player['name_last']}"
+        self._refetch_matches()
+
+    def _connect_filters(self):
+        """Wire filter widgets to re-fetch matches when the user changes them."""
+        self.surface_pills.changed.connect(lambda _: self._refetch_matches())
+        self.level_pills.changed.connect(lambda _: self._refetch_matches())
+        self.year_combo.currentIndexChanged.connect(
+            lambda _: self._refetch_matches())
+        self.round_combo.currentIndexChanged.connect(
+            lambda _: self._refetch_matches())
+
+    def _refetch_matches(self):
+        """Re-query the DB using current filter values for the selected player."""
+        if not self._current_player_id:
+            return
 
         surface = self.surface_pills.value()
         surface = None if surface == "All" else surface
@@ -134,10 +149,10 @@ class MatchesPage(QWidget):
         tourney_level = _level_map.get(self.level_pills.value())
 
         self._all_matches = self.db.get_player_matches(
-            player_id, surface=surface,
+            self._current_player_id, surface=surface,
             tourney_level=tourney_level,
             year=year, round_=round_,
-            tour=player_tour,
+            tour=self._current_player_tour,
         )
         self._current_page = 1
         self._display_page()
