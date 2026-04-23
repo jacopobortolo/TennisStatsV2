@@ -118,7 +118,8 @@ def main(argv=None) -> int:
             )
             if not matches_df.empty:
                 db.import_scraped_matches(
-                    matches_df, scraped_player_names=scraped_names)
+                    matches_df, scraped_player_names=scraped_names,
+                    replace_existing=False)
             if rankings:
                 db.import_scraped_rankings(rankings)
 

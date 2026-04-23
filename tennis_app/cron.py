@@ -52,7 +52,8 @@ def run(top_n: int = 150, do_extended: bool = True,
             )
             if not matches_df.empty:
                 new = db.import_scraped_matches(
-                    matches_df, scraped_player_names=scraped_names)
+                    matches_df, scraped_player_names=scraped_names,
+                    replace_existing=False)
                 total_new += new or 0
             if rankings:
                 db.import_scraped_rankings(rankings)

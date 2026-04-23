@@ -1186,7 +1186,8 @@ class TennisDatabase:
 
     @_locked_write
     def import_scraped_matches(self, matches_df, progress_callback=None,
-                               scraped_player_names=None):
+                               scraped_player_names=None,
+                               replace_existing=True):
         """
         Import scraped match data into the database.
 
@@ -1199,6 +1200,12 @@ class TennisDatabase:
             Names of the players whose full career was explicitly scraped.
             Old SCRAPED matches for these players will be deleted before
             re-importing.  If None, detected automatically via frequency.
+        replace_existing : bool, default True
+            If True, delete existing SCRAPED matches for *scraped_player_names*
+            before inserting (full refresh).  If False, only insert rows
+            that aren't already in the matches table (incremental refresh
+            \u2014 use when *matches_df* contains only the most recent N
+            matches per player).
         """
         if matches_df is None or matches_df.empty:
             return 0
@@ -1291,8 +1298,11 @@ class TennisDatabase:
             # Players with at least 50 % of the max count are scraped players
             scraped_players = set(
                 total_counts[total_counts >= max_count * 0.5].index)
-        # Remove old scraped matches for ALL scraped players (single query)
-        if scraped_players:
+        # Remove old scraped matches for ALL scraped players (single query).
+        # Skipped when replace_existing=False (incremental mode \u2014 we trust
+        # the dedup LEFT JOIN below to avoid duplicates and preserve any
+        # older SCRAPED rows already in the DB).
+        if scraped_players and replace_existing:
             placeholders = ",".join("?" for _ in scraped_players)
             player_list = list(scraped_players)
             self.conn.execute(

@@ -274,12 +274,15 @@ def _get_scraper():
     return _scraper_instance
 
 
-def scrape_player_matches(player_name, min_year=None, tour="atp"):
+def scrape_player_matches(player_name, min_year=None, tour="atp",
+                          max_matches=None):
     """
     Scrape all matches for a player from tennisabstract.com and return
     a DataFrame in the same format as the database 'matches' table.
 
     If *min_year* is set, only matches from that year onward are kept.
+    If *max_matches* is set, only the N most recent matches are kept
+    (after the min_year filter).
 
     Returns (DataFrame, last_match_date_str).
     ``last_match_date_str`` is the YYYYMMDD string of the most recent
@@ -301,7 +304,8 @@ def scrape_player_matches(player_name, min_year=None, tour="atp"):
             except (ValueError, TypeError):
                 pass
 
-    df = convert_scraped_to_db_format(raw, player_name, min_year=min_year)
+    df = convert_scraped_to_db_format(raw, player_name, min_year=min_year,
+                                      max_matches=max_matches)
     return df, last_match_date
 
 
@@ -449,7 +453,8 @@ def _build_ranking_name_map(ranking_names, db, tour="atp"):
 
 
 def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
-                               db=None, cache_expire_hours=6, min_year=None):
+                               db=None, cache_expire_hours=6, min_year=None,
+                               max_matches_per_player=20):
     """
     Scrape matches for the top N ranked players.
 
@@ -461,6 +466,9 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
     If *db* is provided, uses the scrape cache to skip players whose
     data was scraped less than *cache_expire_hours* ago.
     If *min_year* is set, only matches from that year onward are kept.
+    If *max_matches_per_player* is set, only the N most recent matches
+    per player are kept (default 20). Reduces import work since older
+    scraped matches are already in the DB. Set to None for full history.
 
     Returns (combined_DataFrame, rankings_list, scraped_names_list).
     """
@@ -598,7 +606,8 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
         name = entry["name"]
         try:
             df, last_match_date = scrape_player_matches(
-                name, min_year=min_year, tour=tour)
+                name, min_year=min_year, tour=tour,
+                max_matches=max_matches_per_player)
             return name, df, last_match_date, None
         except Exception as exc:
             return name, None, None, exc

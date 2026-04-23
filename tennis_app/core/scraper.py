@@ -1123,7 +1123,8 @@ EXTENDED_DB_TABLES = {
 }
 
 
-def convert_scraped_to_db_format(raw_matches, player_name, min_year=None):
+def convert_scraped_to_db_format(raw_matches, player_name, min_year=None,
+                                 max_matches=None):
     """
     Convert raw scraped match arrays into a DataFrame matching the
     existing database schema (winner/loser format).
@@ -1136,6 +1137,10 @@ def convert_scraped_to_db_format(raw_matches, player_name, min_year=None):
         The name of the player whose matches these are
     min_year : int or None
         If set, discard matches before this year (e.g. 2025).
+    max_matches : int or None
+        If set, keep only the *max_matches* most recent matches
+        (after the min_year filter).  Useful for incremental refreshes
+        when the player already has historical data in the DB.
 
     Returns
     -------
@@ -1146,6 +1151,19 @@ def convert_scraped_to_db_format(raw_matches, player_name, min_year=None):
 
     # Pre-compute year cutoff string for fast comparison (e.g. "20250000")
     min_date_str = str(min_year * 10000) if min_year else None
+
+    # When max_matches is set, sort raw matches by date desc and trim early.
+    # raw_matches[i][0] is the date as int/str like 20250416.
+    if max_matches is not None and max_matches > 0:
+        def _date_key(m):
+            try:
+                return int(m[0])
+            except (ValueError, TypeError, IndexError):
+                return 0
+        raw_matches = sorted(raw_matches, key=_date_key, reverse=True)
+        # Keep extra headroom (3x) before filtering, in case some get dropped
+        # for being walkovers / pre-min_year / parse errors.
+        raw_matches = raw_matches[: max_matches * 3]
 
     records = []
     for match in raw_matches:
@@ -1333,4 +1351,10 @@ def convert_scraped_to_db_format(raw_matches, player_name, min_year=None):
     if not records:
         return pd.DataFrame()
 
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    # Final trim to exactly max_matches most recent rows (we may have
+    # kept 3x headroom above to absorb walkover/parse drops).
+    if max_matches is not None and max_matches > 0 and len(df) > max_matches:
+        df = df.sort_values("tourney_date", ascending=False).head(max_matches)
+        df = df.reset_index(drop=True)
+    return df

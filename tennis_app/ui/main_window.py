@@ -410,7 +410,8 @@ class MainWindow(QMainWindow):
             if not matches_df.empty:
                 progress_cb(80, 100, f"Importing {label} scraped matches...")
                 self.db.import_scraped_matches(
-                    matches_df, scraped_player_names=scraped_names)
+                    matches_df, scraped_player_names=scraped_names,
+                    replace_existing=False)
 
             if rankings:
                 progress_cb(90, 100, f"Importing {label} live rankings...")
