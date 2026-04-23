@@ -1,0 +1,1336 @@
+"""
+Scraper for fetching live player match data from tennisabstract.com.
+
+This provides access to up-to-date match data (2025/2026+) that is not
+available in Jeff Sackmann's GitHub CSV files (frozen at 2024).
+"""
+
+import ast
+import logging
+import random
+import re
+import time
+import unicodedata
+
+import cloudscraper
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
+
+BASE_URL = "https://www.tennisabstract.com"
+REQUEST_DELAY_MIN = 5.0
+REQUEST_DELAY_MAX = 8.0
+REQUEST_RETRIES = 3
+
+# Column mapping from the JS array indices to field names
+# (based on tennisabstract's matchmx array structure)
+MATCH_COLUMNS = {
+    0: "date",
+    1: "tourn",
+    2: "surf",
+    3: "level",
+    4: "wl",
+    5: "prank",
+    6: "pseed",
+    7: "pentry",
+    8: "round",
+    9: "score",
+    11: "opp",
+    12: "orank",
+    13: "oseed",
+    14: "oentry",
+    18: "oioc",
+    20: "minutes",
+    21: "aces",
+    22: "dfs",
+    23: "svpt",
+    24: "first_in",
+    25: "first_won",
+    26: "second_won",
+    27: "sv_gms",
+    28: "bp_saved",
+    29: "bp_faced",
+    30: "o_aces",
+    31: "o_dfs",
+    32: "o_svpt",
+    33: "o_first_in",
+    34: "o_first_won",
+    35: "o_second_won",
+    36: "o_sv_gms",
+    37: "o_bp_saved",
+    38: "o_bp_faced",
+}
+
+# Map tennisabstract tourney level codes to Sackmann-style codes
+LEVEL_MAP = {
+    "G": "G",       # Grand Slam
+    "M": "M",       # Masters 1000
+    "A": "A",       # ATP 250/500
+    "F": "F",       # Tour Finals
+    "D": "D",       # Davis Cup
+    "C": "C",       # Challenger
+}
+
+
+class TennisAbstractScraper:
+    """Scrapes match data from tennisabstract.com."""
+
+    def __init__(self):
+        self.session = cloudscraper.create_scraper()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        })
+        self._delay_multiplier = 1.0  # adaptive: increases after 429s
+        self._request_count = 0  # track requests to skip first delay
+
+    def _jittered_delay(self, multiplier=1):
+        """Sleep for a random duration between REQUEST_DELAY_MIN and REQUEST_DELAY_MAX."""
+        delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX) * multiplier * self._delay_multiplier
+        time.sleep(delay)
+
+    def _make_request(self, url, raise_on_error=True):
+        """Make HTTP request with retry logic and rate-limit handling."""
+        for attempt in range(REQUEST_RETRIES):
+            try:
+                # Jittered delay: skip on very first request of the session
+                if attempt > 0:
+                    self._jittered_delay(multiplier=2 ** attempt)
+                elif self._request_count > 0:
+                    self._jittered_delay()
+
+                self._request_count += 1
+
+                resp = self.session.get(url, timeout=30)
+
+                if resp.status_code == 429:
+                    # Increase adaptive delay for future requests
+                    self._delay_multiplier = min(self._delay_multiplier * 1.5, 3.0)
+                    wait = 30
+                    logger.warning("Rate limited (attempt %d), waiting %ds... "
+                                   "(delay multiplier now %.1f)",
+                                   attempt + 1, wait, self._delay_multiplier)
+                    time.sleep(wait)
+                    continue
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                # Successful request: slowly reduce adaptive delay
+                if self._delay_multiplier > 1.0:
+                    self._delay_multiplier = max(1.0, self._delay_multiplier * 0.95)
+                return resp
+            except requests.RequestException as exc:
+                logger.warning("Attempt %d failed for %s: %s",
+                               attempt + 1, url, exc)
+                if attempt == REQUEST_RETRIES - 1:
+                    if raise_on_error:
+                        raise
+                    return None
+        return None
+
+    # Characters that NFKD does not decompose — map to ASCII equivalents
+    _EXTRA_TRANSLIT = str.maketrans({
+        "ø": "o", "Ø": "O", "ł": "l", "Ł": "L",
+        "đ": "d", "Đ": "D", "æ": "ae", "Æ": "AE",
+        "œ": "oe", "Œ": "OE", "ß": "ss",
+        "þ": "th", "Þ": "Th",
+        "'": None, "\u2019": None, "\u2018": None,  # apostrophes
+    })
+
+    @staticmethod
+    def _clean_name(name):
+        """Normalize whitespace, diacritics, and hyphens in a player name."""
+        # Transliterate chars that NFKD cannot decompose & strip apostrophes
+        name = name.translate(TennisAbstractScraper._EXTRA_TRANSLIT)
+        # Decompose unicode (e.g. ć → c + combining accent)
+        name = unicodedata.normalize("NFKD", name)
+        # Strip combining marks (accents, diacritics)
+        name = "".join(c for c in name if not unicodedata.combining(c))
+        # Remove hyphens (e.g. Auger-Aliassime → Auger Aliassime)
+        name = name.replace("-", " ")
+        name = re.sub(r"\s+", " ", name).strip()
+        return name
+
+    def fetch_player_matches(self, player_name, tour="atp"):
+        """
+        Fetch all matches for a player from tennisabstract.com.
+
+        Returns a list of raw match arrays, or None if not found.
+        """
+        player_name = self._clean_name(player_name)
+        # Title-case each word to match tennisabstract URL format
+        # e.g. "Botic van de Zandschulp" → "BoticVanDeZandschulp"
+        player_url_name = "".join(
+            w.capitalize() for w in player_name.split() if w
+        )
+        all_matches = []
+
+        # WTA uses wplayer-classic.cgi, ATP uses player-classic.cgi
+        cgi = "wplayer-classic.cgi" if tour == "wta" else "player-classic.cgi"
+
+        # Try HTML page first (has embedded JS data)
+        try:
+            url = f"{BASE_URL}/cgi-bin/{cgi}?p={player_url_name}"
+            resp = self._make_request(url)
+            if resp and "No player found" not in resp.text:
+                matches = self._parse_matches_from_html(resp.text)
+                if matches:
+                    all_matches.extend(matches)
+                    logger.info("Found %d matches in HTML for %s",
+                                len(matches), player_name)
+        except Exception as exc:
+            logger.warning("Could not get HTML matches for %s: %s",
+                           player_name, exc)
+
+        # Fallback to JS files
+        if not all_matches:
+            js_urls = [
+                f"{BASE_URL}/jsmatches/{player_url_name}.js",
+                f"{BASE_URL}/jsmatches/{player_url_name}Career.js",
+            ]
+            for url in js_urls:
+                try:
+                    resp = self._make_request(url, raise_on_error=False)
+                    if resp and resp.status_code == 200:
+                        matches = self._parse_matches_from_js(resp.text)
+                        if matches:
+                            all_matches.extend(matches)
+                            logger.info("Found %d matches from JS: %s",
+                                        len(matches), url)
+                except Exception as exc:
+                    logger.warning("Could not get JS matches from %s: %s",
+                                   url, exc)
+
+        if all_matches:
+            return all_matches
+        logger.warning("No matches found for %s", player_name)
+        return None
+
+    def _parse_matches_from_html(self, html_content):
+        """Extract the matchmx JS array from HTML page."""
+        try:
+            marker = "var matchmx = ["
+            start = html_content.find(marker)
+            if start == -1:
+                return None
+            start += len(marker) - 1  # include the '['
+            end = html_content.find("];", start)
+            if end == -1:
+                return None
+            matches_str = html_content[start:end + 1]
+            matches_str = matches_str.replace("null", "None")
+            return ast.literal_eval(matches_str)
+        except Exception as exc:
+            logger.error("Error parsing HTML matches: %s", exc)
+            return None
+
+    def _parse_matches_from_js(self, js_content):
+        """Parse the matchmx array from a JS file."""
+        try:
+            if "matchmx = [" in js_content:
+                raw = js_content.split("matchmx = [")[1].split("];")[0]
+                raw = "[" + raw + "]"
+                raw = raw.replace("null", "None")
+                return ast.literal_eval(raw)
+            return []
+        except Exception as exc:
+            logger.error("Error parsing JS matches: %s", exc)
+            return []
+
+    def scrape_rankings_live_tennis(self, tour="atp", discipline="singles",
+                                    source="LIVE"):
+        """
+        Scrape rankings from live-tennis.eu.
+
+        Parameters
+        ----------
+        tour : str
+            "atp" or "wta"
+        discipline : str
+            "singles" or "doubles"
+        source : str
+            "LIVE", "OFFICIAL" or "RACE"
+
+        Returns list of dicts with:
+            rank, name, country, points, age,
+            rank_diff, pts_diff, next_tournament, tour
+        """
+        tour = (tour or "atp").lower()
+        discipline = (discipline or "singles").lower()
+        source = (source or "LIVE").upper()
+
+        path_map = {
+            ("atp", "singles", "LIVE"): "atp-live-ranking",
+            ("wta", "singles", "LIVE"): "wta-live-ranking",
+            ("atp", "doubles", "LIVE"): "atp-doubles-live-ranking",
+            ("wta", "doubles", "LIVE"): "wta-doubles-live-ranking",
+            ("atp", "singles", "OFFICIAL"): "official-atp-ranking",
+            ("wta", "singles", "OFFICIAL"): "official-wta-ranking",
+            ("atp", "doubles", "OFFICIAL"): "official-atp-doubles-ranking",
+            ("wta", "doubles", "OFFICIAL"): "official-wta-doubles-ranking",
+            ("atp", "singles", "RACE"): "atp-race",
+            ("wta", "singles", "RACE"): "wta-race",
+            ("atp", "doubles", "RACE"): "atp-doubles-race",
+            ("wta", "doubles", "RACE"): "wta-doubles-race",
+        }
+        path = path_map.get((tour, discipline, source))
+        if not path:
+            logger.warning("Unsupported ranking request: %s %s %s",
+                           tour, discipline, source)
+            return []
+
+        url = f"https://live-tennis.eu/en/{path}"
+        results = []
+
+        try:
+            scraper = cloudscraper.create_scraper()
+            resp = scraper.get(url, timeout=30)
+            resp.encoding = "utf-8"
+            if resp.status_code != 200:
+                logger.warning("live-tennis.eu returned %d", resp.status_code)
+                return results
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            tables = soup.find_all("table")
+            if not tables:
+                return results
+
+            # Pick table that contains most ranking rows (first td starts with rank)
+            target = None
+            best_rows = -1
+            for tbl in tables:
+                rows = 0
+                for tr in tbl.find_all("tr"):
+                    tds = tr.find_all("td")
+                    if not tds:
+                        continue
+                    first = tds[0].get_text(strip=True)
+                    if re.match(r"^\d+", first):
+                        rows += 1
+                if rows > best_rows:
+                    best_rows = rows
+                    target = tbl
+            if target is None:
+                return results
+
+            # live pages include 2 extra leading cols vs official pages
+            # LIVE row shape: rank,chg,*,name,age,ioc,points,...
+            # OFFICIAL row shape: rank,*,name,age,ioc,points,...
+            name_idx = 3 if source == "LIVE" else 2
+            age_idx = name_idx + 1
+            country_idx = name_idx + 2
+            points_idx = name_idx + 3
+
+            for tr in target.find_all("tr"):
+                tds = tr.find_all("td")
+                if len(tds) <= points_idx:
+                    continue
+
+                rank_text = tds[0].get_text(strip=True)
+                if not rank_text or not rank_text[0].isdigit():
+                    continue
+                rank = int(re.sub(r"[^\d]", "", rank_text))
+
+                raw_name = tds[name_idx].get_text(strip=True)
+                raw_name = unicodedata.normalize("NFKC", raw_name)
+                raw_name = re.sub(r"\s+", " ", raw_name).strip()
+
+                age_text = tds[age_idx].get_text(strip=True)
+                age = int(age_text) if age_text.isdigit() else None
+
+                country = tds[country_idx].get_text(strip=True).upper()
+                # Normalise IOC (3-letter)
+                m = re.search(r"[A-Z]{3}", country)
+                country = m.group(0) if m else country[:3]
+
+                pts_text = re.sub(r"[^\d]", "",
+                                  tds[points_idx].get_text(strip=True))
+                points = int(pts_text) if pts_text else 0
+
+                # Parse deltas from semantic classes, not positional indices.
+                # This avoids false matches from unrelated columns (e.g. chtd).
+                rank_diff = None
+                pts_diff = None
+
+                signed_cells = []
+                for i, td in enumerate(tds):
+                    txt = td.get_text(strip=True)
+                    if not re.fullmatch(r"[+\-]\d+", txt or ""):
+                        continue
+                    classes = set(td.get("class", []))
+                    signed_cells.append((i, txt, classes))
+
+                # Rank diff: prefer rdf class (present on both LIVE/OFFICIAL when provided).
+                for _, txt, classes in signed_cells:
+                    if "rdf" in classes:
+                        try:
+                            rank_diff = int(txt)
+                        except ValueError:
+                            pass
+                        break
+
+                # On OFFICIAL pages some rows miss rdf but keep a trailing signed rank delta.
+                if source == "OFFICIAL" and rank_diff is None and signed_cells:
+                    try:
+                        rank_diff = int(signed_cells[-1][1])
+                    except ValueError:
+                        pass
+
+                # Points diff: LIVE uses sgr/srd classes; OFFICIAL does not expose this reliably.
+                if source == "LIVE":
+                    for _, txt, classes in signed_cells:
+                        if "sgr" in classes or "srd" in classes:
+                            try:
+                                pts_diff = int(txt)
+                            except ValueError:
+                                pass
+                            break
+
+                # Tournament info: OFFICIAL pages have fixed columns
+                # for current and previous tournament activity.
+                current_tourn = ""
+                previous_tourn = ""
+                next_tourn = ""
+
+                if source == "OFFICIAL":
+                    # After points (points_idx) there is a rank_diff cell,
+                    # then current_tournament, then previous_tournament.
+                    # Locate the first non-numeric text cell after points.
+                    base = points_idx + 1  # skip rank_diff cell
+                    # Skip any signed-number cells (rank diff etc.)
+                    while base < len(tds) and re.fullmatch(
+                            r"[+\-]?\d+", tds[base].get_text(strip=True) or "x"):
+                        base += 1
+                    if base < len(tds):
+                        current_tourn = tds[base].get_text(strip=True)
+                    if base + 1 < len(tds):
+                        previous_tourn = tds[base + 1].get_text(strip=True)
+                    next_tourn = current_tourn or previous_tourn
+                else:
+                    # LIVE pages: first non-numeric trailing text
+                    for idx in range(points_idx + 2, min(len(tds), points_idx + 6)):
+                        txt = tds[idx].get_text(strip=True)
+                        if txt and not re.fullmatch(r"[+\-]?\d+", txt):
+                            next_tourn = txt
+                            break
+
+                results.append({
+                    "rank": rank,
+                    "name": raw_name,
+                    "country": country,
+                    "points": points,
+                    "age": age,
+                    "rank_diff": rank_diff,
+                    "pts_diff": pts_diff,
+                    "next_tournament": next_tourn,
+                    "current_tournament": current_tourn,
+                    "previous_tournament": previous_tourn,
+                    "tour": tour,
+                    "discipline": discipline,
+                    "source": source,
+                })
+
+        except Exception as exc:
+            logger.warning("Error scraping live-tennis.eu: %s", exc)
+
+        logger.info("Total live rankings scraped: %d", len(results))
+        return results
+
+    def scrape_live_rankings(self, tour="atp"):
+        """Backward-compatible wrapper for ATP/WTA live singles."""
+        return self.scrape_rankings_live_tennis(
+            tour=tour, discipline="singles", source="LIVE"
+        )
+
+    def fetch_rankings_html(self, tour="atp"):
+        """Fetch current rankings page from tennisabstract."""
+        tour = tour.lower()
+        url = f"{BASE_URL}/reports/{tour}Rankings.html"
+        try:
+            resp = self._make_request(url)
+            return resp.text if resp else None
+        except Exception as exc:
+            logger.error("Failed to fetch rankings: %s", exc)
+            return None
+
+    def parse_rankings(self, html, tour="atp"):
+        """
+        Parse rankings HTML table into a list of dicts.
+
+        Returns list of: {rank, name, country, points}
+        """
+        if not html:
+            return []
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            tables = soup.find_all("table")
+
+            target = None
+            headers = []
+            for tbl in tables:
+                ths = tbl.find_all("th")
+                if not ths:
+                    continue
+                labels = [th.get_text(" ", strip=True).lower() for th in ths]
+                canon = ["".join(c for c in h if c.isalnum()) for h in labels]
+                if any("rank" in h or h == "rk" for h in canon) and \
+                   any("player" in h or "name" in h for h in canon):
+                    target = tbl
+                    headers = labels
+                    break
+
+            if target is None:
+                if tables:
+                    target = tables[0]
+                    headers = [th.get_text(" ", strip=True).lower()
+                               for th in target.find_all("th")]
+                else:
+                    return []
+
+            canon_headers = ["".join(c for c in h if c.isalnum())
+                             for h in headers]
+
+            def find_idx(*keys):
+                for k in keys:
+                    for i, h in enumerate(canon_headers):
+                        if k in h:
+                            return i
+                return None
+
+            idx_rank = find_idx("rank", "rk")
+            idx_name = find_idx("player", "name")
+            idx_nat = find_idx("nat", "country", "ctry")
+            idx_pts = find_idx("point", "pts")
+
+            out = []
+            for tr in target.find_all("tr"):
+                tds = tr.find_all("td")
+                if len(tds) < 2:
+                    continue
+
+                rank_text = (tds[idx_rank].get_text(strip=True)
+                             if idx_rank is not None and idx_rank < len(tds)
+                             else "")
+                if not rank_text or not rank_text[0].isdigit():
+                    continue
+                try:
+                    rank = int(re.sub(r"[^\d]", "", rank_text))
+                except ValueError:
+                    continue
+
+                name_cell = (tds[idx_name]
+                             if idx_name is not None and idx_name < len(tds)
+                             else None)
+                if not name_cell:
+                    continue
+                a = name_cell.find("a")
+                name = (a.get_text(strip=True) if a
+                        else name_cell.get_text(strip=True))
+                # Normalize unicode whitespace (\xa0 etc.)
+                name = unicodedata.normalize("NFKD", name)
+                name = re.sub(r"\s+", " ", name).strip()
+
+                country = ""
+                if idx_nat is not None and idx_nat < len(tds):
+                    img = tds[idx_nat].find("img")
+                    if img and (img.get("alt") or img.get("title")):
+                        alt = (img.get("alt") or img.get("title") or "").strip().upper()
+                        m = re.search(r"\b([A-Z]{3})\b", alt)
+                        if m:
+                            country = m.group(1)
+                    if not country:
+                        txt = tds[idx_nat].get_text(strip=True).upper()
+                        m = re.search(r"\b([A-Z]{3})\b", txt)
+                        if m:
+                            country = m.group(1)
+
+                points = 0
+                if idx_pts is not None and idx_pts < len(tds):
+                    pts_text = tds[idx_pts].get_text(strip=True)
+                    pts_text = re.sub(r"[^\d]", "", pts_text)
+                    if pts_text:
+                        points = int(pts_text)
+
+                out.append({
+                    "rank": rank,
+                    "name": name,
+                    "country": country,
+                    "points": points,
+                    "tour": tour,
+                })
+
+            return out
+        except Exception as exc:
+            logger.exception("Failed to parse rankings: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
+    # Extended stats scraping (player-more.cgi)
+    # ------------------------------------------------------------------
+
+    EXTENDED_TABLES = [
+        "winners-errors", "serve-speed", "pbp-stats",
+        "mcp-serve", "mcp-return", "mcp-rally",
+    ]
+
+    def _discover_player_id(self, player_url_name):
+        """Discover the numeric player_id from the jsfrags JS file.
+
+        Returns (player_id, jsfrags_text) — player_id may be None if the
+        jsfrags file doesn't contain player-more.cgi links, but the raw
+        jsfrags text is still returned so the caller can fall back to
+        parsing tables directly from it.
+        """
+        url = f"{BASE_URL}/jsfrags/{player_url_name}.js"
+        try:
+            resp = self._make_request(url, raise_on_error=False)
+            if not resp:
+                return None, None
+            text = resp.text
+            m = re.search(r'player-more\.cgi\?p=(\d+)/', text)
+            if m:
+                return m.group(1), text
+            return None, text
+        except Exception as exc:
+            logger.warning("Could not discover player_id for %s: %s",
+                           player_url_name, exc)
+            return None, None
+
+    def _make_player_url_name(self, player_name):
+        """Convert a player name to URL format (e.g. 'Jannik Sinner' -> 'JannikSinner')."""
+        clean = self._clean_name(player_name)
+        return "".join(w.capitalize() for w in clean.split() if w)
+
+    def _make_player_hyphen_name(self, player_name):
+        """Convert name to hyphenated format (e.g. 'Jannik Sinner' -> 'Jannik-Sinner')."""
+        clean = self._clean_name(player_name)
+        return "-".join(w.capitalize() for w in clean.split() if w)
+
+    def _parse_table_from_soup(self, soup_table, player_name, table_name):
+        """Parse headers and rows from a BeautifulSoup <table> element."""
+        headers = []
+        thead = soup_table.find("thead")
+        if thead:
+            for th in thead.find_all("th"):
+                headers.append(th.get_text(strip=True).replace("\xa0", " "))
+        else:
+            header_row = soup_table.find("tr")
+            if header_row:
+                for th in header_row.find_all(["th", "td"]):
+                    headers.append(
+                        th.get_text(strip=True).replace("\xa0", " "))
+
+        if not headers:
+            return None
+
+        rows = []
+        tbody = soup_table.find("tbody")
+        data_rows = (tbody.find_all("tr") if tbody
+                     else soup_table.find_all("tr")[1:])
+        for tr in data_rows:
+            cells = tr.find_all("td")
+            if len(cells) < 3:
+                continue
+            row = {}
+            for i, cell in enumerate(cells):
+                if i < len(headers):
+                    row[headers[i]] = cell.get_text(strip=True).replace(
+                        "\xa0", " ")
+            rows.append(row)
+
+        logger.info("Parsed %d rows from %s for %s",
+                    len(rows), table_name, player_name)
+        return rows
+
+    def fetch_extended_table(self, player_name, table_name, _pid=None,
+                             tour="atp"):
+        """
+        Fetch one extended data table from player-more.cgi.
+
+        Parameters
+        ----------
+        player_name : str
+            Player name (e.g. "Jannik Sinner")
+        table_name : str
+            One of EXTENDED_TABLES (e.g. "winners-errors")
+        _pid : str or None
+            Pre-discovered numeric player_id (avoids re-fetching jsfrags).
+        tour : str
+            "atp" or "wta"
+
+        Returns list of dicts (one per match row), or None on failure.
+        """
+        url_name = self._make_player_url_name(player_name)
+        hyphen_name = self._make_player_hyphen_name(player_name)
+
+        if not _pid:
+            _pid, _ = self._discover_player_id(url_name)
+        if not _pid:
+            logger.warning("Could not find player_id for %s", player_name)
+            return None
+
+        cgi = "wplayer-more.cgi" if tour == "wta" else "player-more.cgi"
+        url = (f"{BASE_URL}/cgi-bin/{cgi}"
+               f"?p={_pid}/{hyphen_name}&table={table_name}")
+        try:
+            resp = self._make_request(url, raise_on_error=False)
+            if not resp:
+                return None
+
+            # Data table is inside a JS template literal: var player_frag = `...`
+            frag_match = re.search(
+                r'var\s+player_frag\s*=\s*`(.*?)`', resp.text, re.DOTALL)
+            if frag_match:
+                soup = BeautifulSoup(frag_match.group(1), "html.parser")
+            else:
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+            table = soup.find("table")
+            if not table:
+                logger.warning("No table found for %s/%s", player_name, table_name)
+                return None
+
+            return self._parse_table_from_soup(table, player_name, table_name)
+
+        except Exception as exc:
+            logger.warning("Error fetching %s for %s: %s",
+                           table_name, player_name, exc)
+            return None
+
+    def _parse_tables_from_jsfrags(self, jsfrags_text, player_name, table_names):
+        """Parse extended stats tables directly from jsfrags JS content.
+
+        Some players' jsfrags files don't include player-more.cgi links but
+        DO embed all the extended stats tables in ``var player_frag = `...```.
+        This method extracts those tables by their HTML ``id`` attribute.
+        """
+        frag_match = re.search(
+            r'var\s+player_frag\s*=\s*`(.*?)`', jsfrags_text, re.DOTALL)
+        if not frag_match:
+            return {}
+        soup = BeautifulSoup(frag_match.group(1), "html.parser")
+
+        results = {}
+        for table_name in table_names:
+            table_el = soup.find("table", id=table_name)
+            if not table_el:
+                continue
+            rows = self._parse_table_from_soup(table_el, player_name, table_name)
+            if rows:
+                results[table_name] = rows
+        return results
+
+    def fetch_all_extended_tables(self, player_name, tables=None,
+                                  progress_callback=None, tour="atp"):
+        """
+        Fetch all (or specified) extended data tables for a player.
+
+        First tries to parse tables from the jsfrags file (already fetched
+        during player_id discovery). Only falls back to individual
+        player-more.cgi requests for tables not found in jsfrags.
+
+        Returns dict: { "winners-errors": [rows], "serve-speed": [rows], ... }
+        """
+        if tables is None:
+            tables = self.EXTENDED_TABLES
+
+        url_name = self._make_player_url_name(player_name)
+        pid, jsfrags_text = self._discover_player_id(url_name)
+
+        # Step 1: try parsing all tables from jsfrags (no extra HTTP)
+        results = {}
+        if jsfrags_text:
+            results = self._parse_tables_from_jsfrags(
+                jsfrags_text, player_name, tables)
+            if results:
+                logger.info("Parsed %d/%d tables from jsfrags for %s",
+                            len(results), len(tables), player_name)
+
+        # Step 2: fetch any missing tables via player-more.cgi
+        missing = [t for t in tables if t not in results]
+        if missing and pid:
+            for i, table_name in enumerate(missing):
+                if progress_callback:
+                    progress_callback(len(results) + i, len(tables),
+                                      f"Fetching {table_name} for {player_name}...")
+                rows = self.fetch_extended_table(player_name, table_name,
+                                                 _pid=pid, tour=tour)
+                if rows:
+                    results[table_name] = rows
+        elif missing and not pid:
+            logger.warning("Could not find player_id for %s, %d tables missing",
+                           player_name, len(missing))
+
+        if progress_callback:
+            progress_callback(len(tables), len(tables),
+                              f"Extended stats complete for {player_name}")
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Extended stats row conversion helpers
+# ---------------------------------------------------------------------------
+
+def _safe_float(val):
+    """Parse a float from a string, returning None on failure."""
+    if val is None or val == "" or val == "-" or val == "N/A":
+        return None
+    try:
+        # Remove % signs
+        val = str(val).replace("%", "").strip()
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_int(val):
+    if val is None or val == "" or val == "-" or val == "N/A":
+        return None
+    try:
+        return int(float(str(val).replace(",", "").strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_match_context(row):
+    """Extract common match context fields from a raw extended stats row."""
+    ctx = {}
+    for key in row:
+        kl = key.lower().strip()
+        if kl == "match":
+            val = row[key].replace("\xa0", " ").strip()
+            # Format: "2026 Miami Masters F" or "2025 Roland Garros R128"
+            # Extract year, tournament name, and round
+            m = re.match(
+                r"(\d{4})\s+(.+?)\s+"
+                r"(F|SF|QF|R(?:R|16|32|64|128)|R\d+)$", val)
+            if m:
+                ctx["tourney_date"] = m.group(1)
+                ctx["tourney_name"] = m.group(2).strip()
+                ctx["round"] = m.group(3)
+            else:
+                # Fallback: at least extract the year
+                m2 = re.match(r"(\d{4})\s+(.*)", val)
+                if m2:
+                    ctx["tourney_date"] = m2.group(1)
+                    ctx["tourney_name"] = m2.group(2).strip()
+        elif kl == "result":
+            val = row[key].replace("\xa0", " ").strip()
+            # Format: "W vs Lehecka" or "L vs Alcaraz"
+            m = re.match(r"([WL])\s+vs\s*(.*)", val)
+            if m:
+                ctx["result"] = m.group(1)
+                ctx["opponent_name"] = m.group(2).strip()
+        elif kl in ("date", "dt"):
+            ctx["tourney_date"] = row[key]
+        elif kl in ("tournament", "tourn", "tourney"):
+            ctx["tourney_name"] = row[key]
+        elif kl in ("round", "rd"):
+            ctx["round"] = row[key]
+        elif kl in ("surface", "surf"):
+            ctx["surface"] = row[key]
+        elif kl in ("opponent", "opp"):
+            ctx["opponent_name"] = row[key]
+        elif kl in ("score", "sc"):
+            ctx["score"] = row[key]
+    return ctx
+
+
+def convert_winners_errors(rows, player_name, tour="atp"):
+    """Convert raw winners-errors rows to DB format.
+
+    Actual headers from tennisabstract: Match, Result, Winners, UFEs,
+    Ratio, Wnr/Pt, UFE/Pt, RallyWinners, RallyUFEs, RallyRatio,
+    Rally Wnr/Pt, Rally UFE/Pt, FH Wnr/Pt, BH Wnr/Pt, vs Ratio,
+    vs Wnr/Pt, vs UFE/Pt
+    """
+    records = []
+    for row in rows:
+        ctx = _extract_match_context(row)
+        record = {
+            "player_name": player_name,
+            "opponent_name": ctx.get("opponent_name"),
+            "tourney_name": ctx.get("tourney_name"),
+            "tourney_date": ctx.get("tourney_date"),
+            "round": ctx.get("round"),
+            "surface": ctx.get("surface"),
+            "score": ctx.get("score"),
+            "tour": tour,
+        }
+        for key, val in row.items():
+            kl = key.lower().strip()
+            # Player stats (exact header match to avoid "rally*" columns)
+            if kl == "winners":
+                record["winners"] = _safe_int(val)
+            elif kl == "ufes":
+                record["unforced_errors"] = _safe_int(val)
+            elif kl == "ratio":
+                record["w_ue_ratio"] = _safe_float(val)
+            elif kl == "wnr/pt":
+                record["winner_pct"] = _safe_float(val)
+            elif kl == "ufe/pt":
+                record["ue_pct"] = _safe_float(val)
+            # Opponent stats (vs prefix)
+            elif kl == "vs ratio":
+                record["opp_w_ue_ratio"] = _safe_float(val)
+            elif kl == "vs wnr/pt":
+                record["opp_winner_pct"] = _safe_float(val)
+            elif kl == "vs ufe/pt":
+                record["opp_ue_pct"] = _safe_float(val)
+        records.append(record)
+    return records
+
+
+def convert_serve_speed(rows, player_name, tour="atp"):
+    """Convert raw serve-speed rows to DB format.
+
+    Actual headers: Match, Result, Avg Speed, 1st Avg, 1st StDev,
+    1st T Avg, 1st Wide Avg, Max 1st, Min 1st, 2nd Avg, 2nd StDev,
+    2nd T Avg, 2nd Wide Avg, Max 2nd, Min 2nd
+    """
+    records = []
+    for row in rows:
+        ctx = _extract_match_context(row)
+        record = {
+            "player_name": player_name,
+            "opponent_name": ctx.get("opponent_name"),
+            "tourney_name": ctx.get("tourney_name"),
+            "tourney_date": ctx.get("tourney_date"),
+            "round": ctx.get("round"),
+            "surface": ctx.get("surface"),
+            "speed_unit": "mph",
+            "tour": tour,
+        }
+        for key, val in row.items():
+            kl = key.lower().strip()
+            # Use exact matches to avoid "1st t avg"/"1st wide avg" overwrites
+            if kl == "1st avg":
+                record["first_serve_avg"] = _safe_float(val)
+            elif kl == "1st stdev":
+                record["first_serve_stdev"] = _safe_float(val)
+            elif kl == "max 1st":
+                record["first_serve_max"] = _safe_float(val)
+            elif kl == "min 1st":
+                record["first_serve_min"] = _safe_float(val)
+            elif kl == "2nd avg":
+                record["second_serve_avg"] = _safe_float(val)
+            elif kl == "2nd stdev":
+                record["second_serve_stdev"] = _safe_float(val)
+            elif kl == "max 2nd":
+                record["second_serve_max"] = _safe_float(val)
+            elif kl == "min 2nd":
+                record["second_serve_min"] = _safe_float(val)
+        records.append(record)
+    return records
+
+
+def convert_pbp_stats(rows, player_name, tour="atp"):
+    """Convert raw pbp-stats rows to DB format.
+
+    Actual headers: Match, Result, BLR, DR+, EI, CBF, Deuce A%,
+    Deuce SPW%, Ad A%, Ad SPW%, Deuce RPW%, Ad RPW%
+    """
+    records = []
+    for row in rows:
+        ctx = _extract_match_context(row)
+        record = {
+            "player_name": player_name,
+            "opponent_name": ctx.get("opponent_name"),
+            "tourney_name": ctx.get("tourney_name"),
+            "tourney_date": ctx.get("tourney_date"),
+            "round": ctx.get("round"),
+            "surface": ctx.get("surface"),
+            "tour": tour,
+        }
+        for key, val in row.items():
+            kl = key.lower().strip()
+            # BLR = Baseline Rally Length
+            if kl == "blr":
+                record["rally_length_avg"] = _safe_float(val)
+            # DR+ = Dominance Ratio
+            elif kl == "dr+":
+                record["aggressive_margin"] = _safe_float(val)
+            # EI = Efficiency Index
+            elif kl == "ei":
+                record["serve_plus1_ratio"] = _safe_float(val)
+            # Deuce RPW% = return points won on deuce court
+            elif kl == "deuce rpw%":
+                record["return_pts_won_pct"] = _safe_float(val)
+        records.append(record)
+    return records
+
+
+def convert_mcp_serve(rows, player_name, tour="atp"):
+    """Convert raw mcp-serve rows to DB format.
+
+    Actual headers: Match, Result, Unret%, <=3 W%, RiP W%, SvImpact,
+    1st: Unret%, <=3 W%, RiP W%, SvImpact, D Wide%, A Wide%, BP Wide%,
+    2nd: Unret%, <=3 W%, RiP W%, 2ndAgg
+    """
+    records = []
+    for row in rows:
+        ctx = _extract_match_context(row)
+        record = {
+            "player_name": player_name,
+            "opponent_name": ctx.get("opponent_name"),
+            "tourney_name": ctx.get("tourney_name"),
+            "tourney_date": ctx.get("tourney_date"),
+            "round": ctx.get("round"),
+            "surface": ctx.get("surface"),
+            "tour": tour,
+        }
+        for key, val in row.items():
+            kl = key.lower().strip()
+            if kl == "unret%":
+                record["unreturned_pct"] = _safe_float(val)
+            elif kl == "d wide%":
+                record["deuce_wide_pct"] = _safe_float(val)
+            elif kl == "a wide%":
+                record["ad_wide_pct"] = _safe_float(val)
+        records.append(record)
+    return records
+
+
+def convert_mcp_return(rows, player_name, tour="atp"):
+    """Convert raw mcp-return rows to DB format.
+
+    Actual headers: Match, Result, RiP%, RiP W%, RetWnr%, FH/BH,
+    RDI, Slice%, 1st: RiP%, RiP W%, RetWnr%, RDI, Slice%,
+    2nd: RiP%, RiP W%, RetWnr%, RDI, Slice%
+    """
+    records = []
+    for row in rows:
+        ctx = _extract_match_context(row)
+        record = {
+            "player_name": player_name,
+            "opponent_name": ctx.get("opponent_name"),
+            "tourney_name": ctx.get("tourney_name"),
+            "tourney_date": ctx.get("tourney_date"),
+            "round": ctx.get("round"),
+            "surface": ctx.get("surface"),
+            "tour": tour,
+        }
+        for key, val in row.items():
+            kl = key.lower().strip()
+            if kl == "rip%":
+                record["return_in_play_pct"] = _safe_float(val)
+            elif kl == "1st: rip%":
+                record["first_return_in_play_pct"] = _safe_float(val)
+            elif kl == "2nd: rip%":
+                record["second_return_in_play_pct"] = _safe_float(val)
+        records.append(record)
+    return records
+
+
+def convert_mcp_rally(rows, player_name, tour="atp"):
+    """Convert raw mcp-rally rows to DB format.
+
+    Actual headers: Match, Result, RallyLen, RLen-Serve, RLen-Return,
+    1-3 W%, 4-6 W%, 7-9 W%, 10+ W%, FH/GS, BH Slice%, FHP,
+    FHP/100, BHP, BHP/100
+    """
+    records = []
+    for row in rows:
+        ctx = _extract_match_context(row)
+        record = {
+            "player_name": player_name,
+            "opponent_name": ctx.get("opponent_name"),
+            "tourney_name": ctx.get("tourney_name"),
+            "tourney_date": ctx.get("tourney_date"),
+            "round": ctx.get("round"),
+            "surface": ctx.get("surface"),
+            "tour": tour,
+        }
+        for key, val in row.items():
+            kl = key.lower().strip()
+            if kl == "rallylen":
+                record["rally_length_avg"] = _safe_float(val)
+            elif kl == "1-3 w%":
+                record["rally_won_0_4"] = _safe_float(val)
+            elif kl == "4-6 w%":
+                record["rally_won_5_8"] = _safe_float(val)
+            elif kl == "10+ w%":
+                record["rally_won_9_plus"] = _safe_float(val)
+            elif kl == "bh slice%":
+                record["bh_pct"] = _safe_float(val)
+        records.append(record)
+    return records
+
+
+def convert_mcp_tactics(rows, player_name, tour="atp"):
+    """Convert raw mcp-tactics rows to DB format."""
+    records = []
+    for row in rows:
+        ctx = _extract_match_context(row)
+        record = {
+            "player_name": player_name,
+            "opponent_name": ctx.get("opponent_name"),
+            "tourney_name": ctx.get("tourney_name"),
+            "tourney_date": ctx.get("tourney_date"),
+            "round": ctx.get("round"),
+            "surface": ctx.get("surface"),
+            "tour": tour,
+        }
+        for key, val in row.items():
+            kl = key.lower().strip()
+            if "net" in kl and ("approach" in kl or "appr" in kl) and "won" not in kl:
+                record["net_approach_pct"] = _safe_float(val)
+            elif "net" in kl and "won" in kl:
+                record["net_points_won_pct"] = _safe_float(val)
+            elif "drop" in kl and "won" not in kl:
+                record["dropshot_pct"] = _safe_float(val)
+            elif "drop" in kl and "won" in kl:
+                record["dropshot_won_pct"] = _safe_float(val)
+            elif "s&v" in kl or "serve" in kl and "volley" in kl:
+                if "won" in kl:
+                    record["sv_won_pct"] = _safe_float(val)
+                else:
+                    record["serve_and_volley_pct"] = _safe_float(val)
+            elif "inside" in kl and "in" in kl:
+                record["inside_in_fh_pct"] = _safe_float(val)
+            elif "inside" in kl and "out" in kl:
+                record["inside_out_fh_pct"] = _safe_float(val)
+        records.append(record)
+    return records
+
+
+# Table name -> converter function mapping
+EXTENDED_CONVERTERS = {
+    "winners-errors": convert_winners_errors,
+    "serve-speed": convert_serve_speed,
+    "pbp-stats": convert_pbp_stats,
+    "mcp-serve": convert_mcp_serve,
+    "mcp-return": convert_mcp_return,
+    "mcp-rally": convert_mcp_rally,
+    "mcp-tactics": convert_mcp_tactics,
+}
+
+# Table name -> DB table name mapping
+EXTENDED_DB_TABLES = {
+    "winners-errors": "match_winners_errors",
+    "serve-speed": "match_serve_speed",
+    "pbp-stats": "match_pbp_stats",
+    "mcp-serve": "match_mcp_serve",
+    "mcp-return": "match_mcp_return",
+    "mcp-rally": "match_mcp_rally",
+    "mcp-tactics": "match_mcp_tactics",
+}
+
+
+def convert_scraped_to_db_format(raw_matches, player_name, min_year=None):
+    """
+    Convert raw scraped match arrays into a DataFrame matching the
+    existing database schema (winner/loser format).
+
+    Parameters
+    ----------
+    raw_matches : list
+        List of match arrays from tennisabstract
+    player_name : str
+        The name of the player whose matches these are
+    min_year : int or None
+        If set, discard matches before this year (e.g. 2025).
+
+    Returns
+    -------
+    pd.DataFrame with columns matching the 'matches' table schema
+    """
+    if not raw_matches:
+        return pd.DataFrame()
+
+    # Pre-compute year cutoff string for fast comparison (e.g. "20250000")
+    min_date_str = str(min_year * 10000) if min_year else None
+
+    records = []
+    for match in raw_matches:
+        try:
+            # Extract fields using index mapping
+            row = {}
+            for idx, col_name in MATCH_COLUMNS.items():
+                if idx < len(match):
+                    row[col_name] = match[idx]
+                else:
+                    row[col_name] = None
+
+            # Parse date
+            date_raw = row.get("date")
+            if not date_raw:
+                continue
+            try:
+                date_str = str(int(date_raw))
+            except (ValueError, TypeError):
+                date_str = str(date_raw)
+
+            # Skip matches before min_year
+            if min_date_str and date_str < min_date_str:
+                continue
+
+            # Determine winner/loser based on W/L flag
+            wl = str(row.get("wl", "")).upper()
+            opponent = row.get("opp", "")
+            score = row.get("score", "")
+
+            # Skip walkovers and empty scores
+            if score in ("W/O", "", None) or pd.isna(score) if isinstance(score, float) else False:
+                continue
+
+            surface = row.get("surf", "")
+            tourney = row.get("tourn", "")
+            round_ = row.get("round", "")
+            level = row.get("level", "")
+            orank = row.get("orank")
+            pseed = row.get("pseed")
+            pentry = (row.get("pentry") or "").strip() or None
+            oseed = row.get("oseed")
+            oentry = (row.get("oentry") or "").strip() or None
+            oioc = (row.get("oioc") or "").strip() or None
+
+            # Parse numeric stats safely
+            def safe_num(val):
+                if val is None or val == "" or val == "None":
+                    return None
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return None
+
+            minutes = safe_num(row.get("minutes"))
+
+            prank = row.get("prank")
+
+            if wl == "W":
+                winner_name = player_name
+                loser_name = opponent
+                winner_rank = safe_num(prank)
+                loser_rank = safe_num(orank)
+                winner_seed = pseed
+                winner_entry = pentry
+                loser_seed = oseed
+                loser_entry = oentry
+                winner_ioc = None  # filled later from players table
+                loser_ioc = oioc
+                # Player serve stats = winner stats
+                w_ace = safe_num(row.get("aces"))
+                w_df = safe_num(row.get("dfs"))
+                w_svpt = safe_num(row.get("svpt"))
+                w_1stIn = safe_num(row.get("first_in"))
+                w_1stWon = safe_num(row.get("first_won"))
+                w_2ndWon = safe_num(row.get("second_won"))
+                w_SvGms = safe_num(row.get("sv_gms"))
+                w_bpSaved = safe_num(row.get("bp_saved"))
+                w_bpFaced = safe_num(row.get("bp_faced"))
+                # Opponent serve stats = loser stats
+                l_ace = safe_num(row.get("o_aces"))
+                l_df = safe_num(row.get("o_dfs"))
+                l_svpt = safe_num(row.get("o_svpt"))
+                l_1stIn = safe_num(row.get("o_first_in"))
+                l_1stWon = safe_num(row.get("o_first_won"))
+                l_2ndWon = safe_num(row.get("o_second_won"))
+                l_SvGms = safe_num(row.get("o_sv_gms"))
+                l_bpSaved = safe_num(row.get("o_bp_saved"))
+                l_bpFaced = safe_num(row.get("o_bp_faced"))
+            elif wl == "L":
+                winner_name = opponent
+                loser_name = player_name
+                winner_rank = safe_num(orank)
+                loser_rank = safe_num(prank)
+                winner_seed = oseed
+                winner_entry = oentry
+                loser_seed = pseed
+                loser_entry = pentry
+                winner_ioc = oioc
+                loser_ioc = None  # filled later from players table
+                # Opponent is winner
+                w_ace = safe_num(row.get("o_aces"))
+                w_df = safe_num(row.get("o_dfs"))
+                w_svpt = safe_num(row.get("o_svpt"))
+                w_1stIn = safe_num(row.get("o_first_in"))
+                w_1stWon = safe_num(row.get("o_first_won"))
+                w_2ndWon = safe_num(row.get("o_second_won"))
+                w_SvGms = safe_num(row.get("o_sv_gms"))
+                w_bpSaved = safe_num(row.get("o_bp_saved"))
+                w_bpFaced = safe_num(row.get("o_bp_faced"))
+                # Player is loser
+                l_ace = safe_num(row.get("aces"))
+                l_df = safe_num(row.get("dfs"))
+                l_svpt = safe_num(row.get("svpt"))
+                l_1stIn = safe_num(row.get("first_in"))
+                l_1stWon = safe_num(row.get("first_won"))
+                l_2ndWon = safe_num(row.get("second_won"))
+                l_SvGms = safe_num(row.get("sv_gms"))
+                l_bpSaved = safe_num(row.get("bp_saved"))
+                l_bpFaced = safe_num(row.get("bp_faced"))
+            else:
+                continue  # skip unknown result
+
+            # Map surface names for consistency
+            surf_map = {"H": "Hard", "C": "Clay", "G": "Grass", "P": "Carpet"}
+            surface_full = surf_map.get(surface, surface)
+
+            records.append({
+                "tourney_id": "",
+                "tourney_name": tourney,
+                "surface": surface_full,
+                "draw_size": None,
+                "tourney_level": LEVEL_MAP.get(level, level),
+                "tourney_date": date_str,
+                "match_num": None,
+                "winner_id": "",
+                "winner_seed": winner_seed,
+                "winner_entry": winner_entry,
+                "winner_name": winner_name,
+                "winner_hand": None,
+                "winner_ht": None,
+                "winner_ioc": winner_ioc,
+                "winner_age": None,
+                "loser_id": "",
+                "loser_seed": loser_seed,
+                "loser_entry": loser_entry,
+                "loser_name": loser_name,
+                "loser_hand": None,
+                "loser_ht": None,
+                "loser_ioc": loser_ioc,
+                "loser_age": None,
+                "score": score,
+                "best_of": None,
+                "round": round_,
+                "minutes": minutes,
+                "w_ace": w_ace,
+                "w_df": w_df,
+                "w_svpt": w_svpt,
+                "w_1stIn": w_1stIn,
+                "w_1stWon": w_1stWon,
+                "w_2ndWon": w_2ndWon,
+                "w_SvGms": w_SvGms,
+                "w_bpSaved": w_bpSaved,
+                "w_bpFaced": w_bpFaced,
+                "l_ace": l_ace,
+                "l_df": l_df,
+                "l_svpt": l_svpt,
+                "l_1stIn": l_1stIn,
+                "l_1stWon": l_1stWon,
+                "l_2ndWon": l_2ndWon,
+                "l_SvGms": l_SvGms,
+                "l_bpSaved": l_bpSaved,
+                "l_bpFaced": l_bpFaced,
+                "winner_rank": winner_rank,
+                "winner_rank_points": None,
+                "loser_rank": loser_rank,
+                "loser_rank_points": None,
+                "tour": "atp",
+            })
+
+        except Exception as exc:
+            logger.warning("Error converting match: %s", exc)
+            continue
+
+    if not records:
+        return pd.DataFrame()
+
+    return pd.DataFrame(records)

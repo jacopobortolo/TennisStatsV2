@@ -1,0 +1,71 @@
+name: Hourly Tennis Scrape
+
+on:
+  schedule:
+    # Every hour at :07 (off the hour to avoid GH Actions queue spikes)
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      top_n:
+        description: 'Top-N players to refresh'
+        required: false
+        default: '150'
+      skip_extended:
+        description: 'Skip extended stats pass'
+        required: false
+        default: 'false'
+
+# Only one scrape at a time — newer runs cancel older queued ones.
+concurrency:
+  group: tennis-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    env:
+      TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+      TURSO_AUTH_TOKEN:   ${{ secrets.TURSO_AUTH_TOKEN }}
+      TURSO_LOCAL_PATH:   ${{ github.workspace }}/replica.db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-cloud.txt
+
+      - name: Validate Turso secrets
+        run: |
+          if [ -z "$TURSO_DATABASE_URL" ] || [ -z "$TURSO_AUTH_TOKEN" ]; then
+            echo "::error::TURSO_DATABASE_URL and TURSO_AUTH_TOKEN secrets must be set"
+            exit 1
+          fi
+
+      - name: Run scrape job
+        run: |
+          TOP_N="${{ github.event.inputs.top_n || '150' }}"
+          EXTRA=""
+          if [ "${{ github.event.inputs.skip_extended }}" = "true" ]; then
+            EXTRA="--no-extended"
+          fi
+          python -m cloud.scrape_job --top "$TOP_N" --monday-boost $EXTRA
+
+      - name: Upload replica snapshot (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replica-${{ github.run_id }}
+          path: replica.db
+          retention-days: 3
+          if-no-files-found: ignore
