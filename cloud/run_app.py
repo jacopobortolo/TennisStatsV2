@@ -23,7 +23,7 @@ def main():
     from PySide6.QtWidgets import QApplication
     from tennis_app.ui.main_window import MainWindow
     from tennis_app.ui.theme import build_stylesheet, enable_dark_title_bar, load_fonts
-    from .db import CloudTennisDatabase
+    from .db import SnapshotTennisDatabase
 
     app = QApplication(sys.argv)
     app.setApplicationName("Tennis Analytics — Cloud")
@@ -31,12 +31,9 @@ def main():
     load_fonts()
     app.setStyleSheet(build_stylesheet())
 
-    # Patch MainWindow so it uses our cloud DB instead of TennisDatabase().
-    # The UI never imports TennisDatabase by reference outside this point,
-    # so we monkey-patch the symbol on the main_window module.
+    # Patch MainWindow so it uses our snapshot DB instead of TennisDatabase().
     import tennis_app.ui.main_window as mw
-    mw.TennisDatabase = lambda: CloudTennisDatabase(read_only=True,
-                                                   sync_interval=60)
+    mw.TennisDatabase = lambda: SnapshotTennisDatabase(refresh_on_open=True)
 
     window = MainWindow()
     window.setWindowTitle(window.windowTitle() + " [Cloud]")

@@ -33,7 +33,7 @@ def main(argv=None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    from .db import CloudTennisDatabase
+    from .db import RemoteTennisDatabase
     from tennis_app.core.data_manager import (
         scrape_top_players_matches,
         scrape_top_players_extended_stats,
@@ -44,9 +44,12 @@ def main(argv=None) -> int:
         top_n = max(top_n, 1000)
         logger.info("Monday boost active: top_n=%d", top_n)
 
-    db = CloudTennisDatabase(read_only=False, sync_interval=0)
+    db = RemoteTennisDatabase()
 
     try:
+        # Cloud mode is "live-only": we don't import the 1.7M-row Sackmann
+        # historical CSVs into Turso (would take hours via HTTP).  Use local
+        # mode for full archive queries; cloud mode = always-fresh top-N.
         for tour in ("atp", "wta"):
             logger.info("=== %s: scraping top %d ===", tour.upper(), top_n)
             matches_df, rankings, scraped_names = scrape_top_players_matches(
@@ -73,16 +76,14 @@ def main(argv=None) -> int:
                     db=db,
                 )
 
-        # Final push to remote
-        if hasattr(db._impl.conn, "sync"):
-            logger.info("Final sync to Turso...")
-            db._impl.conn.sync()
+        # Final commit (no-op for remote — every call already round-trips)
+        logger.info("Cloud scrape complete")
     except Exception:
         logger.exception("Cloud scrape failed")
         return 1
     finally:
         try:
-            db._impl.conn.close()
+            db.close()
         except Exception:
             pass
 
