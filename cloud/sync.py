@@ -149,10 +149,9 @@ def sync_cloud_to_local(
     local_db_path = Path(local_db_path)
 
     if not local_db_path.exists():
-        # Let TennisDatabase create the schema first; refuse to seed CSVs here.
         raise FileNotFoundError(
-            f"Local DB {local_db_path} does not exist yet. Open the app once "
-            "to initialize it (and import CSVs) before syncing.")
+            f"Local DB {local_db_path} does not exist. "
+            "Run the app once to initialize the schema before syncing.")
 
     t0 = time.time()
     logger.info("Cloud sync: opening Turso connection...")

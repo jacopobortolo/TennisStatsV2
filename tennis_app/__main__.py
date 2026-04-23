@@ -17,6 +17,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _ensure_db_initialized():
+    """Create local DB schema if it doesn't exist yet (first run on a new PC)."""
+    try:
+        from .core.database import TennisDatabase
+        db = TennisDatabase()
+        db.conn.close()
+        logger.info("Local DB schema ready: %s", db.db_path)
+    except Exception as exc:
+        logger.warning("Could not pre-initialize local DB: %s", exc)
+
+
 def _run_cloud_sync(splash, app):
     """Try to merge cloud data into local DB. Never raises."""
     try:
@@ -46,10 +57,6 @@ def _run_cloud_sync(splash, app):
         elapsed = result.pop("_elapsed_seconds", 0.0)
         total = sum(v for v in result.values() if isinstance(v, int))
         logger.info("Cloud sync OK: %d total rows in %.1fs", total, elapsed)
-    except FileNotFoundError as exc:
-        # First run: local DB not yet initialized — open app, user can
-        # import CSVs, then re-launch to pick up cloud data.
-        logger.info("Skipping cloud sync (first run): %s", exc)
     except Exception:
         logger.exception("Cloud sync failed; opening app with stale data")
 
@@ -72,6 +79,7 @@ def main():
 
     splash = None
     if not no_sync:
+        _ensure_db_initialized()
         pix = QPixmap(520, 220)
         pix.fill(QColor("#101218"))
         splash = QSplashScreen(pix)
