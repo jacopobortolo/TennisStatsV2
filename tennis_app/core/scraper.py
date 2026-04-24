@@ -139,6 +139,9 @@ class TennisAbstractScraper:
         "đ": "d", "Đ": "D", "æ": "ae", "Æ": "AE",
         "œ": "oe", "Œ": "OE", "ß": "ss",
         "þ": "th", "Þ": "Th",
+        # Turkish letters that NFKD doesn't fully decompose
+        "ı": "i", "İ": "I", "ş": "s", "Ş": "S",
+        "ğ": "g", "Ğ": "G",
         "'": None, "\u2019": None, "\u2018": None,  # apostrophes
     })
 
@@ -583,17 +586,33 @@ class TennisAbstractScraper:
     # (built lazily from playerlist.js / wplayerlist.js)
     _PLAYERLIST_CACHE = {"atp": None, "wta": None}
 
+    @staticmethod
+    def _de_loose_key(norm_name):
+        """Reduce German-style transliterations so that a stripped-diacritic
+        name matches an umlaut-expanded one.
+
+        Tennisabstract sometimes uses German style (Möller → Moeller) while
+        our _clean_name strips diacritics (Möller → Moller).  This collapses
+        oe→o, ue→u, ae→a, ss→s so both forms map to the same loose key.
+        """
+        s = norm_name
+        s = s.replace("oe", "o").replace("ue", "u")
+        s = s.replace("ae", "a").replace("ss", "s")
+        return s
+
     def _load_playerlist(self, tour="atp"):
         """Fetch and cache the official tennisabstract playerlist for a tour.
 
         Returns a dict mapping normalized name → official name, where the
         official name's URL form (no spaces) is the actual jsfrags filename.
+        Also includes a ``__loose__`` sub-dict for umlaut-tolerant lookups.
         """
         if self._PLAYERLIST_CACHE.get(tour) is not None:
             return self._PLAYERLIST_CACHE[tour]
         fname = "playerlist.js" if tour == "atp" else "wplayerlist.js"
         url = f"{BASE_URL}/jsplayers/{fname}"
         index = {}
+        loose = {}
         try:
             resp = self._make_request(url, raise_on_error=False)
             if resp:
@@ -609,10 +628,16 @@ class TennisAbstractScraper:
                         norm = re.sub(r"\s+", " ", cleaned).lower().strip()
                         if norm and norm not in index:
                             index[norm] = cleaned
+                        # Loose key: collapse German digraphs
+                        lkey = self._de_loose_key(norm)
+                        if lkey and lkey not in loose:
+                            loose[lkey] = cleaned
         except Exception as exc:
             logger.warning("Could not load %s playerlist: %s", tour, exc)
+        index["__loose__"] = loose
         self._PLAYERLIST_CACHE[tour] = index
-        logger.info("Loaded %s playerlist: %d entries", tour, len(index))
+        logger.info("Loaded %s playerlist: %d entries (%d loose)",
+                    tour, len(index) - 1, len(loose))
         return index
 
     def _resolve_via_playerlist(self, player_name, tour="atp"):
@@ -628,21 +653,37 @@ class TennisAbstractScraper:
         index = self._load_playerlist(tour)
         if not index:
             return None
+        loose = index.get("__loose__", {})
         cleaned = self._clean_name(player_name)
         norm = re.sub(r"\s+", " ", cleaned).lower().strip()
         # 1. Exact match
-        if norm in index:
+        if norm in index and norm != "__loose__":
             return index[norm]
-        # 2. First word + last word match (handles compound surnames)
+        # 2. Loose (German digraph) match — handles Möller/Moeller mismatch
+        lkey = self._de_loose_key(norm)
+        if lkey in loose:
+            return loose[lkey]
+        # 3. First word + last word match (handles compound surnames)
         parts = norm.split()
         if len(parts) >= 2:
             first = parts[0]
             last = parts[-1]
+            l_first = self._de_loose_key(first)
+            l_last = self._de_loose_key(last)
             candidates = []
             for k, v in index.items():
+                if k == "__loose__":
+                    continue
                 kp = k.split()
                 if len(kp) >= 2 and kp[0] == first and kp[-1] == last:
                     candidates.append(v)
+            if not candidates:
+                # Loose first+last match
+                for k, v in loose.items():
+                    kp = k.split()
+                    if (len(kp) >= 2 and kp[0] == l_first
+                            and kp[-1] == l_last):
+                        candidates.append(v)
             if len(candidates) == 1:
                 return candidates[0]
             if len(candidates) > 1:
