@@ -613,8 +613,29 @@ class TennisDatabase:
                            year=None, opponent_id=None, round_=None,
                            tour=None):
         """Get all matches for a player with optional filters."""
-        conditions = ["(winner_id = ? OR loser_id = ?)"]
-        params = [player_id, player_id]
+        # Resolve full name for this player_id so we can also catch SCRAPED
+        # matches where winner_id/loser_id was left empty by the scraper.
+        name_row = self.conn.execute(
+            "SELECT name_first, name_last FROM players WHERE player_id = ? LIMIT 1",
+            (player_id,)
+        ).fetchone()
+        player_name = (
+            f"{name_row[0]} {name_row[1]}".strip() if name_row else None
+        )
+
+        if player_name:
+            id_cond = (
+                "(winner_id = ? OR loser_id = ? "
+                "OR (winner_id = '' AND winner_name = ?) "
+                "OR (loser_id  = '' AND loser_name  = ?))"
+            )
+            id_params = [player_id, player_id, player_name, player_name]
+        else:
+            id_cond = "(winner_id = ? OR loser_id = ?)"
+            id_params = [player_id, player_id]
+
+        conditions = [id_cond]
+        params = id_params
 
         if tour:
             conditions.append("tour = ?")
