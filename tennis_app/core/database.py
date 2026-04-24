@@ -122,7 +122,8 @@ class TennisDatabase:
                 l_bpSaved REAL, l_bpFaced REAL,
                 winner_rank REAL, winner_rank_points REAL,
                 loser_rank REAL, loser_rank_points REAL,
-                tour TEXT
+                tour TEXT,
+                is_upcoming INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS rankings (
@@ -413,6 +414,20 @@ class TennisDatabase:
             cur.execute("ALTER TABLE extended_stats_cache ADD COLUMN activity_fingerprint TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
+        # Migrate matches table: add is_upcoming flag for scheduled
+        # matches that haven't been played yet (used by the matches UI
+        # banner; analytics queries should filter is_upcoming=0).
+        try:
+            cur.execute(
+                "ALTER TABLE matches ADD COLUMN is_upcoming INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_matches_upcoming "
+                "ON matches(is_upcoming, winner_name, loser_name)")
+        except sqlite3.OperationalError:
+            pass
         # Migrate extended stats tables: add tourney_level column.
         for tbl in ("match_winners_errors", "match_serve_speed",
                      "match_pbp_stats", "match_mcp_serve",
@@ -661,6 +676,8 @@ class TennisDatabase:
         if round_:
             conditions.append("round = ?")
             params.append(round_)
+        # Always exclude scheduled/upcoming matches from analytics views.
+        conditions.append("(is_upcoming = 0 OR is_upcoming IS NULL)")
 
         where = " AND ".join(conditions)
         query = f"""
@@ -683,6 +700,50 @@ class TennisDatabase:
         cur = self.conn.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
+    def get_player_upcoming_match(self, player_name):
+        """Return the next scheduled match for *player_name*, or None.
+
+        Looks for rows in ``matches`` with ``is_upcoming = 1`` where
+        the player appears as either winner or loser placeholder.
+        Returns the soonest one (earliest tourney_date).
+        """
+        if not player_name:
+            return None
+        try:
+            row = self.conn.execute("""
+                SELECT * FROM matches
+                WHERE is_upcoming = 1
+                  AND (REPLACE(winner_name, '-', ' ') = ?
+                       OR REPLACE(loser_name, '-', ' ') = ?)
+                ORDER BY tourney_date ASC, match_num ASC
+                LIMIT 1
+            """, (player_name.replace("-", " "),
+                  player_name.replace("-", " "))).fetchone()
+        except sqlite3.OperationalError:
+            # is_upcoming column not yet present (pre-migration).
+            return None
+        if not row:
+            return None
+        d = dict(row)
+        # The "opponent" is whichever side is not the queried player.
+        # We stored player_name as winner_name when scraping; if hyphen
+        # normalisation differs, fall back to matching by substring.
+        target = player_name.lower().replace("-", " ")
+        wn = (d.get("winner_name") or "").lower().replace("-", " ")
+        if wn == target:
+            d["opponent"] = d.get("loser_name")
+            d["opponent_seed"] = d.get("loser_seed")
+            d["opponent_entry"] = d.get("loser_entry")
+            d["opponent_ioc"] = d.get("loser_ioc")
+            d["opponent_rank"] = d.get("loser_rank")
+        else:
+            d["opponent"] = d.get("winner_name")
+            d["opponent_seed"] = d.get("winner_seed")
+            d["opponent_entry"] = d.get("winner_entry")
+            d["opponent_ioc"] = d.get("winner_ioc")
+            d["opponent_rank"] = d.get("winner_rank")
+        return d
+
     def get_player_career_stats(self, player_id, tour=None):
         """Calculate career statistics for a player."""
         tour_cond = " AND tour = ?" if tour else ""
@@ -703,6 +764,7 @@ class TennisDatabase:
                        w_2ndWon as second_won, w_bpSaved as bp_saved,
                        w_bpFaced as bp_faced
                 FROM matches WHERE winner_id = ?{tour_cond}
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
                 UNION ALL
                 SELECT 'L' as side, surface, tourney_level, round, tourney_date,
                        l_ace as aces, l_df as dfs, l_svpt as svpt,
@@ -710,6 +772,7 @@ class TennisDatabase:
                        l_2ndWon as second_won, l_bpSaved as bp_saved,
                        l_bpFaced as bp_faced
                 FROM matches WHERE loser_id = ?{tour_cond}
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
             )
             GROUP BY side, surface, tourney_level, round, yr
         """, (player_id,) + tour_params + (player_id,) + tour_params).fetchall()
@@ -821,6 +884,7 @@ class TennisDatabase:
             SELECT * FROM matches
             WHERE ((winner_id = ? AND loser_id = ?)
                OR (winner_id = ? AND loser_id = ?)){tour_cond}
+              AND (is_upcoming = 0 OR is_upcoming IS NULL)
             ORDER BY tourney_date DESC
         """, (player1_id, player2_id, player2_id, player1_id) + tour_params).fetchall()
 
@@ -1088,6 +1152,7 @@ class TennisDatabase:
         cur = self.conn.execute(f"""
             SELECT * FROM matches
             WHERE {where}
+              AND (is_upcoming = 0 OR is_upcoming IS NULL)
             ORDER BY tourney_date DESC, match_num DESC
         """, params)
         results = [dict(r) for r in cur.fetchall()]
@@ -1134,6 +1199,7 @@ class TennisDatabase:
                    tourney_date
             FROM matches
             WHERE {where}
+              AND (is_upcoming = 0 OR is_upcoming IS NULL)
             ORDER BY tourney_date
         """, params)
         return [dict(r) for r in cur.fetchall()]
@@ -1165,12 +1231,14 @@ class TennisDatabase:
             cur = self.conn.execute("""
                 SELECT DISTINCT SUBSTR(tourney_date, 1, 4) as year
                 FROM matches WHERE tour = ?
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
                 ORDER BY year
             """, (tour,))
         else:
             cur = self.conn.execute("""
                 SELECT DISTINCT SUBSTR(tourney_date, 1, 4) as year
                 FROM matches
+                WHERE (is_upcoming = 0 OR is_upcoming IS NULL)
                 ORDER BY year
             """)
         return [r[0] for r in cur.fetchall()]
@@ -1341,6 +1409,22 @@ class TennisDatabase:
                 f"AND (winner_name IN ({placeholders}) "
                 f"OR loser_name IN ({placeholders}))",
                 player_list + player_list)
+
+        # Always wipe stale upcoming rows for the scraped players, even
+        # in incremental mode: when an upcoming match is finally played,
+        # winner/loser may swap, so the dedup LEFT JOIN below cannot
+        # match the placeholder row.  Re-import rebuilds upcoming list.
+        if scraped_players:
+            placeholders = ",".join("?" for _ in scraped_players)
+            player_list = list(scraped_players)
+            try:
+                self.conn.execute(
+                    f"DELETE FROM matches WHERE is_upcoming = 1 "
+                    f"AND (winner_name IN ({placeholders}) "
+                    f"OR loser_name IN ({placeholders}))",
+                    player_list + player_list)
+            except sqlite3.OperationalError:
+                pass  # column missing on first run before migration
 
         # Remove duplicates within the DataFrame (same date + winner + loser + tourney)
         matches_df = matches_df.drop_duplicates(
@@ -1583,16 +1667,40 @@ class TennisDatabase:
     def update_scrape_cache(self, player_name, match_count,
                             last_match_date=None,
                             activity_fingerprint=None):
-        """Record that a player was just scraped."""
+        """Record that a player was just scraped.
+
+        If *activity_fingerprint* is None, the existing stored
+        fingerprint is preserved (only ``last_scraped`` and
+        ``match_count`` are updated).  Callers pass None when a scrape
+        produced no real matches but we still want to mark the run as
+        attempted; preserving the old fingerprint ensures the next run
+        will detect activity change and retry (instead of treating the
+        new fingerprint as already-scraped).
+        """
         from datetime import datetime
-        self.conn.execute(
-            "INSERT OR REPLACE INTO scrape_cache "
-            "(player_name, last_scraped, match_count, last_match_date, "
-            "activity_fingerprint) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (player_name, datetime.now().isoformat(), match_count,
-             last_match_date, activity_fingerprint)
-        )
+        now_iso = datetime.now().isoformat()
+        if activity_fingerprint is None:
+            self.conn.execute(
+                "INSERT INTO scrape_cache "
+                "(player_name, last_scraped, match_count, "
+                "last_match_date, activity_fingerprint) "
+                "VALUES (?, ?, ?, ?, NULL) "
+                "ON CONFLICT(player_name) DO UPDATE SET "
+                "last_scraped = excluded.last_scraped, "
+                "match_count = excluded.match_count, "
+                "last_match_date = COALESCE(excluded.last_match_date, "
+                "                          scrape_cache.last_match_date)",
+                (player_name, now_iso, match_count, last_match_date)
+            )
+        else:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO scrape_cache "
+                "(player_name, last_scraped, match_count, last_match_date, "
+                "activity_fingerprint) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (player_name, now_iso, match_count,
+                 last_match_date, activity_fingerprint)
+            )
         self.conn.commit()
 
     def get_stale_players(self, player_names, expire_hours=6):
@@ -1922,14 +2030,31 @@ class TennisDatabase:
     @_locked_write
     def update_extended_stats_cache(self, player_name, tables_scraped,
                                     activity_fingerprint=None):
-        """Record that extended stats were scraped for a player."""
+        """Record that extended stats were scraped for a player.
+
+        If *activity_fingerprint* is None, the existing stored
+        fingerprint is preserved.  See :meth:`update_scrape_cache`.
+        """
         from datetime import datetime
-        self.conn.execute(
-            "INSERT OR REPLACE INTO extended_stats_cache "
-            "(player_name, last_scraped, tables_scraped, activity_fingerprint) "
-            "VALUES (?, ?, ?, ?)",
-            (player_name, datetime.now().isoformat(),
-             ",".join(tables_scraped), activity_fingerprint))
+        now_iso = datetime.now().isoformat()
+        tables_csv = ",".join(tables_scraped)
+        if activity_fingerprint is None:
+            self.conn.execute(
+                "INSERT INTO extended_stats_cache "
+                "(player_name, last_scraped, tables_scraped, "
+                "activity_fingerprint) "
+                "VALUES (?, ?, ?, NULL) "
+                "ON CONFLICT(player_name) DO UPDATE SET "
+                "last_scraped = excluded.last_scraped, "
+                "tables_scraped = excluded.tables_scraped",
+                (player_name, now_iso, tables_csv))
+        else:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO extended_stats_cache "
+                "(player_name, last_scraped, tables_scraped, "
+                "activity_fingerprint) "
+                "VALUES (?, ?, ?, ?)",
+                (player_name, now_iso, tables_csv, activity_fingerprint))
         self.conn.commit()
 
     def has_extended_new_activity(self, player_name, new_fingerprint):

@@ -857,17 +857,28 @@ class TennisAbstractScraper:
         frag_match = re.search(
             r'var\s+player_frag\s*=\s*`(.*?)`', jsfrags_text, re.DOTALL)
         if not frag_match:
+            logger.info(
+                "[ext-diag] %s: no player_frag block in jsfrags "
+                "(will fall back to player-more.cgi for all tables)",
+                player_name)
             return {}
         soup = BeautifulSoup(frag_match.group(1), "html.parser")
 
         results = {}
+        diag = []
         for table_name in table_names:
             table_el = soup.find("table", id=table_name)
             if not table_el:
+                diag.append(f"{table_name}=missing")
                 continue
             rows = self._parse_table_from_soup(table_el, player_name, table_name)
             if rows:
                 results[table_name] = rows
+                diag.append(f"{table_name}={len(rows)}")
+            else:
+                diag.append(f"{table_name}=0")
+        logger.info("[ext-diag] %s jsfrags tables: %s",
+                    player_name, ", ".join(diag) if diag else "(none)")
         return results
 
     def fetch_all_extended_tables(self, player_name, tables=None,
@@ -875,9 +886,10 @@ class TennisAbstractScraper:
         """
         Fetch all (or specified) extended data tables for a player.
 
-        First tries to parse tables from the jsfrags file (already fetched
-        during player_id discovery). Only falls back to individual
-        player-more.cgi requests for tables not found in jsfrags.
+        Each table is fetched from ``player-more.cgi`` because the embedded
+        ``var player_frag = `...```` block in jsfrags is truncated to roughly
+        the most recent 20 matches per table, while the per-table CGI
+        endpoint returns the full 52-week (and Match Charting) dataset.
 
         Returns dict: { "winners-errors": [rows], "serve-speed": [rows], ... }
         """
@@ -885,32 +897,34 @@ class TennisAbstractScraper:
             tables = self.EXTENDED_TABLES
 
         url_name = self._make_player_url_name(player_name)
-        pid, jsfrags_text = self._discover_player_id(
+        pid, _jsfrags_text = self._discover_player_id(
             url_name, original_name=player_name, tour=tour)
 
-        # Step 1: try parsing all tables from jsfrags (no extra HTTP)
         results = {}
-        if jsfrags_text:
-            results = self._parse_tables_from_jsfrags(
-                jsfrags_text, player_name, tables)
-            if results:
-                logger.info("Parsed %d/%d tables from jsfrags for %s",
-                            len(results), len(tables), player_name)
-
-        # Step 2: fetch any missing tables via player-more.cgi
-        missing = [t for t in tables if t not in results]
-        if missing and pid:
-            for i, table_name in enumerate(missing):
+        if not pid:
+            logger.warning(
+                "Could not find player_id for %s, all %d tables missing",
+                player_name, len(tables))
+        else:
+            for i, table_name in enumerate(tables):
                 if progress_callback:
-                    progress_callback(len(results) + i, len(tables),
-                                      f"Fetching {table_name} for {player_name}...")
-                rows = self.fetch_extended_table(player_name, table_name,
-                                                 _pid=pid, tour=tour)
+                    progress_callback(
+                        i, len(tables),
+                        f"Fetching {table_name} for {player_name}...")
+                rows = self.fetch_extended_table(
+                    player_name, table_name, _pid=pid, tour=tour)
                 if rows:
                     results[table_name] = rows
-        elif missing and not pid:
-            logger.warning("Could not find player_id for %s, %d tables missing",
-                           player_name, len(missing))
+
+        # Diagnostic summary: per-table row count
+        summary = ", ".join(f"{t}={len(results[t])}"
+                            for t in tables if t in results)
+        missing_after = [t for t in tables if t not in results]
+        if missing_after:
+            summary = (summary + "; missing=" + ",".join(missing_after)
+                       if summary else "missing=" + ",".join(missing_after))
+        logger.info("[ext-diag] %s summary: %s", player_name,
+                    summary or "(no tables)")
 
         if progress_callback:
             progress_callback(len(tables), len(tables),
@@ -1339,9 +1353,15 @@ def convert_scraped_to_db_format(raw_matches, player_name, min_year=None,
             opponent = row.get("opp", "")
             score = row.get("score", "")
 
-            # Skip walkovers and empty scores
-            if score in ("W/O", "", None) or pd.isna(score) if isinstance(score, float) else False:
+            # Walkovers (no data, no future meaning) are still skipped.
+            if score == "W/O":
                 continue
+            # Empty score = upcoming/scheduled match (not yet played).
+            score_is_empty = (
+                score in ("", None)
+                or (isinstance(score, float) and pd.isna(score))
+            )
+            is_upcoming = score_is_empty and bool(opponent)
 
             surface = row.get("surf", "")
             tourney = row.get("tourn", "")
@@ -1367,7 +1387,27 @@ def convert_scraped_to_db_format(raw_matches, player_name, min_year=None,
 
             prank = row.get("prank")
 
-            if wl == "W":
+            if is_upcoming:
+                # Scheduled match: store player as placeholder winner so
+                # name-based queries still find it; the is_upcoming flag
+                # is what callers should filter on.
+                winner_name = player_name
+                loser_name = opponent
+                winner_rank = safe_num(prank)
+                loser_rank = safe_num(orank)
+                winner_seed = pseed
+                winner_entry = pentry
+                loser_seed = oseed
+                loser_entry = oentry
+                winner_ioc = None
+                loser_ioc = oioc
+                w_ace = w_df = w_svpt = w_1stIn = None
+                w_1stWon = w_2ndWon = w_SvGms = None
+                w_bpSaved = w_bpFaced = None
+                l_ace = l_df = l_svpt = l_1stIn = None
+                l_1stWon = l_2ndWon = l_SvGms = None
+                l_bpSaved = l_bpFaced = None
+            elif wl == "W":
                 winner_name = player_name
                 loser_name = opponent
                 winner_rank = safe_num(prank)
@@ -1487,6 +1527,7 @@ def convert_scraped_to_db_format(raw_matches, player_name, min_year=None,
                 "loser_rank": loser_rank,
                 "loser_rank_points": None,
                 "tour": "atp",
+                "is_upcoming": 1 if is_upcoming else 0,
             })
 
         except Exception as exc:

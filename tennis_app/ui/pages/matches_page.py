@@ -80,6 +80,19 @@ class MatchesPage(QWidget):
         filter_row.addStretch()
         layout.addLayout(filter_row)
 
+        # --- Upcoming match banner ---
+        self.upcoming_label = QLabel("")
+        self.upcoming_label.setObjectName("upcomingBanner")
+        self.upcoming_label.setStyleSheet(
+            "QLabel#upcomingBanner {"
+            f"background-color: {COLORS['accent_dim']};"
+            f"color: {COLORS['accent']};"
+            f"border: 1px solid {COLORS['accent']};"
+            "padding: 8px 12px; border-radius: 6px; font-weight: 600;}"
+        )
+        self.upcoming_label.setVisible(False)
+        layout.addWidget(self.upcoming_label)
+
         # --- Table ---
         self.table = DataTable([
             ("Date", 90), ("Tournament", 170), ("Level", 80),
@@ -121,6 +134,33 @@ class MatchesPage(QWidget):
         self._current_player = f"{player['name_first']} {player['name_last']}"
         self._refetch_matches()
 
+    def _refresh_upcoming_banner(self):
+        """Show next scheduled match for the selected player, if any."""
+        if not self._current_player:
+            self.upcoming_label.setVisible(False)
+            return
+        try:
+            row = self.db.get_player_upcoming_match(self._current_player)
+        except Exception:
+            self.upcoming_label.setVisible(False)
+            return
+        if not row:
+            self.upcoming_label.setVisible(False)
+            return
+        date = str(row.get("tourney_date") or "")
+        if len(date) == 8:
+            date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+        opp = row.get("opponent") or "?"
+        opp_rank = row.get("opponent_rank")
+        opp_str = f"{opp} (#{int(opp_rank)})" if opp_rank else opp
+        tourney = row.get("tourney_name") or ""
+        round_ = row.get("round") or ""
+        round_str = f" \u2013 {round_}" if round_ else ""
+        self.upcoming_label.setText(
+            f"Next match: {opp_str}  \u00b7  {tourney}{round_str}  \u00b7  {date}"
+        )
+        self.upcoming_label.setVisible(True)
+
     def _connect_filters(self):
         """Wire filter widgets to re-fetch matches when the user changes them."""
         self.surface_pills.changed.connect(lambda _: self._refetch_matches())
@@ -134,6 +174,9 @@ class MatchesPage(QWidget):
         """Re-query the DB using current filter values for the selected player."""
         if not self._current_player_id:
             return
+
+        # Refresh upcoming-match banner (independent of filters).
+        self._refresh_upcoming_banner()
 
         surface = self.surface_pills.value()
         surface = None if surface == "All" else surface
