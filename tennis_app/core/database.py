@@ -624,12 +624,14 @@ class TennisDatabase:
         )
 
         if player_name:
+            # Normalize hyphens: match both "Auger-Aliassime" and "Auger Aliassime"
+            player_name_nohyphen = player_name.replace("-", " ")
             id_cond = (
                 "(winner_id = ? OR loser_id = ? "
-                "OR (winner_id = '' AND winner_name = ?) "
-                "OR (loser_id  = '' AND loser_name  = ?))"
+                "OR (winner_id = '' AND REPLACE(winner_name, '-', ' ') = ?) "
+                "OR (loser_id  = '' AND REPLACE(loser_name,  '-', ' ') = ?))"
             )
-            id_params = [player_id, player_id, player_name, player_name]
+            id_params = [player_id, player_id, player_name_nohyphen, player_name_nohyphen]
         else:
             id_cond = "(winner_id = ? OR loser_id = ?)"
             id_params = [player_id, player_id]
@@ -1234,11 +1236,19 @@ class TennisDatabase:
         if progress_callback:
             progress_callback(0, 1, "Importing scraped matches...")
 
-        # Normalize player names: strip diacritics for consistency
+        # Normalize player names: strip diacritics + replace hyphens with spaces
+        # (tennisabstract uses both "Auger-Aliassime" and "Auger Aliassime" for
+        # the same player; normalising to spaces ensures consistent storage and
+        # correct dedup)
+        def _normalize_player_name(name):
+            if not isinstance(name, str):
+                return name
+            return _strip_diacritics(name).replace("-", " ")
+
         matches_df = matches_df.copy()
         for col in ("winner_name", "loser_name"):
             if col in matches_df.columns:
-                matches_df[col] = matches_df[col].apply(_strip_diacritics)
+                matches_df[col] = matches_df[col].apply(_normalize_player_name)
 
         # Build a name→id and name→ioc cache from existing players (single scan)
         name_cache = {}
