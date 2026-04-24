@@ -1,57 +1,114 @@
 # TennisStatsV2
 
-Two ways to run the app:
-
-| Mode      | Database              | Continuous updates with PC off? | Setup     |
-| --------- | --------------------- | -------------------------------- | --------- |
-| **Local** (default)    | local `tennis.db`     | Only via Windows Task Scheduler  | Easy      |
-| **Cloud** (`cloud/`)   | Turso (libSQL) remote | Yes, hourly via GitHub Actions   | 10 min    |
+Desktop tennis analytics app built with PySide6. Combines historical match data from Jeff Sackmann's CSV datasets with live scraping from tennisabstract.com, kept fresh 24/7 by a GitHub Actions cron job writing to a Turso cloud database.
 
 ---
 
-## Local mode
+## Architecture
 
-```powershell
-pip install -r requirements.txt
-python -m tennis_app          # full UI
-python -m tennis_app.cron     # headless scrape (used by Task Scheduler)
+```
+┌─────────────────────────┐   every 4h   ┌──────────────────┐
+│ GitHub Actions          │ ────────────► │  Turso (libSQL)  │
+│  cloud/scrape_job.py    │              │  cloud DB        │
+│  top-1000 players       │              └────────┬─────────┘
+└─────────────────────────┘                       │
+                                                  │ sync on startup
+                                                  ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Desktop app  (python -m tennis_app)                         │
+│                                                             │
+│  splash: init DB → cloud sync → open UI                    │
+│                                                             │
+│  local SQLite  (~/.tennis_analytics/data/tennis.db)         │
+│   ├── historical matches   (Sackmann CSVs, 1968–today)      │
+│   ├── live matches         (scraped, tourney_id='SCRAPED')  │
+│   ├── live rankings        (ranking_date='LIVE')            │
+│   └── extended stats       (from cloud sync)                │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-Recent local-mode improvements:
+---
 
-- **Concurrency-safe DB** — `RLock` + `busy_timeout=10000` prevents the
-  "database is locked" error when the live scrape and background
-  extended-stats workers run simultaneously.
-- **Unique staging tables** — each `import_scraped_matches` call uses a
-  UUID-suffixed staging table, so parallel imports never collide.
-- **Parallel scraping** — the per-player HTTP loop uses an 8-thread
-  pool, ~6-8× faster on top-150 refreshes.
-- **Background scrape pause** — the extended-stats worker now pauses
-  when "Scrape Live Data" is clicked, then resumes after.
-- **Headless cron** — `python -m tennis_app.cron` runs the same pipeline
-  as the UI button, with no Qt dependency, so it can be triggered by
-  Windows Task Scheduler.
+## Quick start
 
-### Schedule hourly scrapes (PC must be on)
+```powershell
+git clone https://github.com/jacopobortolo/TennisStatsV2.git
+cd TennisStatsV2
+pip install -r requirements.txt
+python -m tennis_app
+```
+
+**First launch on a new PC:**
+1. The app initialises the local SQLite schema automatically
+2. Cloud sync runs — downloads all scraped matches and live rankings from Turso
+3. Historical CSV data (Sackmann, 1968–present) is downloaded and imported automatically (~300 MB, one-time)
+4. All subsequent launches sync only the delta from cloud
+
+To skip the cloud sync (offline mode):
+```powershell
+python -m tennis_app --no-sync
+```
+
+---
+
+## Cloud scrape job (GitHub Actions)
+
+See [`cloud/README.md`](cloud/README.md) for the one-time setup.
+
+Key behaviour:
+- Runs every **4 hours** (`cron: '7 */4 * * *'`)
+- Scrapes the **top 1000 ATP + WTA players** from tennisabstract.com
+- Uses **activity fingerprinting** (current/previous tournament from OFFICIAL rankings) to skip players with no new matches — only truly changed fingerprints trigger a re-scrape
+- Imports only the **20 most recent matches** per player per run (incremental, non-destructive)
+- Extended stats are included in the cloud DB and synced to the desktop at startup
+
+---
+
+## Pages
+
+| Tab | Description |
+|-----|-------------|
+| **Rankings** | Live ATP/WTA rankings with filtering |
+| **Player** | Player profile, stats, surface breakdown |
+| **Matches** | Match history with surface/year/round/level filters |
+| **H2H** | Head-to-head record between two players |
+| **Stats** | Extended match statistics (serve speed, rally length, etc.) |
+| **Tournaments** | Tournament history and results |
+
+---
+
+## Manual operations
+
+```powershell
+# Headless scrape (same pipeline as the UI button, no Qt needed)
+python -m tennis_app.cron
+```
+
+**"Refresh Extended Stats" button** in the toolbar manually triggers a scrape of extended stats (serve speed, rally, MCP stats, etc.) for the top 150 players. Normally this data comes from the cloud sync — use this only if you need fresher data between syncs.
+
+---
+
+## Local cron (Windows Task Scheduler)
+
+If you also want the PC to run scrapes locally:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1
 ```
 
-This creates a "TennisStats Hourly Scrape" task that runs `scrape.bat`
-every hour.  See `scripts/install_task.ps1` for parameters.
+Creates a "TennisStats Hourly Scrape" task running `scrape.bat` every hour.
 
 ---
 
-## Cloud mode (GitHub Actions + Turso)
+## Requirements
 
-See [`cloud/README.md`](cloud/README.md) for the full setup.  TL;DR:
-
-1. `turso db create tennis-stats` → save URL + auth token
-2. Add the two values as GitHub repo secrets
-3. Push `.github/workflows/scrape.yml` — hourly cron starts immediately
-4. `python -m cloud.run_app` on the desktop reads from the synced replica
-
-Both modes share the entire `tennis_app/` source tree; the cloud variant
-is a thin overlay (~200 LoC) that swaps the SQLite connection for a
-libSQL embedded replica.
+| Package | Version | Purpose |
+|---------|---------|---------|
+| PySide6 | ≥6.6.0 | Desktop UI |
+| pandas | ≥2.0.0 | Data processing |
+| requests | ≥2.28.0 | HTTP downloads |
+| beautifulsoup4 | ≥4.12.0 | HTML parsing |
+| cloudscraper | ≥1.2.0 | tennisabstract scraping (bypasses Cloudflare) |
+| matplotlib | ≥3.7.0 | Charts |
+| plotly | ≥5.18.0 | Interactive charts |
+| libsql-client | ≥0.3.1 | Turso cloud DB (cloud sync only) |
