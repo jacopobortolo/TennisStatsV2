@@ -266,9 +266,22 @@ class MainWindow(QMainWindow):
         """Navigate to the Stats page and load a player by name."""
         self._switch_page("stats")
         stats_page = self._pages.get("stats")
-        if stats_page:
-            stats_page.search_bar.set_text(player_name)
-            stats_page._on_search(player_name)
+        if not stats_page:
+            return
+        # Resolve name → player record via DB so we can call _load_player
+        # directly (the search widget API uses player_selected, not text).
+        try:
+            results = self.db.search_players(player_name, limit=1)
+        except Exception:
+            results = []
+        if not results:
+            return
+        player = results[0]
+        # Reflect the choice in the search field for visual consistency
+        if hasattr(stats_page, "player_edit") and hasattr(
+                stats_page.player_edit, "set_text"):
+            stats_page.player_edit.set_text(player.get("name", player_name))
+        stats_page._load_player(player)
 
     # ------------------------------------------------------------------
     # Data loading

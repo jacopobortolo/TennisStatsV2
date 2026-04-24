@@ -27,6 +27,31 @@ def _strip_diacritics(text):
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
+def _player_match_key(name):
+    """Canonical lookup key for player-name matching across CSV / scraped
+    sources.  Lowercased, transliterated (ø → o, ł → l, …), apostrophe-free,
+    hyphen-free, whitespace-collapsed.  Used to merge variants like::
+
+        Christopher O'Connell ↔ Christopher Oconnell
+        Elmer Møller          ↔ Elmer Moller
+        Auger-Aliassime       ↔ Auger Aliassime
+    """
+    if not isinstance(name, str) or not name:
+        return ""
+    # Re-use the scraper's transliteration table (handles ø/ł/ı/ş/ğ/ß/…)
+    # plus NFKD diacritic stripping.
+    try:
+        from .scraper import clean_player_name as _clean
+        s = _clean(name) or name
+    except Exception:
+        s = _strip_diacritics(name)
+    for ch in ("'", "\u2019", "\u2018", "`"):
+        s = s.replace(ch, "")
+    s = s.replace("-", " ")
+    s = " ".join(s.split())
+    return s.lower()
+
+
 def _locked_write(method):
     """Decorator: serialize a write method through ``self._write_lock``.
 
@@ -437,6 +462,30 @@ class TennisDatabase:
                 cur.execute(f"ALTER TABLE {tbl} ADD COLUMN tourney_level TEXT")
             except sqlite3.OperationalError:
                 pass  # column already exists
+
+        # One-shot migration: normalize player_name in extended-stats
+        # tables and cache to the diacritic-free spelling used in the
+        # ``players`` table (e.g. "Rafael Jódar" → "Rafael Jodar"), so
+        # that lookups by ``f"{name_first} {name_last}"`` find the rows.
+        try:
+            self._migrate_normalize_extended_player_names(cur)
+        except Exception:
+            logger.exception(
+                "Failed to normalize extended-stats player names "
+                "(non-fatal, will retry on next start)")
+
+        # One-shot migration: canonicalize winner_name / loser_name in
+        # the ``matches`` table against the spellings used in the
+        # ``players`` table (e.g. "Christopher Oconnell" →
+        # "Christopher O'Connell", "Marvin Möller" → "Marvin Moller"),
+        # then collapse duplicate match rows that differed only by name
+        # spelling.
+        try:
+            self._migrate_normalize_match_player_names(cur)
+        except Exception:
+            logger.exception(
+                "Failed to normalize matches.winner_name/loser_name "
+                "(non-fatal, will retry on next start)")
 
         # --- Phase 2 composite indexes for faster queries ---
         cur.executescript("""
@@ -1321,6 +1370,7 @@ class TennisDatabase:
         # Build a name→id and name→ioc cache from existing players (single scan)
         name_cache = {}
         name_ioc_cache = {}
+        canonical_name_by_key = {}
         cur = self.conn.execute(
             "SELECT player_id, name_first, name_last, ioc FROM players")
         for row in cur:
@@ -1334,6 +1384,25 @@ class TennisDatabase:
                     name_ioc_cache[full.lower()] = row[3]
                     if stripped != full.lower():
                         name_ioc_cache[stripped] = row[3]
+                # Canonical-name lookup keyed on fully-normalized form so
+                # scraped variants (different apostrophe / case / accent)
+                # collapse onto the CSV spelling.
+                key = _player_match_key(full)
+                if key and key not in canonical_name_by_key:
+                    canonical_name_by_key[key] = full
+
+        def _canonicalize(name):
+            if not isinstance(name, str) or not name:
+                return name
+            key = _player_match_key(name)
+            return canonical_name_by_key.get(key, name)
+
+        # Replace scraped winner/loser names with the canonical CSV spelling
+        # whenever the player exists in the players table.  Prevents duplicate
+        # match rows that differ only by name spelling.
+        for col in ("winner_name", "loser_name"):
+            if col in matches_df.columns:
+                matches_df[col] = matches_df[col].apply(_canonicalize)
 
         def resolve(name):
             if not name:
@@ -1862,6 +1931,166 @@ class TennisDatabase:
             f"SELECT * FROM match_mcp_tactics WHERE {where} "
             "ORDER BY tourney_date DESC", params)
         return [dict(r) for r in cur.fetchall()]
+
+    def _migrate_normalize_extended_player_names(self, cur):
+        """Rewrite ``player_name`` in extended-stats tables and cache to
+        the diacritic-free spelling produced by ``clean_player_name``.
+
+        Idempotent: rows already in canonical form are skipped.  When a
+        canonical row already exists for the same player, the legacy
+        accented row is deleted to avoid PRIMARY KEY conflicts in the
+        cache table.
+        """
+        from .scraper import clean_player_name
+
+        tables = [
+            "match_winners_errors", "match_serve_speed", "match_pbp_stats",
+            "match_mcp_serve", "match_mcp_return", "match_mcp_rally",
+            "match_mcp_tactics", "extended_stats_cache",
+        ]
+        total_updated = 0
+        for tbl in tables:
+            try:
+                rows = cur.execute(
+                    f"SELECT DISTINCT player_name FROM {tbl}"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue  # table doesn't exist yet
+            for (raw,) in rows:
+                if not raw:
+                    continue
+                canonical = clean_player_name(raw)
+                if not canonical or canonical == raw:
+                    continue
+                if tbl == "extended_stats_cache":
+                    # PK conflict possible — delete legacy if canonical exists
+                    exists = cur.execute(
+                        f"SELECT 1 FROM {tbl} WHERE player_name = ?",
+                        (canonical,)).fetchone()
+                    if exists:
+                        cur.execute(
+                            f"DELETE FROM {tbl} WHERE player_name = ?",
+                            (raw,))
+                    else:
+                        cur.execute(
+                            f"UPDATE {tbl} SET player_name = ? "
+                            f"WHERE player_name = ?",
+                            (canonical, raw))
+                else:
+                    cur.execute(
+                        f"UPDATE {tbl} SET player_name = ? "
+                        f"WHERE player_name = ?",
+                        (canonical, raw))
+                total_updated += 1
+        if total_updated:
+            self.conn.commit()
+            logger.info(
+                "Normalized %d distinct accented player_name entries "
+                "across extended-stats tables", total_updated)
+
+    def _migrate_normalize_match_player_names(self, cur):
+        """Collapse name-spelling duplicates in the ``matches`` table.
+
+        Two-phase, idempotent:
+
+        1. Build a canonical-name map from the ``players`` table keyed on
+           the diacritic / case / apostrophe / hyphen-insensitive form
+           (see ``_player_match_key``).  Update every ``winner_name`` /
+           ``loser_name`` whose canonical form differs.
+
+        2. Delete duplicate rows that differ only by spelling, grouping
+           on (tour, tourney_id, tourney_date, round, winner_name,
+           loser_name).  In each group keep the row with the most
+           informative ``score`` (longest non-NULL), preferring
+           ``is_upcoming = 0`` over scheduled rows.
+        """
+        # Phase 1: build canonical lookup
+        canonical_by_key = {}
+        for row in cur.execute(
+                "SELECT name_first, name_last FROM players"):
+            first, last = row[0] or "", row[1] or ""
+            full = f"{first} {last}".strip()
+            if not full:
+                continue
+            key = _player_match_key(full)
+            if key and key not in canonical_by_key:
+                canonical_by_key[key] = full
+
+        if not canonical_by_key:
+            return
+
+        # Collect distinct names actually present in matches
+        distinct_names = set()
+        try:
+            for (n,) in cur.execute(
+                    "SELECT DISTINCT winner_name FROM matches "
+                    "WHERE winner_name IS NOT NULL"):
+                distinct_names.add(n)
+            for (n,) in cur.execute(
+                    "SELECT DISTINCT loser_name FROM matches "
+                    "WHERE loser_name IS NOT NULL"):
+                distinct_names.add(n)
+        except sqlite3.OperationalError:
+            return
+
+        rename_pairs = []  # (old, new)
+        for raw in distinct_names:
+            if not raw:
+                continue
+            key = _player_match_key(raw)
+            canonical = canonical_by_key.get(key)
+            if canonical and canonical != raw:
+                rename_pairs.append((raw, canonical))
+
+        for old, new in rename_pairs:
+            cur.execute(
+                "UPDATE matches SET winner_name = ? WHERE winner_name = ?",
+                (new, old))
+            cur.execute(
+                "UPDATE matches SET loser_name = ? WHERE loser_name = ?",
+                (new, old))
+
+        # Phase 2: dedup.  Group by the natural identity of a match.
+        dup_groups = cur.execute("""
+            SELECT tour, tourney_id, tourney_date, round,
+                   winner_name, loser_name, COUNT(*) AS cnt
+            FROM matches
+            WHERE winner_name IS NOT NULL AND loser_name IS NOT NULL
+              AND tourney_date IS NOT NULL AND round IS NOT NULL
+            GROUP BY tour, tourney_id, tourney_date, round,
+                     winner_name, loser_name
+            HAVING COUNT(*) > 1
+        """).fetchall()
+
+        deleted = 0
+        for tour, tid, tdate, rnd, wn, ln, _cnt in dup_groups:
+            rows = cur.execute("""
+                SELECT rowid, score, is_upcoming
+                FROM matches
+                WHERE tour IS ? AND tourney_id IS ? AND tourney_date IS ?
+                  AND round IS ? AND winner_name = ? AND loser_name = ?
+            """, (tour, tid, tdate, rnd, wn, ln)).fetchall()
+            if len(rows) <= 1:
+                continue
+
+            def quality(r):
+                score = r[1] or ""
+                upcoming = r[2] or 0
+                # Prefer non-upcoming, then longer score
+                return (0 if upcoming else 1, len(score))
+
+            rows.sort(key=quality, reverse=True)
+            keep = rows[0][0]
+            for r in rows[1:]:
+                cur.execute("DELETE FROM matches WHERE rowid = ?", (r[0],))
+                deleted += 1
+
+        if rename_pairs or deleted:
+            self.conn.commit()
+            logger.info(
+                "Normalized %d matches.player_name spellings; "
+                "deleted %d duplicate match rows",
+                len(rename_pairs), deleted)
 
     def get_extended_stats_count(self, player_name):
         """Return count of extended stats records per table for a player."""

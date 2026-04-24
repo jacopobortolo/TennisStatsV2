@@ -1285,6 +1285,19 @@ EXTENDED_CONVERTERS = {
     "mcp-tactics": convert_mcp_tactics,
 }
 
+
+def clean_player_name(name):
+    """Module-level wrapper around ``TennisAbstractScraper._clean_name``.
+
+    Used by callers (data_manager, UI pages, DB migrations) to ensure a
+    consistent, diacritic-free spelling of player names when storing or
+    looking up rows in the extended-stats tables and cache.
+    """
+    if name is None:
+        return None
+    return TennisAbstractScraper._clean_name(name)
+
+
 # Table name -> DB table name mapping
 EXTENDED_DB_TABLES = {
     "winners-errors": "match_winners_errors",

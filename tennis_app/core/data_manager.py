@@ -865,19 +865,24 @@ def scrape_player_extended_stats(player_name, db=None, tables=None,
 
     Returns dict of table_name -> record_count
     """
-    from .scraper import EXTENDED_CONVERTERS, EXTENDED_DB_TABLES
+    from .scraper import EXTENDED_CONVERTERS, EXTENDED_DB_TABLES, clean_player_name
+
+    # Normalize the name for all DB writes/lookups so that scraping
+    # "Rafael Jódar" stores rows under "Rafael Jodar" (matching the
+    # diacritic-free spelling used in the players table).
+    storage_name = clean_player_name(player_name) or player_name
 
     # Check cache using fingerprint if available, else time-based
     if db and not force:
         if activity_fingerprint:
-            if not db.has_extended_new_activity(player_name,
+            if not db.has_extended_new_activity(storage_name,
                                                activity_fingerprint):
                 logger.info("Extended stats fingerprint unchanged for %s",
-                            player_name)
+                            storage_name)
                 return {}
-        elif db.is_extended_cache_valid(player_name):
+        elif db.is_extended_cache_valid(storage_name):
             logger.info("Extended stats cache still valid for %s",
-                        player_name)
+                        storage_name)
             return {}
 
     scraper = _get_scraper()
@@ -901,18 +906,18 @@ def scrape_player_extended_stats(player_name, db=None, tables=None,
                     row = db.conn.execute(
                         "SELECT 1 FROM extended_stats_cache "
                         "WHERE player_name = ?",
-                        (player_name,)).fetchone()
+                        (storage_name,)).fetchone()
                     had_cache = row is not None
                 except Exception:
                     pass
                 fp_to_store = None if had_cache else activity_fingerprint
                 db.update_extended_stats_cache(
-                    player_name, [],
+                    storage_name, [],
                     activity_fingerprint=fp_to_store)
             except Exception:
                 logger.exception(
                     "Failed to cache empty extended stats for %s",
-                    player_name)
+                    storage_name)
         return {}
 
     result = {}
@@ -924,9 +929,9 @@ def scrape_player_extended_stats(player_name, db=None, tables=None,
         if not converter or not db_table:
             continue
 
-        records = converter(rows, player_name, tour=tour)
+        records = converter(rows, storage_name, tour=tour)
         if records and db:
-            count = db.import_extended_stats(db_table, records, player_name)
+            count = db.import_extended_stats(db_table, records, storage_name)
             result[table_name] = count
             tables_scraped.append(table_name)
         elif records:
@@ -941,7 +946,7 @@ def scrape_player_extended_stats(player_name, db=None, tables=None,
     if db:
         if tables_scraped:
             db.update_extended_stats_cache(
-                player_name, tables_scraped,
+                storage_name, tables_scraped,
                 activity_fingerprint=activity_fingerprint)
         else:
             had_cache = False
@@ -949,13 +954,13 @@ def scrape_player_extended_stats(player_name, db=None, tables=None,
                 row = db.conn.execute(
                     "SELECT 1 FROM extended_stats_cache "
                     "WHERE player_name = ?",
-                    (player_name,)).fetchone()
+                    (storage_name,)).fetchone()
                 had_cache = row is not None
             except Exception:
                 pass
             fp_to_store = None if had_cache else activity_fingerprint
             db.update_extended_stats_cache(
-                player_name, [], activity_fingerprint=fp_to_store)
+                storage_name, [], activity_fingerprint=fp_to_store)
 
-    logger.info("Extended stats for %s: %s", player_name, result)
+    logger.info("Extended stats for %s: %s", storage_name, result)
     return result

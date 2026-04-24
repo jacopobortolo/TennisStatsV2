@@ -234,7 +234,9 @@ class StatsPage(QWidget):
 
         agg = aggregate_stats(per_match)
         pressure = compute_pressure_stats(matches, player_id)
-        ext_counts = self.db.get_extended_stats_count(name)
+        from ...core.scraper import clean_player_name
+        ext_counts = self.db.get_extended_stats_count(
+            clean_player_name(name) or name)
 
         # All data ready — build new content off-screen, then swap
         self.content.begin_update()
@@ -517,7 +519,9 @@ class StatsPage(QWidget):
             return
 
         player = self.current_player
-        name = f"{player['name_first']} {player['name_last']}"
+        from ...core.scraper import clean_player_name
+        raw_name = f"{player['name_first']} {player['name_last']}"
+        name = clean_player_name(raw_name) or raw_name
         tour = player.get("tour", "atp")
         self.status_label.setText(f"Scraping extended stats for {name}...")
         self.scrape_btn.setEnabled(False)
