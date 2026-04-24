@@ -886,10 +886,14 @@ class TennisAbstractScraper:
         """
         Fetch all (or specified) extended data tables for a player.
 
-        Each table is fetched from ``player-more.cgi`` because the embedded
-        ``var player_frag = `...```` block in jsfrags is truncated to roughly
-        the most recent 20 matches per table, while the per-table CGI
-        endpoint returns the full 52-week (and Match Charting) dataset.
+        Strategy:
+          1. If we resolved a numeric ``player_id``, fetch each table from
+             ``player-more.cgi`` (full 52-week / Match Charting dataset).
+          2. Otherwise (jsfrags has no ``player-more.cgi`` link — typical
+             for new / unranked players that tennisabstract has not yet
+             assigned a pid to), fall back to parsing the truncated tables
+             embedded directly in the jsfrags ``var player_frag = `...```
+             block (~20 most recent matches per table).
 
         Returns dict: { "winners-errors": [rows], "serve-speed": [rows], ... }
         """
@@ -897,15 +901,13 @@ class TennisAbstractScraper:
             tables = self.EXTENDED_TABLES
 
         url_name = self._make_player_url_name(player_name)
-        pid, _jsfrags_text = self._discover_player_id(
+        pid, jsfrags_text = self._discover_player_id(
             url_name, original_name=player_name, tour=tour)
 
         results = {}
-        if not pid:
-            logger.warning(
-                "Could not find player_id for %s, all %d tables missing",
-                player_name, len(tables))
-        else:
+        source = None  # "cgi" or "jsfrags-fallback"
+        if pid:
+            source = "cgi"
             for i, table_name in enumerate(tables):
                 if progress_callback:
                     progress_callback(
@@ -915,16 +917,29 @@ class TennisAbstractScraper:
                     player_name, table_name, _pid=pid, tour=tour)
                 if rows:
                     results[table_name] = rows
+        elif jsfrags_text:
+            # No pid → use the (truncated) embedded tables as a fallback.
+            source = "jsfrags-fallback"
+            logger.info(
+                "%s: no player-more.cgi pid available; using truncated "
+                "jsfrags-embedded tables (recent matches only)",
+                player_name)
+            results = self._parse_tables_from_jsfrags(
+                jsfrags_text, player_name, tables)
+        else:
+            logger.warning(
+                "Could not fetch jsfrags for %s, all %d tables missing",
+                player_name, len(tables))
 
-        # Diagnostic summary: per-table row count
+        # Diagnostic summary
         summary = ", ".join(f"{t}={len(results[t])}"
                             for t in tables if t in results)
         missing_after = [t for t in tables if t not in results]
         if missing_after:
             summary = (summary + "; missing=" + ",".join(missing_after)
                        if summary else "missing=" + ",".join(missing_after))
-        logger.info("[ext-diag] %s summary: %s", player_name,
-                    summary or "(no tables)")
+        logger.info("[ext-diag] %s summary (%s): %s", player_name,
+                    source or "none", summary or "(no tables)")
 
         if progress_callback:
             progress_callback(len(tables), len(tables),
