@@ -1605,6 +1605,19 @@ class TennisDatabase:
                 stale.append(name)
         return stale
 
+    def get_all_scrape_cache(self):
+        """Bulk-load the entire scrape_cache table.
+
+        Returns a dict ``{player_name: (last_scraped_iso, fingerprint)}``.
+        Used to avoid 1000+ sequential round-trips when checking activity
+        for top-N rankings against a remote (Turso) database.
+        """
+        rows = self.conn.execute(
+            "SELECT player_name, last_scraped, activity_fingerprint "
+            "FROM scrape_cache"
+        ).fetchall()
+        return {r[0]: (r[1], r[2]) for r in rows}
+
     # ------------------------------------------------------------------
     # Extended stats queries
     # ------------------------------------------------------------------
@@ -1936,6 +1949,19 @@ class TennisDatabase:
         cur_is_new = bool(new_cur) and new_cur not in old_combined
         prev_is_new = bool(new_prev) and new_prev not in old_combined
         return cur_is_new or prev_is_new
+
+    def get_all_extended_stats_cache(self):
+        """Bulk-load the entire extended_stats_cache table.
+
+        Returns a dict ``{player_name: (last_scraped_iso, fingerprint)}``.
+        Used to avoid 1000+ sequential round-trips when checking activity
+        for top-N rankings against a remote (Turso) database.
+        """
+        rows = self.conn.execute(
+            "SELECT player_name, last_scraped, activity_fingerprint "
+            "FROM extended_stats_cache"
+        ).fetchall()
+        return {r[0]: (r[1], r[2]) for r in rows}
 
     def close(self):
         self.conn.close()

@@ -347,6 +347,39 @@ def _normalize_name(name):
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
+def _activity_changed(old_fp, new_fp):
+    """Pure-in-memory equivalent of ``has_(extended_)new_activity``.
+
+    Returns True if *new_fp* contains tournament text not already
+    present in *old_fp*.  Used by the bulk activity-check path so we
+    don't issue 1000+ Turso round-trips per loop.
+    """
+    if old_fp is None:
+        return True
+    if old_fp == new_fp:
+        return False
+    old_combined = old_fp.replace("|", "")
+    new_cur, new_prev = (new_fp.split("|", 1) + [""])[:2]
+    cur_is_new = bool(new_cur) and new_cur not in old_combined
+    prev_is_new = bool(new_prev) and new_prev not in old_combined
+    return cur_is_new or prev_is_new
+
+
+def _cache_row_is_fresh(cache_row, expire_hours):
+    """In-memory equivalent of ``is_(player|extended)_cache_valid``."""
+    if not cache_row or expire_hours == 0:
+        return False
+    last_iso = cache_row[0]
+    if not last_iso:
+        return False
+    try:
+        last = datetime.datetime.fromisoformat(last_iso)
+    except (ValueError, TypeError):
+        return False
+    return (datetime.datetime.now() - last
+            < datetime.timedelta(hours=expire_hours))
+
+
 def _resolve_ranking_name(ranking_name, db, tour="atp"):
     """Resolve a live-tennis.eu ranking name to the full DB player name.
 
@@ -542,6 +575,11 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
     # Determine which players need re-scraping
     stale = set()
     fingerprints = {}  # name → fingerprint (for players we'll scrape)
+
+    # Bulk-load the entire scrape_cache in ONE round-trip instead of
+    # issuing two queries per player (1000+ remote calls for top-1000).
+    cache_snapshot = db.get_all_scrape_cache() if db is not None else {}
+
     for name in player_names:
         norm = _normalize_name(name)
         fp = activity_map.get(norm)
@@ -550,15 +588,17 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
             stale.add(name)
             continue
 
+        cache_row = cache_snapshot.get(name)
+
         if fp is not None:
             # We have activity data from OFFICIAL
             cur_t, prev_t = fp.split("|", 1)
             if not cur_t and not prev_t:
                 # Inactive player: use 7-day cache
-                if not db.is_player_cache_valid(name, expire_hours=168):
+                if not _cache_row_is_fresh(cache_row, 168):
                     stale.add(name)
                     fingerprints[name] = fp
-            elif db.has_new_activity(name, fp):
+            elif _activity_changed(cache_row[1] if cache_row else None, fp):
                 # Fingerprint changed to new non-empty value: scrape
                 stale.add(name)
                 fingerprints[name] = fp
@@ -569,7 +609,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                 logger.debug("Skipping %s (activity unchanged)", name)
         else:
             # Player not found in OFFICIAL: fall back to time-based cache
-            if not db.is_player_cache_valid(name, expire_hours=cache_expire_hours):
+            if not _cache_row_is_fresh(cache_row, cache_expire_hours):
                 stale.add(name)
 
     logger.info("Event-driven check: %d/%d players (top %d) need refresh",
@@ -716,6 +756,12 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
     # Determine which players need scraping
     stale = []
     fingerprints = {}
+
+    # Bulk-load extended_stats_cache in ONE round-trip (avoids 1000+
+    # remote calls for top-1000 against Turso).
+    cache_snapshot = (db.get_all_extended_stats_cache()
+                      if db is not None else {})
+
     for entry in rankings:
         name = entry["name"]
         norm = _normalize_name(name)
@@ -726,21 +772,23 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
             fingerprints[name] = fp
             continue
 
+        cache_row = cache_snapshot.get(name)
+
         if fp is not None:
             cur_t, prev_t = fp.split("|", 1)
             if not cur_t and not prev_t:
                 # Inactive: use time-based cache (1 week)
-                if not db.is_extended_cache_valid(name, expire_hours=168):
+                if not _cache_row_is_fresh(cache_row, 168):
                     stale.append(name)
                     fingerprints[name] = fp
-            elif db.has_extended_new_activity(name, fp):
+            elif _activity_changed(cache_row[1] if cache_row else None, fp):
                 stale.append(name)
                 fingerprints[name] = fp
             else:
                 # Fingerprint unchanged — sync it silently
                 fingerprints[name] = fp
         else:
-            if not db.is_extended_cache_valid(name):
+            if not _cache_row_is_fresh(cache_row, 168):
                 stale.append(name)
 
     scraped_names = []
