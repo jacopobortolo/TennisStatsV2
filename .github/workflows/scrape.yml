@@ -2,8 +2,8 @@ name: Hourly Tennis Scrape
 
 on:
   schedule:
-    # Every hour at :07 (off the hour to avoid GH Actions queue spikes)
-    - cron: '7 * * * *'
+    # Every 4 hours at :07 (off the hour to avoid GH Actions queue spikes)
+    - cron: '7 */4 * * *'
   workflow_dispatch:
     inputs:
       top_n:
