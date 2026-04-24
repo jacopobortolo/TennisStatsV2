@@ -1,4 +1,4 @@
-name: Hourly Tennis Scrape
+name: 4-Hourly Tennis Scrape
 
 on:
   schedule:

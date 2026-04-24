@@ -579,28 +579,130 @@ class TennisAbstractScraper:
         "mcp-serve", "mcp-return", "mcp-rally",
     ]
 
-    def _discover_player_id(self, player_url_name):
+    # Cached lookup: normalized name → official tennisabstract name
+    # (built lazily from playerlist.js / wplayerlist.js)
+    _PLAYERLIST_CACHE = {"atp": None, "wta": None}
+
+    def _load_playerlist(self, tour="atp"):
+        """Fetch and cache the official tennisabstract playerlist for a tour.
+
+        Returns a dict mapping normalized name → official name, where the
+        official name's URL form (no spaces) is the actual jsfrags filename.
+        """
+        if self._PLAYERLIST_CACHE.get(tour) is not None:
+            return self._PLAYERLIST_CACHE[tour]
+        fname = "playerlist.js" if tour == "atp" else "wplayerlist.js"
+        url = f"{BASE_URL}/jsplayers/{fname}"
+        index = {}
+        try:
+            resp = self._make_request(url, raise_on_error=False)
+            if resp:
+                # Extract the JS array literal: var playerlist=[...];
+                m = re.search(r'=\s*\[(.*?)\]\s*;?\s*$',
+                              resp.text, re.DOTALL)
+                if m:
+                    arr = ast.literal_eval("[" + m.group(1) + "]")
+                    for full in arr:
+                        if not isinstance(full, str):
+                            continue
+                        cleaned = self._clean_name(full)
+                        norm = re.sub(r"\s+", " ", cleaned).lower().strip()
+                        if norm and norm not in index:
+                            index[norm] = cleaned
+        except Exception as exc:
+            logger.warning("Could not load %s playerlist: %s", tour, exc)
+        self._PLAYERLIST_CACHE[tour] = index
+        logger.info("Loaded %s playerlist: %d entries", tour, len(index))
+        return index
+
+    def _resolve_via_playerlist(self, player_name, tour="atp"):
+        """Try to resolve a player name via tennisabstract's playerlist.js.
+
+        Useful when the direct URL (e.g. SantiagoTaverna) doesn't exist
+        but the player is registered under a longer name
+        (e.g. Santiago Fa Rodriguez Taverna).
+
+        Returns the cleaned official name (e.g. "Santiago Fa Rodriguez
+        Taverna") or None if no match is found.
+        """
+        index = self._load_playerlist(tour)
+        if not index:
+            return None
+        cleaned = self._clean_name(player_name)
+        norm = re.sub(r"\s+", " ", cleaned).lower().strip()
+        # 1. Exact match
+        if norm in index:
+            return index[norm]
+        # 2. First word + last word match (handles compound surnames)
+        parts = norm.split()
+        if len(parts) >= 2:
+            first = parts[0]
+            last = parts[-1]
+            candidates = []
+            for k, v in index.items():
+                kp = k.split()
+                if len(kp) >= 2 and kp[0] == first and kp[-1] == last:
+                    candidates.append(v)
+            if len(candidates) == 1:
+                return candidates[0]
+            if len(candidates) > 1:
+                logger.info(
+                    "Ambiguous playerlist match for %s: %d candidates",
+                    player_name, len(candidates))
+        return None
+
+    def _discover_player_id(self, player_url_name, original_name=None,
+                            tour="atp"):
         """Discover the numeric player_id from the jsfrags JS file.
 
         Returns (player_id, jsfrags_text) — player_id may be None if the
         jsfrags file doesn't contain player-more.cgi links, but the raw
         jsfrags text is still returned so the caller can fall back to
         parsing tables directly from it.
+
+        If the direct jsfrags URL is missing or doesn't contain a
+        player_id, falls back to the official playerlist.js to find the
+        correct URL name.
         """
         url = f"{BASE_URL}/jsfrags/{player_url_name}.js"
         try:
             resp = self._make_request(url, raise_on_error=False)
-            if not resp:
-                return None, None
-            text = resp.text
-            m = re.search(r'player-more\.cgi\?p=(\d+)/', text)
-            if m:
-                return m.group(1), text
-            return None, text
+            if resp:
+                text = resp.text
+                m = re.search(r'player-more\.cgi\?p=(\d+)/', text)
+                if m:
+                    return m.group(1), text
+            else:
+                text = None
         except Exception as exc:
             logger.warning("Could not discover player_id for %s: %s",
                            player_url_name, exc)
-            return None, None
+            text = None
+
+        # Fallback: resolve via official playerlist
+        if original_name:
+            resolved = self._resolve_via_playerlist(original_name, tour=tour)
+            if resolved:
+                resolved_url = "".join(
+                    w.capitalize() for w in resolved.split() if w)
+                if resolved_url and resolved_url != player_url_name:
+                    logger.info("Playerlist resolved %s → %s",
+                                player_url_name, resolved_url)
+                    url2 = f"{BASE_URL}/jsfrags/{resolved_url}.js"
+                    try:
+                        resp2 = self._make_request(url2, raise_on_error=False)
+                        if resp2:
+                            text2 = resp2.text
+                            m2 = re.search(
+                                r'player-more\.cgi\?p=(\d+)/', text2)
+                            if m2:
+                                return m2.group(1), text2
+                            return None, text2
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not fetch resolved jsfrags for %s: %s",
+                            resolved_url, exc)
+        return None, text
 
     def _make_player_url_name(self, player_name):
         """Convert a player name to URL format (e.g. 'Jannik Sinner' -> 'JannikSinner')."""
@@ -670,7 +772,8 @@ class TennisAbstractScraper:
         hyphen_name = self._make_player_hyphen_name(player_name)
 
         if not _pid:
-            _pid, _ = self._discover_player_id(url_name)
+            _pid, _ = self._discover_player_id(
+                url_name, original_name=player_name, tour=tour)
         if not _pid:
             logger.warning("Could not find player_id for %s", player_name)
             return None
@@ -741,7 +844,8 @@ class TennisAbstractScraper:
             tables = self.EXTENDED_TABLES
 
         url_name = self._make_player_url_name(player_name)
-        pid, jsfrags_text = self._discover_player_id(url_name)
+        pid, jsfrags_text = self._discover_player_id(
+            url_name, original_name=player_name, tour=tour)
 
         # Step 1: try parsing all tables from jsfrags (no extra HTTP)
         results = {}

@@ -814,6 +814,18 @@ def scrape_player_extended_stats(player_name, db=None, tables=None,
 
     if not raw_data:
         logger.warning("No extended stats found for %s", player_name)
+        # Cache the negative result so we don't retry every run.
+        # The fingerprint guards against staleness: when the player gets
+        # new activity, has_extended_new_activity() will return True.
+        if db:
+            try:
+                db.update_extended_stats_cache(
+                    player_name, [],
+                    activity_fingerprint=activity_fingerprint)
+            except Exception:
+                logger.exception(
+                    "Failed to cache empty extended stats for %s",
+                    player_name)
         return {}
 
     result = {}
@@ -834,8 +846,9 @@ def scrape_player_extended_stats(player_name, db=None, tables=None,
             result[table_name] = len(records)
             tables_scraped.append(table_name)
 
-    # Update cache with fingerprint
-    if db and tables_scraped:
+    # Update cache with fingerprint (even if no tables produced records,
+    # to avoid retrying every run for players with no extended data).
+    if db:
         db.update_extended_stats_cache(player_name, tables_scraped,
                                        activity_fingerprint=activity_fingerprint)
 
