@@ -165,52 +165,127 @@ class TennisAbstractScraper:
 
         Returns a list of raw match arrays, or None if not found.
         """
+        original_name = player_name
         player_name = self._clean_name(player_name)
         # Title-case each word to match tennisabstract URL format
         # e.g. "Botic van de Zandschulp" → "BoticVanDeZandschulp"
         player_url_name = "".join(
             w.capitalize() for w in player_name.split() if w
         )
+        # Build alternative URL forms.  When the original name contained
+        # hyphens (e.g. "Han-na Chang"), TA may store the player without
+        # any space between the two parts ("HannaChang") rather than
+        # with a capital after the hyphen ("HanNaChang").  Generate
+        # every adjacent-pair-collapsed variant so we can probe both.
+        url_variants = [player_url_name]
+        if "-" in original_name:
+            words = [w for w in player_name.split() if w]
+            for i in range(len(words) - 1):
+                merged = (words[:i]
+                          + [(words[i] + words[i + 1]).capitalize()]
+                          + words[i + 2:])
+                variant = "".join(w.capitalize() for w in merged)
+                if variant and variant not in url_variants:
+                    url_variants.append(variant)
+
         all_matches = []
 
         # WTA uses wplayer-classic.cgi, ATP uses player-classic.cgi
         cgi = "wplayer-classic.cgi" if tour == "wta" else "player-classic.cgi"
 
-        # Try HTML page first (has embedded JS data)
-        try:
-            url = f"{BASE_URL}/cgi-bin/{cgi}?p={player_url_name}"
-            resp = self._make_request(url)
-            if resp and "No player found" not in resp.text:
-                matches = self._parse_matches_from_html(resp.text)
-                if matches:
-                    all_matches.extend(matches)
-                    logger.info("Found %d matches in HTML for %s",
-                                len(matches), player_name)
-        except Exception as exc:
-            logger.warning("Could not get HTML matches for %s: %s",
-                           player_name, exc)
-
-        # Fallback to JS files
-        if not all_matches:
-            js_urls = [
-                f"{BASE_URL}/jsmatches/{player_url_name}.js",
-                f"{BASE_URL}/jsmatches/{player_url_name}Career.js",
-            ]
-            for url in js_urls:
+        # Try HTML page first (has embedded JS data), then JS fallback,
+        # for each URL variant.  Stop at the first one that yields data.
+        def _try_one(url_name):
+            try:
+                url = f"{BASE_URL}/cgi-bin/{cgi}?p={url_name}"
+                resp = self._make_request(url)
+                if resp and "No player found" not in resp.text:
+                    matches = self._parse_matches_from_html(resp.text)
+                    if matches:
+                        logger.info("Found %d matches in HTML for %s",
+                                    len(matches), url_name)
+                        return matches
+            except Exception as exc:
+                logger.warning("Could not get HTML matches for %s: %s",
+                               url_name, exc)
+            for js_url in (
+                f"{BASE_URL}/jsmatches/{url_name}.js",
+                f"{BASE_URL}/jsmatches/{url_name}Career.js",
+            ):
                 try:
-                    resp = self._make_request(url, raise_on_error=False)
+                    resp = self._make_request(js_url, raise_on_error=False)
                     if resp and resp.status_code == 200:
                         matches = self._parse_matches_from_js(resp.text)
                         if matches:
-                            all_matches.extend(matches)
                             logger.info("Found %d matches from JS: %s",
-                                        len(matches), url)
+                                        len(matches), js_url)
+                            return matches
                 except Exception as exc:
                     logger.warning("Could not get JS matches from %s: %s",
-                                   url, exc)
+                                   js_url, exc)
+            return []
+
+        for url_name in url_variants:
+            found = _try_one(url_name)
+            if found:
+                all_matches.extend(found)
+                # Use the variant that worked for any subsequent fallback
+                player_url_name = url_name
+                break
 
         if all_matches:
             return all_matches
+
+        # Last-chance: resolve via tennisabstract's official playerlist.
+        # Handles cases where the cleaned-name URL doesn't exist on TA
+        # but the player is registered under a different spelling
+        # (e.g. "Stephanie Visscher" \u2192 "Stephanie Judith Visscher",
+        # "Han-na Chang" \u2192 "Hanna Chang").
+        try:
+            resolved = self._resolve_via_playerlist(player_name, tour=tour)
+        except Exception as exc:
+            logger.warning("Playerlist fallback failed for %s: %s",
+                           player_name, exc)
+            resolved = None
+        if resolved:
+            resolved_url = "".join(
+                w.capitalize() for w in resolved.split() if w)
+            if resolved_url and resolved_url != player_url_name:
+                logger.info("Playerlist resolved %s \u2192 %s",
+                            player_name, resolved)
+                try:
+                    url = f"{BASE_URL}/cgi-bin/{cgi}?p={resolved_url}"
+                    resp = self._make_request(url)
+                    if resp and "No player found" not in resp.text:
+                        matches = self._parse_matches_from_html(resp.text)
+                        if matches:
+                            logger.info(
+                                "Found %d matches in HTML for %s "
+                                "(resolved)", len(matches), resolved)
+                            return matches
+                except Exception as exc:
+                    logger.warning(
+                        "Resolved HTML fetch failed for %s: %s",
+                        resolved_url, exc)
+                # JS fallback for the resolved name too
+                for js_url in (
+                    f"{BASE_URL}/jsmatches/{resolved_url}.js",
+                    f"{BASE_URL}/jsmatches/{resolved_url}Career.js",
+                ):
+                    try:
+                        resp = self._make_request(js_url, raise_on_error=False)
+                        if resp and resp.status_code == 200:
+                            matches = self._parse_matches_from_js(resp.text)
+                            if matches:
+                                logger.info(
+                                    "Found %d matches from JS for %s "
+                                    "(resolved): %s",
+                                    len(matches), resolved, js_url)
+                                return matches
+                    except Exception as exc:
+                        logger.warning("Could not get JS matches from %s: %s",
+                                       js_url, exc)
+
         logger.warning("No matches found for %s", player_name)
         return None
 
@@ -663,8 +738,24 @@ class TennisAbstractScraper:
         lkey = self._de_loose_key(norm)
         if lkey in loose:
             return loose[lkey]
-        # 3. First word + last word match (handles compound surnames)
+        # 3. Hyphen-collapsed match (e.g. "han na chang" → "hanna chang")
+        # _clean_name turns 'Han-na Chang' into 'Han na Chang' but TA may
+        # store the same player as 'Hanna Chang' (no space).  Try every
+        # adjacent-pair concatenation against the index.
         parts = norm.split()
+        if len(parts) >= 2:
+            for i in range(len(parts) - 1):
+                collapsed = (" ".join(parts[:i])
+                             + (" " if i else "")
+                             + parts[i] + parts[i + 1]
+                             + (" " if i + 2 < len(parts) else "")
+                             + " ".join(parts[i + 2:])).strip()
+                if collapsed in index and collapsed != "__loose__":
+                    return index[collapsed]
+                lkey2 = self._de_loose_key(collapsed)
+                if lkey2 in loose:
+                    return loose[lkey2]
+        # 4. First word + last word match (handles compound surnames)
         if len(parts) >= 2:
             first = parts[0]
             last = parts[-1]

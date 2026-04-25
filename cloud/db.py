@@ -45,7 +45,11 @@ def _load_dotenv():
     env_path = Path(__file__).parent / ".env"
     if not env_path.exists():
         return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig strips a leading BOM if present (some Windows editors /
+    # PowerShell ``Set-Content -Encoding utf8`` add one, which would
+    # otherwise prefix the first key name with U+FEFF and silently break
+    # ``os.environ.get("TURSO_DATABASE_URL")``).
+    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
