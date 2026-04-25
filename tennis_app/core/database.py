@@ -1387,12 +1387,23 @@ class TennisDatabase:
             if col in matches_df.columns:
                 matches_df[col] = matches_df[col].apply(_normalize_player_name)
 
-        # Build a name→id and name→ioc cache from existing players (single scan)
+        # Build a name→id and name→ioc cache from existing players.
+        # Filter by tour when possible to halve the rows read on remote
+        # (Turso) connections — players table holds ATP+WTA combined.
         name_cache = {}
         name_ioc_cache = {}
         canonical_name_by_key = {}
-        cur = self.conn.execute(
-            "SELECT player_id, name_first, name_last, ioc FROM players")
+        tours_in_df = set()
+        if "tour" in matches_df.columns:
+            tours_in_df = {t for t in matches_df["tour"].dropna().unique()
+                           if t in ("atp", "wta")}
+        if len(tours_in_df) == 1:
+            cur = self.conn.execute(
+                "SELECT player_id, name_first, name_last, ioc FROM players "
+                "WHERE tour = ?", (next(iter(tours_in_df)),))
+        else:
+            cur = self.conn.execute(
+                "SELECT player_id, name_first, name_last, ioc FROM players")
         for row in cur:
             first = row[1] or ""
             last = row[2] or ""
@@ -1526,6 +1537,12 @@ class TennisDatabase:
         # Lowercased tourney_name avoids duplicates like "Us Open" vs "US Open".
         # Unique staging name (UUID) so concurrent imports cannot collide.
         staging_name = f"_import_staging_{uuid.uuid4().hex[:12]}"
+        # On remote (Turso) connections the matches table contains only
+        # SCRAPED rows — no historical CSV imports — so we can scope the
+        # dedup JOIN to SCRAPED to massively reduce rows read.
+        join_extra = ""
+        if _is_remote_conn(self.conn):
+            join_extra = " AND m.tourney_id = 'SCRAPED'"
         try:
             matches_df.to_sql(staging_name, self.conn, if_exists="replace", index=False)
             self.conn.execute(f"""
@@ -1538,7 +1555,7 @@ class TennisDatabase:
                      AND m.winner_name = s.winner_name
                      AND m.loser_name = s.loser_name
                      AND LOWER(m.tourney_name) = LOWER(s.tourney_name)
-                     AND m.round = s.round
+                     AND m.round = s.round{join_extra}
                 )
             """)
             count_row = self.conn.execute(
@@ -1605,7 +1622,8 @@ class TennisDatabase:
 
         name_cache = {}
         cur = self.conn.execute(
-            "SELECT player_id, name_first, name_last FROM players")
+            "SELECT player_id, name_first, name_last FROM players "
+            "WHERE tour = ?", (tour,))
         for row in cur:
             first = row[1] or ""
             last = row[2] or ""
@@ -2263,7 +2281,16 @@ class TennisDatabase:
         df = pd.DataFrame(records)
         df.to_sql(table_name, self.conn, if_exists="append", index=False)
 
-        # Back-fill surface and tourney_level using in-memory lookup
+        # Back-fill surface and tourney_level using in-memory lookup.
+        # Skip on remote (Turso) connections: this scans large slices of
+        # the matches table per player × per stats table — millions of
+        # rows_read per scrape run.  Desktop clients can call
+        # ``backfill_extended_stats_surface()`` once after a snapshot
+        # refresh to populate these columns offline.
+        if _is_remote_conn(self.conn):
+            self.conn.commit()
+            return len(records)
+
         rows = self.conn.execute(
             f"SELECT id, tourney_name, tourney_date, opponent_name "
             f"FROM {table_name} "
