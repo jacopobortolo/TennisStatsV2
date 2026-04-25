@@ -72,6 +72,17 @@ def get_db_path():
     return get_data_dir() / "tennis.db"
 
 
+def _is_remote_conn(conn) -> bool:
+    """True when ``conn`` is the Turso HTTP RemoteConnection.
+
+    Detected by class name to avoid an import cycle with ``cloud.db``.
+    On a remote connection, every ``execute`` is a slow HTTP roundtrip,
+    so per-row migrations must be skipped (or batched into a single
+    statement).
+    """
+    return type(conn).__name__ == "RemoteConnection"
+
+
 class TennisDatabase:
     """SQLite-backed database for tennis analytics."""
 
@@ -1950,6 +1961,8 @@ class TennisDatabase:
         accented row is deleted to avoid PRIMARY KEY conflicts in the
         cache table.
         """
+        if _is_remote_conn(self.conn):
+            return  # too slow over Turso HTTP; ran on local DB already
         from .scraper import clean_player_name
 
         tables = [
@@ -2013,6 +2026,8 @@ class TennisDatabase:
            informative ``score`` (longest non-NULL), preferring
            ``is_upcoming = 0`` over scheduled rows.
         """
+        if _is_remote_conn(self.conn):
+            return  # too slow over Turso HTTP; ran on local DB already
         # Phase 1: build canonical lookup
         canonical_by_key = {}
         for row in cur.execute(
@@ -2112,6 +2127,8 @@ class TennisDatabase:
         Idempotent: only touches rows with tourney_id='SCRAPED' and tour='atp'
         that can be positively identified as WTA.
         """
+        if _is_remote_conn(self.conn):
+            return  # too slow over Turso HTTP; ran on local DB already
         # Build name sets per tour from the players table
         wta_names = set()
         atp_names = set()
