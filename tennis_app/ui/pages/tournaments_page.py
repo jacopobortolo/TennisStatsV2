@@ -11,6 +11,7 @@ from PySide6.QtGui import QColor, QBrush
 
 from ..widgets import SearchBar, DataTable, Separator, PillButtonGroup
 from ..theme import COLORS
+from ..match_detail_dialog import MatchDetailDialog
 
 ROUND_ORDER = {
     "F": 0, "SF": 1, "QF": 2, "R16": 3, "R32": 4,
@@ -25,6 +26,7 @@ class TournamentsPage(QWidget):
         super().__init__(parent)
         self.db = db
         self._tourney_cache = {}
+        self._current_draw_matches = []  # list of match dicts for the draw table
         self._build_ui()
 
     def _build_ui(self):
@@ -96,6 +98,7 @@ class TournamentsPage(QWidget):
             ("Score", 160), ("W Rank", 60), ("L Rank", 60),
         ])
         self.draw_table.cellClicked.connect(self._on_draw_cell_click)
+        self.draw_table.doubleClicked.connect(self._on_draw_double_clicked)
         right_layout.addWidget(self.draw_table)
 
         splitter.addWidget(right)
@@ -185,6 +188,8 @@ class TournamentsPage(QWidget):
 
         matches.sort(key=lambda m: ROUND_ORDER.get(m.get("round", ""), 99))
 
+        # Store for double-click handler
+        self._current_draw_matches = list(matches)
         round_names = {
             "F": "Final", "SF": "Semi-Final", "QF": "Quarter-Final",
             "R16": "R16", "R32": "R32", "R64": "R64", "R128": "R128",
@@ -264,3 +269,12 @@ class TournamentsPage(QWidget):
                     # Reset non-matching rows
                     cell.setBackground(QBrush(QColor(0, 0, 0, 0)))
                     cell.setForeground(default_fg)
+
+    def _on_draw_double_clicked(self, index):
+        row = index.row()
+        if 0 <= row < len(self._current_draw_matches):
+            match = self._current_draw_matches[row]
+            # Doubles matches don't have a single winner_name; skip dialog
+            if match.get("winner_name") or match.get("winner1_name"):
+                dlg = MatchDetailDialog(self.db, match, parent=self)
+                dlg.exec()

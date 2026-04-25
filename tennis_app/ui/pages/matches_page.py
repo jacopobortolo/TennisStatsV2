@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt
 
 from ..widgets import SearchBar, DataTable, Separator, PillButtonGroup, PlayerSearchEdit
 from ..theme import COLORS
+from ..match_detail_dialog import MatchDetailDialog
 
 
 class MatchesPage(QWidget):
@@ -99,6 +100,7 @@ class MatchesPage(QWidget):
             ("Surface", 65), ("Round", 55), ("Winner", 180),
             ("Loser", 180), ("Score", 140), ("Min", 45),
         ])
+        self.table.doubleClicked.connect(self._on_match_double_clicked)
         layout.addWidget(self.table, 1)
 
         # --- Pagination ---
@@ -269,6 +271,20 @@ class MatchesPage(QWidget):
         if self._current_page < self._total_pages():
             self._current_page += 1
             self._display_page()
+
+    def _on_match_double_clicked(self, index):
+        row = index.row()
+        # Map visible row → absolute index in _all_matches
+        rpp = self._rows_per_page()
+        if rpp:
+            start = (self._current_page - 1) * rpp
+            abs_row = start + row
+        else:
+            abs_row = row
+        if 0 <= abs_row < len(self._all_matches):
+            match = self._all_matches[abs_row]
+            dlg = MatchDetailDialog(self.db, match, parent=self)
+            dlg.exec()
 
     @staticmethod
     def _format_player(match, role):

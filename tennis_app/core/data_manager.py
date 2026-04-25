@@ -16,7 +16,11 @@ from pathlib import Path
 import requests
 import pandas as pd
 
-from .scraper import TennisAbstractScraper, convert_scraped_to_db_format
+from .scraper import (
+    TennisAbstractScraper,
+    clean_player_name,
+    convert_scraped_to_db_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +316,7 @@ def scrape_player_matches(player_name, min_year=None, tour="atp",
                 pass
 
     df = convert_scraped_to_db_format(raw, player_name, min_year=min_year,
-                                      max_matches=max_matches)
+                                      max_matches=max_matches, tour=tour)
     return df, last_match_date
 
 
@@ -789,6 +793,7 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
 
     for entry in rankings:
         name = entry["name"]
+        storage_name = clean_player_name(name) or name
         norm = _normalize_name(name)
         fp = activity_map.get(norm)
 
@@ -797,7 +802,7 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
             fingerprints[name] = fp
             continue
 
-        cache_row = cache_snapshot.get(name)
+        cache_row = cache_snapshot.get(storage_name) or cache_snapshot.get(name)
 
         if fp is not None:
             cur_t, prev_t = fp.split("|", 1)
@@ -810,7 +815,8 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
                 stale.append(name)
                 fingerprints[name] = fp
             else:
-                # Fingerprint unchanged — sync it silently
+                # Fingerprint unchanged — cache hit under the same normalized
+                # name used by scrape_player_extended_stats when writing.
                 fingerprints[name] = fp
         else:
             if not _cache_row_is_fresh(cache_row, 168):

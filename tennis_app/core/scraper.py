@@ -1311,7 +1311,7 @@ EXTENDED_DB_TABLES = {
 
 
 def convert_scraped_to_db_format(raw_matches, player_name, min_year=None,
-                                 max_matches=None):
+                                 max_matches=None, tour="atp"):
     """
     Convert raw scraped match arrays into a DataFrame matching the
     existing database schema (winner/loser format).
@@ -1554,7 +1554,7 @@ def convert_scraped_to_db_format(raw_matches, player_name, min_year=None,
                 "winner_rank_points": None,
                 "loser_rank": loser_rank,
                 "loser_rank_points": None,
-                "tour": "atp",
+                "tour": tour,
                 "is_upcoming": 1 if is_upcoming else 0,
             })
 

@@ -16,6 +16,7 @@ from ..widgets import (
 )
 from ..charts import bar_chart_h2h, spider_chart_dual, get_chart_base_url
 from ..theme import COLORS, FONTS
+from ..match_detail_dialog import MatchDetailDialog
 
 
 class H2HPage(QWidget):
@@ -26,6 +27,7 @@ class H2HPage(QWidget):
         self.db = db
         self._p1 = None  # selected player dict
         self._p2 = None
+        self._h2h_matches = []  # flat list, filled after _compare
         self._build_ui()
 
     def _build_ui(self):
@@ -257,6 +259,15 @@ class H2HPage(QWidget):
             ])
         match_table.populate(rows)
         match_table.setMinimumHeight(300)
+        # Store match list and wire double-click
+        self._h2h_matches = list(h2h["matches"])
+        match_table.doubleClicked.connect(self._on_match_double_clicked)
         layout.addWidget(match_table)
 
         self.result_area.end_update()
+
+    def _on_match_double_clicked(self, index):
+        row = index.row()
+        if 0 <= row < len(self._h2h_matches):
+            dlg = MatchDetailDialog(self.db, self._h2h_matches[row], parent=self)
+            dlg.exec()

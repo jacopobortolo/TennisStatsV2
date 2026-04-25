@@ -487,6 +487,15 @@ class TennisDatabase:
                 "Failed to normalize matches.winner_name/loser_name "
                 "(non-fatal, will retry on next start)")
 
+        # One-shot migration: fix scraped WTA matches stored with tour='atp'.
+        # Uses the players table (which is correctly split by tour) to detect
+        # WTA-only names and updates the tour field accordingly.
+        try:
+            self._migrate_fix_scraped_match_tour(cur)
+        except Exception:
+            logger.exception(
+                "Failed to fix scraped match tour field "
+                "(non-fatal, will retry on next start)")
         # --- Phase 2 composite indexes for faster queries ---
         cur.executescript("""
             -- Matches: composite indexes for common query patterns
@@ -2092,6 +2101,71 @@ class TennisDatabase:
                 "deleted %d duplicate match rows",
                 len(rename_pairs), deleted)
 
+    def _migrate_fix_scraped_match_tour(self, cur):
+        """Fix scraped matches that were saved with tour='atp' regardless of
+        the actual tour.
+
+        Strategy: a match is WTA if BOTH players are exclusively in the WTA
+        players table (i.e. present in wta but absent in atp).  We build two
+        name sets from the players table and use them to relabel scraped rows.
+
+        Idempotent: only touches rows with tourney_id='SCRAPED' and tour='atp'
+        that can be positively identified as WTA.
+        """
+        # Build name sets per tour from the players table
+        wta_names = set()
+        atp_names = set()
+        for row in cur.execute(
+                "SELECT name_first, name_last, tour FROM players "
+                "WHERE tour IN ('atp', 'wta')"):
+            first, last, t = row[0] or "", row[1] or "", row[2] or ""
+            full = f"{first} {last}".strip()
+            if not full:
+                continue
+            key = _player_match_key(full)
+            if t == "wta":
+                wta_names.add(key)
+            else:
+                atp_names.add(key)
+
+        if not wta_names:
+            return
+
+        # Collect distinct (winner_name, loser_name) pairs for scraped rows
+        # stored as 'atp' tour — these are the candidates to fix.
+        try:
+            candidates = cur.execute("""
+                SELECT DISTINCT winner_name, loser_name
+                FROM matches
+                WHERE tourney_id = 'SCRAPED' AND tour = 'atp'
+                  AND winner_name IS NOT NULL AND loser_name IS NOT NULL
+            """).fetchall()
+        except Exception:
+            return
+
+        updated = 0
+        for winner_name, loser_name in candidates:
+            wk = _player_match_key(winner_name)
+            lk = _player_match_key(loser_name)
+            w_is_wta = wk in wta_names and wk not in atp_names
+            l_is_wta = lk in wta_names and lk not in atp_names
+            # Mark as WTA only when at least one player is WTA-exclusive.
+            # (Slams / mixed events: both players may appear in both tables —
+            # those stay as-is since they're usually ATP data or ambiguous.)
+            if w_is_wta or l_is_wta:
+                cur.execute("""
+                    UPDATE matches SET tour = 'wta'
+                    WHERE tourney_id = 'SCRAPED' AND tour = 'atp'
+                      AND winner_name = ? AND loser_name = ?
+                """, (winner_name, loser_name))
+                updated += cur.rowcount
+
+        if updated:
+            self.conn.commit()
+            logger.info(
+                "Fixed tour field for %d scraped WTA match rows "
+                "(was 'atp', now 'wta')", updated)
+
     def get_extended_stats_count(self, player_name):
         """Return count of extended stats records per table for a player."""
         tables = [
@@ -2107,6 +2181,57 @@ class TennisDatabase:
         query = " UNION ALL ".join(parts)
         cur = self.conn.execute(query, [player_name] * len(tables))
         return {row[0]: row[1] for row in cur.fetchall()}
+
+    def get_match_extended_stats(self, player_name: str, opponent_name: str,
+                                 tourney_name: str, tourney_date: str) -> dict:
+        """Return extended stats rows for a single match.
+
+        Tries the exact names first, then retries with ``clean_player_name``
+        normalization so scraper-side spellings always match stored data.
+
+        Returns a dict with 7 keys, each the first matching row as a dict
+        (or None if no row found):
+        ``winners_errors``, ``serve_speed``, ``pbp``,
+        ``mcp_serve``, ``mcp_return``, ``mcp_rally``, ``mcp_tactics``.
+        """
+        from .scraper import clean_player_name
+
+        p = clean_player_name(player_name) or player_name
+        o = clean_player_name(opponent_name) or opponent_name
+        tn = clean_player_name(tourney_name) or tourney_name  # keep as-is
+
+        # tourney_name is not normalised via clean_player_name; use original.
+        tn = tourney_name
+
+        tables_keys = [
+            ("match_winners_errors", "winners_errors"),
+            ("match_serve_speed", "serve_speed"),
+            ("match_pbp_stats", "pbp"),
+            ("match_mcp_serve", "mcp_serve"),
+            ("match_mcp_return", "mcp_return"),
+            ("match_mcp_rally", "mcp_rally"),
+            ("match_mcp_tactics", "mcp_tactics"),
+        ]
+
+        result = {}
+        for tbl, key in tables_keys:
+            row = None
+            # Try player p (winner/loser perspective) vs opponent o
+            for pn, on in [(p, o), (o, p)]:
+                cur = self.conn.execute(
+                    f"SELECT * FROM {tbl} "
+                    f"WHERE player_name = ? AND opponent_name = ? "
+                    f"  AND tourney_name = ? AND tourney_date = ? "
+                    f"LIMIT 1",
+                    (pn, on, tn, str(tourney_date)),
+                )
+                row = cur.fetchone()
+                if row:
+                    row = dict(row)
+                    row["_perspective"] = "player" if pn == p else "opponent"
+                    break
+            result[key] = row
+        return result
 
     @_locked_write
     def import_extended_stats(self, table_name, records, player_name):
