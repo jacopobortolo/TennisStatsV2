@@ -2143,7 +2143,7 @@ class TennisDatabase:
         except Exception:
             return
 
-        updated = 0
+        updated_pairs = 0
         for winner_name, loser_name in candidates:
             wk = _player_match_key(winner_name)
             lk = _player_match_key(loser_name)
@@ -2158,13 +2158,13 @@ class TennisDatabase:
                     WHERE tourney_id = 'SCRAPED' AND tour = 'atp'
                       AND winner_name = ? AND loser_name = ?
                 """, (winner_name, loser_name))
-                updated += cur.rowcount
+                updated_pairs += 1
 
-        if updated:
+        if updated_pairs:
             self.conn.commit()
             logger.info(
-                "Fixed tour field for %d scraped WTA match rows "
-                "(was 'atp', now 'wta')", updated)
+                "Fixed tour field for %d scraped WTA match pairs "
+                "(was 'atp', now 'wta')", updated_pairs)
 
     def get_extended_stats_count(self, player_name):
         """Return count of extended stats records per table for a player."""
