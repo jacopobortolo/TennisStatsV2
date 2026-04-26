@@ -919,28 +919,17 @@ def scrape_player_extended_stats(player_name, db=None, tables=None,
 
     if not raw_data:
         logger.warning("No extended stats found for %s", player_name)
-        # Decide whether to update the fingerprint:
-        # - first-ever scrape (no cache row): cache WITH fingerprint as a
-        #   negative-cache marker, to avoid retry storms on players who
-        #   simply have no extended-stats data on tennisabstract.
-        # - had a prior cache row (fingerprint just changed): preserve
-        #   the OLD fingerprint by passing None, so the next run sees
-        #   the activity change again and retries.
+        # Always advance the cached fingerprint to the current one, even
+        # on an empty result.  Otherwise players without a player-more.cgi
+        # page (no extended stats available on tennisabstract) trigger a
+        # re-scrape on every run as soon as their tournament label changes.
+        # The next retry will only happen when the activity fingerprint
+        # actually changes again (e.g. new tournament).
         if db:
             try:
-                had_cache = False
-                try:
-                    row = db.conn.execute(
-                        "SELECT 1 FROM extended_stats_cache "
-                        "WHERE player_name = ?",
-                        (storage_name,)).fetchone()
-                    had_cache = row is not None
-                except Exception:
-                    pass
-                fp_to_store = None if had_cache else activity_fingerprint
                 db.update_extended_stats_cache(
                     storage_name, [],
-                    activity_fingerprint=fp_to_store)
+                    activity_fingerprint=activity_fingerprint)
             except Exception:
                 logger.exception(
                     "Failed to cache empty extended stats for %s",
@@ -965,29 +954,13 @@ def scrape_player_extended_stats(player_name, db=None, tables=None,
             result[table_name] = len(records)
             tables_scraped.append(table_name)
 
-    # Update cache.  If at least one table was scraped, store the
-    # current fingerprint.  If no records were produced at all (all
-    # converters returned empty) treat the same way as the empty
-    # raw_data branch above: preserve old fingerprint when we already
-    # had a cache entry, so the next run will retry.
+    # Update cache.  Always advance the fingerprint to the current one,
+    # even when no converters produced records for this fingerprint state.
+    # The next retry will happen automatically when activity changes again.
     if db:
-        if tables_scraped:
-            db.update_extended_stats_cache(
-                storage_name, tables_scraped,
-                activity_fingerprint=activity_fingerprint)
-        else:
-            had_cache = False
-            try:
-                row = db.conn.execute(
-                    "SELECT 1 FROM extended_stats_cache "
-                    "WHERE player_name = ?",
-                    (storage_name,)).fetchone()
-                had_cache = row is not None
-            except Exception:
-                pass
-            fp_to_store = None if had_cache else activity_fingerprint
-            db.update_extended_stats_cache(
-                storage_name, [], activity_fingerprint=fp_to_store)
+        db.update_extended_stats_cache(
+            storage_name, tables_scraped,
+            activity_fingerprint=activity_fingerprint)
 
     logger.info("Extended stats for %s: %s", storage_name, result)
     return result
