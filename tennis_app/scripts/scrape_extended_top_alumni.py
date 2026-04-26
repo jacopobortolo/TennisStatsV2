@@ -87,6 +87,11 @@ def main() -> int:
     parser.add_argument("--cloud", action="store_true",
                         help="Write directly to Turso via RemoteTennisDatabase "
                              "instead of the local SQLite DB.")
+    parser.add_argument("--players-file", default=None,
+                        help="Path to a pipe-separated file produced by "
+                             "dump_alumni_list.py (player_id|name|tour). "
+                             "Required in --cloud mode because Turso has no "
+                             "historical rankings.")
     args = parser.parse_args()
 
     tours = [t.strip().lower() for t in args.tours.split(",") if t.strip()]
@@ -99,13 +104,37 @@ def main() -> int:
         db = TennisDatabase()
         logger.info("Using local SQLite database")
 
+    file_alumni: dict[str, list] = {}
+    if args.players_file:
+        from pathlib import Path
+        path = Path(args.players_file)
+        if not path.exists():
+            logger.error("--players-file not found: %s", path)
+            return 2
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|")
+            if len(parts) < 3:
+                continue
+            pid, name, tour = parts[0].strip(), parts[1].strip(), parts[2].strip().lower()
+            if not name or tour not in ("atp", "wta"):
+                continue
+            file_alumni.setdefault(tour, []).append((pid, name))
+        logger.info("Loaded alumni from file: %s",
+                    {t: len(v) for t, v in file_alumni.items()})
+
     grand_total = 0
     for tour in tours:
         if tour not in ("atp", "wta"):
             logger.warning("Skipping unknown tour: %s", tour)
             continue
 
-        alumni = _collect_alumni(db, tour, args.max_rank)
+        if file_alumni:
+            alumni = file_alumni.get(tour, [])
+        else:
+            alumni = _collect_alumni(db, tour, args.max_rank)
         if args.limit:
             alumni = alumni[: args.limit]
         logger.info("=== %s: %d players ever top-%d ===",

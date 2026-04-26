@@ -76,4 +76,5 @@ jobs:
             --max-rank "${{ github.event.inputs.max_rank || '20' }}" \
             --sleep "${{ github.event.inputs.sleep || '2.0' }}" \
             --limit "${{ github.event.inputs.limit || '0' }}" \
+            --players-file tennis_app/scripts/data/alumni_top20.txt \
             $EXTRA
