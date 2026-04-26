@@ -233,9 +233,7 @@ class MainWindow(QMainWindow):
                 pass
             self._loading_widget = None
 
-        # Pre-build all pages so tab switching is instant
-        for key in self._page_cls:
-            self._ensure_page(key)
+        # Build only the landing page; all others are built on first visit
         self._switch_page("player")
 
     def _ensure_page(self, key):
@@ -380,6 +378,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         if success:
             self.status_label.setText("Data refreshed!")
+            if self.db:
+                self.db.invalidate_player_cache()
             self._rebuild_pages()
         else:
             QMessageBox.critical(self, "Error",
@@ -438,6 +438,8 @@ class MainWindow(QMainWindow):
             count = self.db.get_scraped_match_count() if self.db else 0
             self.status_label.setText(
                 f"Live data loaded! ({count} scraped matches)")
+            if self.db:
+                self.db.invalidate_player_cache()
             self._rebuild_pages()
         else:
             QMessageBox.critical(self, "Error",

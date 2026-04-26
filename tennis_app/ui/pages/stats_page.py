@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSizePolicy,
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -58,6 +58,153 @@ class _ScrapeWorker(QThread):
             self.finished.emit(False, str(exc))
 
 
+class _LoadPlayerWorker(QThread):
+    """Fetch all matches for a player off the UI thread."""
+    data_ready = Signal(list, list)  # (matches, years)
+    error = Signal(str)
+
+    def __init__(self, db, player, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self._player = player
+
+    def run(self):
+        try:
+            player_id = self._player["player_id"]
+            tour = self._player.get("tour", "atp")
+            matches = self._db.get_player_matches(player_id, tour=tour)
+            years = sorted(
+                {str(m.get("tourney_date", ""))[:4]
+                 for m in matches if m.get("tourney_date")},
+                reverse=True,
+            )
+            self.data_ready.emit(matches, years)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _StatsComputeWorker(QThread):
+    """Compute stats + chart HTML off the UI thread."""
+    data_ready = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, db, player, matches, filters, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self._player = player
+        self._matches = matches
+        self._filters = filters
+
+    def run(self):
+        try:
+            from ...core.scraper import clean_player_name
+            player = self._player
+            player_id = player["player_id"]
+            name = f"{player['name_first']} {player['name_last']}"
+            filters = self._filters
+
+            filtered = filter_matches(
+                self._matches,
+                surface=filters["surface"],
+                year=filters["year"],
+                tourney_level=filters["tourney_level"],
+            )
+
+            if not filtered:
+                self.data_ready.emit({"no_matches": True})
+                return
+
+            per_match = []
+            for m in filtered:
+                ms = compute_match_stats(m, player_id)
+                if ms:
+                    per_match.append(ms)
+
+            agg = aggregate_stats(per_match)
+            pressure = compute_pressure_stats(filtered, player_id)
+            ext_counts = self._db.get_extended_stats_count(
+                clean_player_name(name) or name)
+            yearly = compute_yearly_advanced_stats(self._matches, player_id)
+
+            # --- Build all chart HTML in the background ---
+            # Spider chart
+            html_spider = ""
+            spider_cats, spider_vals = [], []
+            for lbl, key in [
+                ("Win %", "win_pct"),
+                ("1st Serve %", "avg_first_serve_pct"),
+                ("1st Serve Won", "avg_first_serve_won_pct"),
+                ("2nd Serve Won", "avg_second_serve_won_pct"),
+                ("Return Pts Won", "avg_return_pts_won_pct"),
+                ("BP Save %", "overall_bp_save_pct"),
+            ]:
+                val = agg.get(key)
+                if val is not None:
+                    spider_cats.append(lbl)
+                    spider_vals.append(float(val))
+            if len(spider_cats) >= 3:
+                html_spider = spider_chart(spider_cats, spider_vals, name)
+
+            # Pressure chart
+            html_pressure = ""
+            if any(pressure.get(k) is not None for k in (
+                    "dominance_ratio", "breakpoints_prevail",
+                    "deciding_set_win_pct", "tiebreak_win_pct")):
+                html_pressure = pressure_chart(pressure) or ""
+
+            # Yearly trend chart
+            html_yearly = ""
+            if yearly:
+                html_yearly = line_chart_trends(yearly, player_id) or ""
+
+            # Extended stats DB queries — use the normalized name so it
+            # matches the storage name written by the scraper (which also
+            # normalizes via clean_player_name before writing to the DB).
+            db_name = clean_player_name(name) or name
+            fkw = dict(surface=filters["surface"], year=filters["year"],
+                       tourney_level=filters["tourney_level"])
+            ext_data = {}
+            if ext_counts.get("match_winners_errors", 0) > 0:
+                ext_data["winners_errors"] = self._db.get_player_winners_errors(db_name, **fkw)
+            if ext_counts.get("match_serve_speed", 0) > 0:
+                ext_data["serve_speed"] = self._db.get_player_serve_speed(db_name, **fkw)
+            if ext_counts.get("match_pbp_stats", 0) > 0:
+                ext_data["pbp_stats"] = self._db.get_player_pbp_stats(db_name, **fkw)
+            if ext_counts.get("match_mcp_serve", 0) > 0:
+                ext_data["mcp_serve"] = self._db.get_player_mcp_serve(db_name, **fkw)
+            if ext_counts.get("match_mcp_tactics", 0) > 0:
+                ext_data["mcp_tactics"] = self._db.get_player_mcp_tactics(db_name, **fkw)
+
+            # Filter summary text
+            filter_text = []
+            if filters["surface"]:
+                filter_text.append(filters["surface"])
+            if filters["year"]:
+                filter_text.append(filters["year"])
+            if filters["tourney_level"]:
+                filter_text.append(f"Level: {filters['tourney_level']}")
+            filter_str = " | ".join(filter_text) if filter_text else "All matches"
+
+            self.data_ready.emit({
+                "no_matches": False,
+                "name": name,
+                "agg": agg,
+                "pressure": pressure,
+                "ext_counts": ext_counts,
+                "yearly": yearly,
+                "html_spider": html_spider,
+                "html_pressure": html_pressure,
+                "html_yearly": html_yearly,
+                "ext_data": ext_data,
+                "filter_str": filter_str,
+                "match_count": len(filtered),
+                "filters": filters,
+            })
+        except Exception as exc:
+            logger.exception("Stats computation failed")
+            self.error.emit(str(exc))
+
+
 class StatsPage(QWidget):
     """Advanced player statistics dashboard."""
 
@@ -66,6 +213,12 @@ class StatsPage(QWidget):
         self.db = db
         self.current_player = None
         self._cached_matches = []
+        self._load_worker = None
+        self._stats_worker = None
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(250)
+        self._filter_timer.timeout.connect(self._refresh_stats)
         self._build_ui()
 
     def _build_ui(self):
@@ -117,7 +270,7 @@ class StatsPage(QWidget):
         filter_row.addWidget(surf_label)
         self.surface_pills = PillButtonGroup(
             ["All", "Hard", "Clay", "Grass", "Carpet"])
-        self.surface_pills.changed.connect(lambda _: self._refresh_stats())
+        self.surface_pills.changed.connect(lambda _: self._filter_timer.start())
         filter_row.addWidget(self.surface_pills)
 
         filter_row.addWidget(QLabel("  "))  # spacer
@@ -129,7 +282,7 @@ class StatsPage(QWidget):
         self.year_combo = QComboBox()
         self.year_combo.addItems(["All"])
         self.year_combo.currentIndexChanged.connect(
-            lambda _: self._refresh_stats())
+            lambda _: self._filter_timer.start())
         filter_row.addWidget(self.year_combo)
 
         level_label = QLabel("Level:")
@@ -138,7 +291,7 @@ class StatsPage(QWidget):
         filter_row.addWidget(level_label)
         self.level_pills = PillButtonGroup(
             ["All", "G", "M", "A", "F", "D"])
-        self.level_pills.changed.connect(lambda _: self._refresh_stats())
+        self.level_pills.changed.connect(lambda _: self._filter_timer.start())
         filter_row.addWidget(self.level_pills)
 
         filter_row.addStretch()
@@ -183,20 +336,33 @@ class StatsPage(QWidget):
 
     def _load_player(self, player):
         self.current_player = player
-        player_id = player["player_id"]
-        tour = player.get("tour", "atp")
+        self.status_label.setText("Loading matches…")
 
-        matches = self.db.get_player_matches(player_id, tour=tour)
-        years = sorted(
-            {str(m.get("tourney_date", ""))[:4]
-             for m in matches if m.get("tourney_date")},
-            reverse=True,
-        )
+        # Show spinner in content area
+        self.content.begin_update()
+        lbl = QLabel("Loading player data…")
+        lbl.setObjectName("dimLabel")
+        lbl.setAlignment(Qt.AlignCenter)
+        self.content.content_layout.addWidget(lbl)
+        self.content.end_update()
+
+        # Stop any running workers
+        for w in (self._load_worker, self._stats_worker):
+            if w and w.isRunning():
+                w.quit()
+                w.wait(2000)
+
+        worker = _LoadPlayerWorker(self.db, player, parent=self)
+        worker.data_ready.connect(self._on_matches_loaded)
+        worker.error.connect(lambda msg: self.status_label.setText(f"Error: {msg}"))
+        self._load_worker = worker
+        worker.start()
+
+    def _on_matches_loaded(self, matches, years):
         self.year_combo.blockSignals(True)
         self.year_combo.clear()
         self.year_combo.addItems(["All"] + years)
         self.year_combo.blockSignals(False)
-
         self._cached_matches = matches
         self._refresh_stats()
 
@@ -204,19 +370,21 @@ class StatsPage(QWidget):
         if not self.current_player:
             return
 
-        player = self.current_player
-        player_id = player["player_id"]
-        name = f"{player['name_first']} {player['name_last']}"
+        # Stop any previous stats computation
+        if self._stats_worker and self._stats_worker.isRunning():
+            self._stats_worker.quit()
+            self._stats_worker.wait(2000)
+
         filters = self._get_filters()
+        worker = _StatsComputeWorker(
+            self.db, self.current_player, self._cached_matches, filters, parent=self)
+        worker.data_ready.connect(self._on_stats_data)
+        worker.error.connect(lambda msg: self.status_label.setText(f"Error: {msg}"))
+        self._stats_worker = worker
+        worker.start()
 
-        matches = filter_matches(
-            self._cached_matches,
-            surface=filters["surface"],
-            year=filters["year"],
-            tourney_level=filters["tourney_level"],
-        )
-
-        if not matches:
+    def _on_stats_data(self, payload):
+        if payload.get("no_matches"):
             self.content.begin_update()
             lbl = QLabel("No matches found with current filters")
             lbl.setObjectName("dimLabel")
@@ -226,40 +394,35 @@ class StatsPage(QWidget):
             self.status_label.setText("No matches")
             return
 
-        per_match = []
-        for m in matches:
-            ms = compute_match_stats(m, player_id)
-            if ms:
-                per_match.append(ms)
+        name = payload["name"]
+        agg = payload["agg"]
+        pressure = payload["pressure"]
+        ext_counts = payload["ext_counts"]
+        ext_data = payload["ext_data"]
+        html_spider = payload["html_spider"]
+        html_pressure = payload["html_pressure"]
+        html_yearly = payload["html_yearly"]
+        filter_str = payload["filter_str"]
+        match_count = payload["match_count"]
+        filters = payload["filters"]
 
-        agg = aggregate_stats(per_match)
-        pressure = compute_pressure_stats(matches, player_id)
-        from ...core.scraper import clean_player_name
-        ext_counts = self.db.get_extended_stats_count(
-            clean_player_name(name) or name)
-
-        # All data ready — build new content off-screen, then swap
         self.content.begin_update()
-        self._display_stats_content(name, agg, pressure, ext_counts, len(matches))
+        self._display_stats_content(
+            name, agg, pressure, ext_counts, ext_data,
+            html_spider, html_pressure, html_yearly,
+            filter_str, match_count, filters)
         self.content.end_update()
 
     def _display_stats(self, name, agg, pressure, ext_counts, match_count):
         self.content.begin_update()
-        self._display_stats_content(name, agg, pressure, ext_counts, match_count)
+        self._display_stats_content(name, agg, pressure, ext_counts, {}, "", "", "",
+                                    "All matches", match_count, {})
         self.content.end_update()
 
-    def _display_stats_content(self, name, agg, pressure, ext_counts, match_count):
+    def _display_stats_content(self, name, agg, pressure, ext_counts, ext_data,
+                                html_spider, html_pressure, html_yearly,
+                                filter_str, match_count, filters):
         layout = self.content.content_layout
-
-        filters = self._get_filters()
-        filter_text = []
-        if filters["surface"]:
-            filter_text.append(filters["surface"])
-        if filters["year"]:
-            filter_text.append(filters["year"])
-        if filters["tourney_level"]:
-            filter_text.append(f"Level: {filters['tourney_level']}")
-        filter_str = " | ".join(filter_text) if filter_text else "All matches"
 
         # Header
         title = QLabel(f"📊 Advanced Stats: {name}")
@@ -274,30 +437,12 @@ class StatsPage(QWidget):
 
         layout.addWidget(Separator())
 
-        # --- Spider chart ---
-        categories = []
-        values = []
-
-        metric_map = [
-            ("Win %", "win_pct"),
-            ("1st Serve %", "avg_first_serve_pct"),
-            ("1st Serve Won", "avg_first_serve_won_pct"),
-            ("2nd Serve Won", "avg_second_serve_won_pct"),
-            ("Return Pts Won", "avg_return_pts_won_pct"),
-            ("BP Save %", "overall_bp_save_pct"),
-        ]
-        for label, key in metric_map:
-            val = agg.get(key)
-            if val is not None:
-                categories.append(label)
-                values.append(float(val))
-
-        if len(categories) >= 3:
-            html = spider_chart(categories, values, name)
+        # --- Spider chart (HTML pre-built in worker) ---
+        if html_spider:
             chart = QWebEngineView()
             chart.page().setBackgroundColor(QColor(COLORS["bg_primary"]))
             chart.setFixedHeight(380)
-            chart.setHtml(html, get_chart_base_url())
+            chart.setHtml(html_spider, get_chart_base_url())
             layout.addWidget(chart)
             layout.addWidget(Separator())
 
@@ -369,16 +514,12 @@ class StatsPage(QWidget):
 
         # --- Pressure ---
         self._section_header(layout, "Pressure & Clutch")
-        if any(pressure.get(k) is not None for k in
-               ("dominance_ratio", "breakpoints_prevail",
-                "deciding_set_win_pct", "tiebreak_win_pct")):
-            html = pressure_chart(pressure)
-            if html:
-                chart = QWebEngineView()
-                chart.page().setBackgroundColor(QColor(COLORS["bg_primary"]))
-                chart.setFixedHeight(300)
-                chart.setHtml(html, get_chart_base_url())
-                layout.addWidget(chart)
+        if html_pressure:
+            chart = QWebEngineView()
+            chart.page().setBackgroundColor(QColor(COLORS["bg_primary"]))
+            chart.setFixedHeight(300)
+            chart.setHtml(html_pressure, get_chart_base_url())
+            layout.addWidget(chart)
 
         press_grid = StatGrid(columns=4)
         if agg.get("overall_bp_save_pct") is not None:
@@ -407,106 +548,82 @@ class StatsPage(QWidget):
             lbl.setObjectName("dimLabel")
             layout.addWidget(lbl)
         else:
-            self._display_extended_stats(layout, ext_counts)
+            self._display_extended_stats(layout, ext_counts, ext_data)
 
         layout.addWidget(Separator())
 
         # --- Yearly trend ---
         self._section_header(layout, "Yearly Trend")
-        player_id = self.current_player["player_id"]
-        yearly = compute_yearly_advanced_stats(
-            self._cached_matches, player_id)
-        if yearly:
-            html = line_chart_trends(yearly, player_id)
+        if html_yearly:
             chart = QWebEngineView()
             chart.page().setBackgroundColor(QColor(COLORS["bg_primary"]))
             chart.setFixedHeight(300)
-            chart.setHtml(html, get_chart_base_url())
+            chart.setHtml(html_yearly, get_chart_base_url())
             layout.addWidget(chart)
         else:
             lbl = QLabel("Not enough data for yearly trend.")
             lbl.setObjectName("dimLabel")
             layout.addWidget(lbl)
 
-    def _display_extended_stats(self, layout, ext_counts):
-        player = self.current_player
-        name = f"{player['name_first']} {player['name_last']}"
-        filters = self._get_filters()
-        fkw = dict(surface=filters["surface"], year=filters["year"],
-                   tourney_level=filters["tourney_level"])
-
+    def _display_extended_stats(self, layout, ext_counts, ext_data):
         grid = StatGrid(columns=4)
 
         # Winners/Errors
-        if ext_counts.get("match_winners_errors", 0) > 0:
-            we_data = self.db.get_player_winners_errors(name, **fkw)
-            if we_data:
-                w_total = sum(r.get("winners") or 0 for r in we_data)
-                ue_total = sum(r.get("unforced_errors") or 0 for r in we_data)
-                n = len(we_data)
-                grid.add_stat("Winners/Match", f"{w_total / n:.1f}")
-                grid.add_stat("UE/Match", f"{ue_total / n:.1f}")
-                if ue_total > 0:
-                    grid.add_stat("W/UE Ratio",
-                                  f"{w_total / ue_total:.2f}")
-                grid.add_stat("W/E Coverage", f"{n} matches")
+        we_data = ext_data.get("winners_errors")
+        if we_data:
+            w_total = sum(r.get("winners") or 0 for r in we_data)
+            ue_total = sum(r.get("unforced_errors") or 0 for r in we_data)
+            n = len(we_data)
+            grid.add_stat("Winners/Match", f"{w_total / n:.1f}")
+            grid.add_stat("UE/Match", f"{ue_total / n:.1f}")
+            if ue_total > 0:
+                grid.add_stat("W/UE Ratio", f"{w_total / ue_total:.2f}")
+            grid.add_stat("W/E Coverage", f"{n} matches")
 
         # Serve Speed
-        if ext_counts.get("match_serve_speed", 0) > 0:
-            speed_data = self.db.get_player_serve_speed(name, **fkw)
-            if speed_data:
-                avg_1st = [r["first_serve_avg"] for r in speed_data
-                           if r.get("first_serve_avg")]
-                max_1st = [r["first_serve_max"] for r in speed_data
-                           if r.get("first_serve_max")]
-                avg_2nd = [r["second_serve_avg"] for r in speed_data
-                           if r.get("second_serve_avg")]
-                if avg_1st:
-                    grid.add_stat("1st Serve Avg",
-                                  f"{sum(avg_1st) / len(avg_1st) * 1.60934:.1f} km/h")
-                if max_1st:
-                    grid.add_stat("1st Serve Max",
-                                  f"{max(max_1st) * 1.60934:.0f} km/h")
-                if avg_2nd:
-                    grid.add_stat("2nd Serve Avg",
-                                  f"{sum(avg_2nd) / len(avg_2nd) * 1.60934:.1f} km/h")
+        speed_data = ext_data.get("serve_speed")
+        if speed_data:
+            avg_1st = [r["first_serve_avg"] for r in speed_data if r.get("first_serve_avg")]
+            max_1st = [r["first_serve_max"] for r in speed_data if r.get("first_serve_max")]
+            avg_2nd = [r["second_serve_avg"] for r in speed_data if r.get("second_serve_avg")]
+            if avg_1st:
+                grid.add_stat("1st Serve Avg",
+                              f"{sum(avg_1st) / len(avg_1st) * 1.60934:.1f} km/h")
+            if max_1st:
+                grid.add_stat("1st Serve Max",
+                              f"{max(max_1st) * 1.60934:.0f} km/h")
+            if avg_2nd:
+                grid.add_stat("2nd Serve Avg",
+                              f"{sum(avg_2nd) / len(avg_2nd) * 1.60934:.1f} km/h")
 
         # PBP Stats
-        if ext_counts.get("match_pbp_stats", 0) > 0:
-            pbp_data = self.db.get_player_pbp_stats(name, **fkw)
-            if pbp_data:
-                rally_lens = [r["rally_length_avg"] for r in pbp_data
-                              if r.get("rally_length_avg")]
-                agg_margins = [r["aggressive_margin"] for r in pbp_data
-                               if r.get("aggressive_margin") is not None]
-                if rally_lens:
-                    grid.add_stat("Rally Length",
-                                  f"{sum(rally_lens) / len(rally_lens):.1f}")
-                if agg_margins:
-                    grid.add_stat(
-                        "Aggr. Margin",
-                        f"{sum(agg_margins) / len(agg_margins):.1f}")
+        pbp_data = ext_data.get("pbp_stats")
+        if pbp_data:
+            rally_lens = [r["rally_length_avg"] for r in pbp_data if r.get("rally_length_avg")]
+            agg_margins = [r["aggressive_margin"] for r in pbp_data
+                           if r.get("aggressive_margin") is not None]
+            if rally_lens:
+                grid.add_stat("Rally Length",
+                              f"{sum(rally_lens) / len(rally_lens):.1f}")
+            if agg_margins:
+                grid.add_stat("Aggr. Margin",
+                              f"{sum(agg_margins) / len(agg_margins):.1f}")
 
         # MCP Serve Direction
-        if ext_counts.get("match_mcp_serve", 0) > 0:
-            srv_data = self.db.get_player_mcp_serve(name, **fkw)
-            if srv_data:
-                ace_pcts = [r["ace_pct"] for r in srv_data
-                            if r.get("ace_pct") is not None]
-                if ace_pcts:
-                    grid.add_stat("Ace %",
-                                  f"{sum(ace_pcts) / len(ace_pcts):.1f}%")
+        srv_data = ext_data.get("mcp_serve")
+        if srv_data:
+            ace_pcts = [r["ace_pct"] for r in srv_data if r.get("ace_pct") is not None]
+            if ace_pcts:
+                grid.add_stat("Ace %", f"{sum(ace_pcts) / len(ace_pcts):.1f}%")
 
         # MCP Tactics
-        if ext_counts.get("match_mcp_tactics", 0) > 0:
-            tac_data = self.db.get_player_mcp_tactics(name, **fkw)
-            if tac_data:
-                net_appr = [r["net_approach_pct"] for r in tac_data
-                            if r.get("net_approach_pct") is not None]
-                if net_appr:
-                    grid.add_stat(
-                        "Net Approach %",
-                        f"{sum(net_appr) / len(net_appr):.1f}%")
+        tac_data = ext_data.get("mcp_tactics")
+        if tac_data:
+            net_appr = [r["net_approach_pct"] for r in tac_data
+                        if r.get("net_approach_pct") is not None]
+            if net_appr:
+                grid.add_stat("Net Approach %",
+                              f"{sum(net_appr) / len(net_appr):.1f}%")
 
         layout.addWidget(grid)
 

@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QSizePolicy,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 from ..widgets import SearchBar, DataTable, Separator, PillButtonGroup, PlayerSearchEdit
 from ..theme import COLORS
@@ -24,6 +24,10 @@ class MatchesPage(QWidget):
         self._current_player_id = None
         self._current_player_tour = None
         self._current_page = 1
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(250)
+        self._filter_timer.timeout.connect(self._refetch_matches)
         self._build_ui()
         self._connect_filters()
 
@@ -165,12 +169,12 @@ class MatchesPage(QWidget):
 
     def _connect_filters(self):
         """Wire filter widgets to re-fetch matches when the user changes them."""
-        self.surface_pills.changed.connect(lambda _: self._refetch_matches())
-        self.level_pills.changed.connect(lambda _: self._refetch_matches())
+        self.surface_pills.changed.connect(lambda _: self._filter_timer.start())
+        self.level_pills.changed.connect(lambda _: self._filter_timer.start())
         self.year_combo.currentIndexChanged.connect(
-            lambda _: self._refetch_matches())
+            lambda _: self._filter_timer.start())
         self.round_combo.currentIndexChanged.connect(
-            lambda _: self._refetch_matches())
+            lambda _: self._filter_timer.start())
 
     def _refetch_matches(self):
         """Re-query the DB using current filter values for the selected player."""

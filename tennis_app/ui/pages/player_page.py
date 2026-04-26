@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QSizePolicy, QPushButton,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from ..widgets import (
@@ -22,6 +22,56 @@ from ..charts import (
 from ..theme import COLORS, FONTS
 
 
+# ---------------------------------------------------------------------------
+# Background worker
+# ---------------------------------------------------------------------------
+
+class _ProfileWorker(QThread):
+    """Fetch all DB data and build chart HTML strings off the UI thread."""
+
+    data_ready = Signal(dict)   # emits payload dict on success
+    error = Signal(str)
+
+    def __init__(self, db, player_id, tour, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self._player_id = player_id
+        self._tour = tour
+
+    def run(self):
+        try:
+            player = self._db.get_player(self._player_id, tour=self._tour)
+            if not player:
+                self.error.emit("Player not found")
+                return
+
+            stats = self._db.get_player_career_stats(self._player_id, tour=self._tour)
+            rank_history = []
+            try:
+                rank_history = self._db.get_player_ranking_history(
+                    self._player_id, self._tour or player.get("tour"))
+            except Exception:
+                pass
+
+            # Pre-compute all chart HTML in the background thread
+            html_donut = surface_donut(stats.get("surfaces", {})) or ""
+            html_yearly = bar_chart_yearly(stats.get("yearly", {})) if stats.get("yearly") else ""
+            html_rank_yr = rank_yearly_chart(rank_history) if rank_history else ""
+            html_rank_wk = ranking_history_chart(rank_history) if rank_history else ""
+
+            self.data_ready.emit({
+                "player": dict(player),
+                "stats": stats,
+                "rank_history": rank_history,
+                "html_donut": html_donut,
+                "html_yearly": html_yearly,
+                "html_rank_yr": html_rank_yr,
+                "html_rank_wk": html_rank_wk,
+            })
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class PlayerPage(QWidget):
     """Page for searching players and viewing their profile dashboard."""
 
@@ -29,6 +79,7 @@ class PlayerPage(QWidget):
         super().__init__(parent)
         self.db = db
         self.current_player = None
+        self._profile_worker = None
         self._build_ui()
 
     def _build_ui(self):
@@ -119,14 +170,43 @@ class PlayerPage(QWidget):
         self._show_profile(player_id, tour)
 
     def _show_profile(self, player_id, tour=None):
-        player = self.db.get_player(player_id, tour=tour)
-        if not player:
-            return
+        # Show spinner immediately so the UI stays responsive
+        self.profile_area.clear_content()
+        spinner = QLabel("Loading player profile…")
+        spinner.setObjectName("dimLabel")
+        spinner.setAlignment(Qt.AlignCenter)
+        self.profile_area.content_layout.addWidget(spinner)
+
+        # Stop any previous worker
+        if self._profile_worker and self._profile_worker.isRunning():
+            self._profile_worker.quit()
+            self._profile_worker.wait(2000)
+
+        worker = _ProfileWorker(self.db, player_id, tour, parent=self)
+        worker.data_ready.connect(self._on_profile_data)
+        worker.error.connect(self._on_profile_error)
+        self._profile_worker = worker
+        worker.start()
+
+    def _on_profile_error(self, msg):
+        self.profile_area.clear_content()
+        lbl = QLabel(f"Could not load profile: {msg}")
+        lbl.setObjectName("dimLabel")
+        lbl.setAlignment(Qt.AlignCenter)
+        self.profile_area.content_layout.addWidget(lbl)
+
+    def _on_profile_data(self, payload):
+        player = payload["player"]
+        stats = payload["stats"]
+        rank_history = payload["rank_history"]
+        html_donut = payload["html_donut"]
+        html_yearly = payload["html_yearly"]
+        html_rank_yr = payload["html_rank_yr"]
+        html_rank_wk = payload["html_rank_wk"]
+
         self.current_player = player
         self.profile_area.clear_content()
         layout = self.profile_area.content_layout
-
-        stats = self.db.get_player_career_stats(player_id, tour=tour)
 
         # --- Header ---
         name = f"{player['name_first']} {player['name_last']}"
@@ -193,12 +273,11 @@ class PlayerPage(QWidget):
         if surfaces:
             row = QHBoxLayout()
 
-            # Donut chart
-            html = surface_donut(surfaces)
-            if html:
+            # Donut chart (HTML pre-built in background thread)
+            if html_donut:
                 chart = QWebEngineView()
                 chart.setFixedHeight(280)
-                chart.setHtml(html, get_chart_base_url())
+                chart.setHtml(html_donut, get_chart_base_url())
                 row.addWidget(chart, 2)
 
             # Stat cards
@@ -226,38 +305,28 @@ class PlayerPage(QWidget):
         layout.addWidget(Separator())
 
         # --- Yearly chart ---
-        yearly = stats.get("yearly", {})
-        if yearly:
+        if html_yearly:
             layout.addWidget(SectionHeader("Year-by-Year Record"))
-
-            html = bar_chart_yearly(yearly)
             chart = QWebEngineView()
             chart.setFixedHeight(300)
-            chart.setHtml(html, get_chart_base_url())
+            chart.setHtml(html_yearly, get_chart_base_url())
             layout.addWidget(chart)
             layout.addWidget(Separator())
 
         # --- Ranking career (yearly best/year-end + week-by-week) ---
-        try:
-            rank_history = self.db.get_player_ranking_history(
-                player_id, tour or player.get("tour"))
-        except Exception:
-            rank_history = []
         if rank_history:
             layout.addWidget(SectionHeader("Ranking Career"))
 
-            html_yr = rank_yearly_chart(rank_history)
-            if html_yr:
+            if html_rank_yr:
                 chart_yr = QWebEngineView()
                 chart_yr.setFixedHeight(320)
-                chart_yr.setHtml(html_yr, get_chart_base_url())
+                chart_yr.setHtml(html_rank_yr, get_chart_base_url())
                 layout.addWidget(chart_yr)
 
-            html_wk = ranking_history_chart(rank_history)
-            if html_wk:
+            if html_rank_wk:
                 chart_wk = QWebEngineView()
                 chart_wk.setFixedHeight(340)
-                chart_wk.setHtml(html_wk, get_chart_base_url())
+                chart_wk.setHtml(html_rank_wk, get_chart_base_url())
                 layout.addWidget(chart_wk)
 
             layout.addWidget(Separator())

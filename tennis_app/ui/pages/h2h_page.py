@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QSizePolicy,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -19,6 +19,88 @@ from ..theme import COLORS, FONTS
 from ..match_detail_dialog import MatchDetailDialog
 
 
+# ---------------------------------------------------------------------------
+# Background worker
+# ---------------------------------------------------------------------------
+
+class _H2HWorker(QThread):
+    """Fetch H2H data and career stats off the UI thread."""
+
+    data_ready = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, db, p1, p2, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self._p1 = p1
+        self._p2 = p2
+
+    def run(self):
+        try:
+            p1, p2 = self._p1, self._p2
+            p1_id, p2_id = p1["player_id"], p2["player_id"]
+            p1_tour = p1.get("tour")
+            p1_name = f"{p1['name_first']} {p1['name_last']}"
+            p2_name = f"{p2['name_first']} {p2['name_last']}"
+
+            h2h = self._db.get_head_to_head(p1_id, p2_id, tour=p1_tour)
+            if h2h["total_matches"] == 0:
+                self.data_ready.emit({
+                    "no_matches": True,
+                    "p1_name": p1_name,
+                    "p2_name": p2_name,
+                })
+                return
+
+            stats1 = self._db.get_player_career_stats(p1_id, tour=p1_tour)
+            stats2 = self._db.get_player_career_stats(p2_id, tour=p1_tour)
+
+            # Build comparisons list
+            def _safe_pct(wins, losses):
+                total = wins + losses
+                return round(wins / total * 100, 1) if total else 0
+
+            comparisons = []
+            comparisons.append(("Win %",
+                                 _safe_pct(stats1["wins"], stats1["losses"]),
+                                 _safe_pct(stats2["wins"], stats2["losses"])))
+            if stats1.get("serve") and stats2.get("serve"):
+                for key, label in [
+                    ("first_serve_pct", "1st Serve %"),
+                    ("first_serve_won_pct", "1st Srv Won %"),
+                    ("second_serve_won_pct", "2nd Srv Won %"),
+                    ("bp_saved_pct", "BP Saved %"),
+                ]:
+                    sv1 = float(stats1["serve"].get(key, 0))
+                    sv2 = float(stats2["serve"].get(key, 0))
+                    if sv1 or sv2:
+                        comparisons.append((label, sv1, sv2))
+
+            # Pre-build chart HTML
+            surfaces_data = h2h.get("by_surface", {})
+            html_h2h_bar = bar_chart_h2h(surfaces_data, p1_name, p2_name) if surfaces_data else ""
+
+            categories = [c[0] for c in comparisons]
+            vals1 = [c[1] for c in comparisons]
+            vals2 = [c[2] for c in comparisons]
+            html_spider = (spider_chart_dual(categories, vals1, p1_name, vals2, p2_name)
+                           if len(categories) >= 3 else "")
+
+            self.data_ready.emit({
+                "no_matches": False,
+                "p1_name": p1_name,
+                "p2_name": p2_name,
+                "h2h": h2h,
+                "stats1": stats1,
+                "stats2": stats2,
+                "comparisons": comparisons,
+                "html_h2h_bar": html_h2h_bar,
+                "html_spider": html_spider,
+            })
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class H2HPage(QWidget):
     """Head-to-head comparison between two players."""
 
@@ -28,6 +110,7 @@ class H2HPage(QWidget):
         self._p1 = None  # selected player dict
         self._p2 = None
         self._h2h_matches = []  # flat list, filled after _compare
+        self._h2h_worker = None
         self._build_ui()
 
     def _build_ui(self):
@@ -105,19 +188,36 @@ class H2HPage(QWidget):
             self.result_area.content_layout.addWidget(lbl)
             return
 
-        players1 = [p1]
-        players2 = [p2]
+        # Show spinner immediately
+        self.result_area.clear_content()
+        spinner = QLabel("Loading comparison…")
+        spinner.setObjectName("dimLabel")
+        spinner.setAlignment(Qt.AlignCenter)
+        self.result_area.content_layout.addWidget(spinner)
 
-        p1 = players1[0]
-        p2 = players2[0]
-        p1_id, p2_id = p1["player_id"], p2["player_id"]
-        p1_tour = p1.get("tour")
-        p1_name = f"{p1['name_first']} {p1['name_last']}"
-        p2_name = f"{p2['name_first']} {p2['name_last']}"
+        # Stop any previous worker
+        if self._h2h_worker and self._h2h_worker.isRunning():
+            self._h2h_worker.quit()
+            self._h2h_worker.wait(2000)
 
-        h2h = self.db.get_head_to_head(p1_id, p2_id, tour=p1_tour)
+        worker = _H2HWorker(self.db, p1, p2, parent=self)
+        worker.data_ready.connect(self._on_h2h_data)
+        worker.error.connect(self._on_h2h_error)
+        self._h2h_worker = worker
+        worker.start()
 
-        if h2h["total_matches"] == 0:
+    def _on_h2h_error(self, msg):
+        self.result_area.clear_content()
+        lbl = QLabel(f"Error: {msg}")
+        lbl.setObjectName("dimLabel")
+        lbl.setAlignment(Qt.AlignCenter)
+        self.result_area.content_layout.addWidget(lbl)
+
+    def _on_h2h_data(self, payload):
+        p1_name = payload["p1_name"]
+        p2_name = payload["p2_name"]
+
+        if payload.get("no_matches"):
             self.result_area.clear_content()
             lbl = QLabel(f"No matches found between {p1_name} and {p2_name}")
             lbl.setObjectName("subHeaderLabel")
@@ -125,9 +225,12 @@ class H2HPage(QWidget):
             self.result_area.content_layout.addWidget(lbl)
             return
 
-        # --- Key Stats Comparison (fetched before clearing UI) ---
-        stats1 = self.db.get_player_career_stats(p1_id, tour=p1_tour)
-        stats2 = self.db.get_player_career_stats(p2_id, tour=p1_tour)
+        h2h = payload["h2h"]
+        stats1 = payload["stats1"]
+        stats2 = payload["stats2"]
+        comparisons = payload["comparisons"]
+        html_h2h_bar = payload["html_h2h_bar"]
+        html_spider = payload["html_spider"]
 
         # All data ready — build new content off-screen, then swap
         self.result_area.begin_update()
@@ -168,13 +271,11 @@ class H2HPage(QWidget):
         if surfaces_data:
             row = QHBoxLayout()
 
-            # Bar chart
-            html = bar_chart_h2h(surfaces_data, p1_name, p2_name)
-            if html:
+            if html_h2h_bar:
                 chart = QWebEngineView()
                 chart.page().setBackgroundColor(QColor(COLORS["bg_primary"]))
                 chart.setFixedHeight(280)
-                chart.setHtml(html, get_chart_base_url())
+                chart.setHtml(html_h2h_bar, get_chart_base_url())
                 row.addWidget(chart, 2)
 
             # Surface stat cards
@@ -190,29 +291,6 @@ class H2HPage(QWidget):
         layout.addWidget(Separator())
 
         # --- Key Stats Comparison (side-by-side bars) ---
-        def _safe_pct(wins, losses):
-            total = wins + losses
-            return round(wins / total * 100, 1) if total else 0
-
-        comparisons = []
-        # Win %
-        v1 = _safe_pct(stats1["wins"], stats1["losses"])
-        v2 = _safe_pct(stats2["wins"], stats2["losses"])
-        comparisons.append(("Win %", v1, v2))
-
-        # Serve/return metrics
-        if stats1.get("serve") and stats2.get("serve"):
-            for key, label in [
-                ("first_serve_pct", "1st Serve %"),
-                ("first_serve_won_pct", "1st Srv Won %"),
-                ("second_serve_won_pct", "2nd Srv Won %"),
-                ("bp_saved_pct", "BP Saved %"),
-            ]:
-                sv1 = float(stats1["serve"].get(key, 0))
-                sv2 = float(stats2["serve"].get(key, 0))
-                if sv1 or sv2:
-                    comparisons.append((label, sv1, sv2))
-
         if comparisons:
             layout.addWidget(SectionHeader("Key Stats Comparison"))
             for stat_label, val1, val2 in comparisons:
@@ -221,19 +299,12 @@ class H2HPage(QWidget):
             layout.addWidget(Separator())
 
         # --- Spider chart comparison (career stats) ---
-        categories = [c[0] for c in comparisons]
-        vals1 = [c[1] for c in comparisons]
-        vals2 = [c[2] for c in comparisons]
-
-        if len(categories) >= 3:
+        if html_spider:
             layout.addWidget(SectionHeader("Performance Spider Comparison"))
-
-            html = spider_chart_dual(
-                categories, vals1, p1_name, vals2, p2_name)
             chart = QWebEngineView()
             chart.page().setBackgroundColor(QColor(COLORS["bg_primary"]))
             chart.setFixedHeight(400)
-            chart.setHtml(html, get_chart_base_url())
+            chart.setHtml(html_spider, get_chart_base_url())
             layout.addWidget(chart)
             layout.addWidget(Separator())
 

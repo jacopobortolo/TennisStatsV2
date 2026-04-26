@@ -95,6 +95,9 @@ class TennisDatabase:
         # (live scrape worker + background extended-stats worker share the
         # same connection and would otherwise raise "database is locked").
         self._write_lock = threading.RLock()
+        # In-memory result caches (keyed by (player_id, tour))
+        self._career_stats_cache: dict = {}
+        self._ranking_history_cache: dict = {}
         # Performance pragmas
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
@@ -184,6 +187,9 @@ class TennisDatabase:
             CREATE INDEX IF NOT EXISTS idx_matches_winner_name ON matches(winner_name);
             CREATE INDEX IF NOT EXISTS idx_matches_loser_name ON matches(loser_name);
             CREATE INDEX IF NOT EXISTS idx_rankings_player ON rankings(player_id);
+            CREATE INDEX IF NOT EXISTS idx_rankings_tour_date ON rankings(tour, ranking_date);
+            CREATE INDEX IF NOT EXISTS idx_matches_winner_name_tour ON matches(winner_name, tour);
+            CREATE INDEX IF NOT EXISTS idx_matches_loser_name_tour ON matches(loser_name, tour);
             CREATE INDEX IF NOT EXISTS idx_players_name ON players(name_last, name_first);
 
             CREATE TABLE IF NOT EXISTS scrape_cache (
@@ -816,8 +822,41 @@ class TennisDatabase:
 
     def get_player_career_stats(self, player_id, tour=None):
         """Calculate career statistics for a player."""
+        _cache_key = (player_id, tour)
+        if _cache_key in self._career_stats_cache:
+            return self._career_stats_cache[_cache_key]
+
         tour_cond = " AND tour = ?" if tour else ""
         tour_params = (tour,) if tour else ()
+
+        # Resolve full name so we also catch SCRAPED matches where the
+        # scraper left winner_id/loser_id empty (typical for recent TA
+        # rows post-2024).  Mirrors the logic in ``get_player_matches``.
+        name_row = self.conn.execute(
+            "SELECT name_first, name_last FROM players "
+            "WHERE player_id = ? LIMIT 1",
+            (player_id,)
+        ).fetchone()
+        player_name = (
+            f"{name_row[0]} {name_row[1]}".strip() if name_row else None
+        )
+        if player_name:
+            player_name_nohyphen = player_name.replace("-", " ")
+            win_match = (
+                "(winner_id = ? OR (winner_id = '' "
+                "AND REPLACE(winner_name, '-', ' ') = ?))"
+            )
+            lose_match = (
+                "(loser_id = ? OR (loser_id = '' "
+                "AND REPLACE(loser_name, '-', ' ') = ?))"
+            )
+            win_params = (player_id, player_name_nohyphen)
+            lose_params = (player_id, player_name_nohyphen)
+        else:
+            win_match = "winner_id = ?"
+            lose_match = "loser_id = ?"
+            win_params = (player_id,)
+            lose_params = (player_id,)
 
         # Single query to get all breakdowns at once
         rows = self.conn.execute(f"""
@@ -833,7 +872,7 @@ class TennisDatabase:
                        w_1stIn as first_in, w_1stWon as first_won,
                        w_2ndWon as second_won, w_bpSaved as bp_saved,
                        w_bpFaced as bp_faced
-                FROM matches WHERE winner_id = ?{tour_cond}
+                FROM matches WHERE {win_match}{tour_cond}
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                 UNION ALL
                 SELECT 'L' as side, surface, tourney_level, round, tourney_date,
@@ -841,11 +880,11 @@ class TennisDatabase:
                        l_1stIn as first_in, l_1stWon as first_won,
                        l_2ndWon as second_won, l_bpSaved as bp_saved,
                        l_bpFaced as bp_faced
-                FROM matches WHERE loser_id = ?{tour_cond}
+                FROM matches WHERE {lose_match}{tour_cond}
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
             )
             GROUP BY side, surface, tourney_level, round, yr
-        """, (player_id,) + tour_params + (player_id,) + tour_params).fetchall()
+        """, win_params + tour_params + lose_params + tour_params).fetchall()
 
         wins = 0
         losses = 0
@@ -935,7 +974,7 @@ class TennisDatabase:
                     total_bp_saved / (total_bp_faced or 1) * 100, 1),
             }
 
-        return {
+        result = {
             "wins": wins,
             "losses": losses,
             "titles": titles,
@@ -945,6 +984,8 @@ class TennisDatabase:
             "serve": serve,
             "yearly": yearly,
         }
+        self._career_stats_cache[_cache_key] = result
+        return result
 
     def get_head_to_head(self, player1_id, player2_id, tour=None):
         """Get head-to-head record and matches between two players."""
@@ -1037,6 +1078,9 @@ class TennisDatabase:
         """
         if not player_id:
             return []
+        _cache_key = (player_id, tour)
+        if _cache_key in self._ranking_history_cache:
+            return self._ranking_history_cache[_cache_key]
         cur = self.conn.execute("""
             SELECT ranking_date, rank, points
             FROM rankings
@@ -1044,7 +1088,26 @@ class TennisDatabase:
               AND ranking_date GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'
             ORDER BY ranking_date
         """, (str(player_id), tour))
-        return [dict(r) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+        self._ranking_history_cache[_cache_key] = rows
+        return rows
+
+    def invalidate_player_cache(self, player_id=None):
+        """Clear in-memory result caches.
+
+        Call with no arguments to wipe everything (e.g. after a data
+        refresh), or with a player_id to evict only that player's entries.
+        """
+        if player_id is None:
+            self._career_stats_cache.clear()
+            self._ranking_history_cache.clear()
+        else:
+            keys = [k for k in self._career_stats_cache if k[0] == player_id]
+            for k in keys:
+                del self._career_stats_cache[k]
+            keys = [k for k in self._ranking_history_cache if k[0] == player_id]
+            for k in keys:
+                del self._ranking_history_cache[k]
 
     # ------------------------------------------------------------------
     # Rank-filling helpers
