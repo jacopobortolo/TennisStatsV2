@@ -14,7 +14,11 @@ from ..widgets import (
     ScrollablePage, SearchBar, StatGrid, Separator, PlayerHeader, DataTable,
     SectionHeader, PillButtonGroup,
 )
-from ..charts import spider_chart, bar_chart_yearly, surface_donut, get_chart_base_url
+from ..charts import (
+    spider_chart, bar_chart_yearly, surface_donut,
+    rank_yearly_chart, ranking_history_chart,
+    get_chart_base_url,
+)
 from ..theme import COLORS, FONTS
 
 
@@ -231,6 +235,31 @@ class PlayerPage(QWidget):
             chart.setFixedHeight(300)
             chart.setHtml(html, get_chart_base_url())
             layout.addWidget(chart)
+            layout.addWidget(Separator())
+
+        # --- Ranking career (yearly best/year-end + week-by-week) ---
+        try:
+            rank_history = self.db.get_player_ranking_history(
+                player_id, tour or player.get("tour"))
+        except Exception:
+            rank_history = []
+        if rank_history:
+            layout.addWidget(SectionHeader("Ranking Career"))
+
+            html_yr = rank_yearly_chart(rank_history)
+            if html_yr:
+                chart_yr = QWebEngineView()
+                chart_yr.setFixedHeight(320)
+                chart_yr.setHtml(html_yr, get_chart_base_url())
+                layout.addWidget(chart_yr)
+
+            html_wk = ranking_history_chart(rank_history)
+            if html_wk:
+                chart_wk = QWebEngineView()
+                chart_wk.setFixedHeight(340)
+                chart_wk.setHtml(html_wk, get_chart_base_url())
+                layout.addWidget(chart_wk)
+
             layout.addWidget(Separator())
 
         # --- By round ---

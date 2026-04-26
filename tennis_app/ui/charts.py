@@ -357,3 +357,142 @@ def surface_donut(surfaces: dict, height: int = 280) -> str:
     ))
     fig.update_layout(showlegend=False)
     return _to_html(fig, height=height)
+
+
+# ---------------------------------------------------------------------------
+# Ranking history charts
+# ---------------------------------------------------------------------------
+
+def _aggregate_yearly_ranks(history: list) -> dict:
+    """From a chronologically sorted ranking history, compute per-year
+    best (lowest) rank and year-end rank.
+
+    Returns:
+        {year:int -> {"best": int, "year_end": int}}
+    """
+    by_year: dict = {}
+    for row in history:
+        d = str(row.get("ranking_date") or "")
+        rk = row.get("rank")
+        if rk is None or len(d) < 4:
+            continue
+        try:
+            year = int(d[:4])
+            rk = int(rk)
+        except (TypeError, ValueError):
+            continue
+        rec = by_year.setdefault(year, {"best": rk, "year_end": rk,
+                                        "_last_date": d})
+        if rk < rec["best"]:
+            rec["best"] = rk
+        # history is already date-ordered, so the last assignment wins
+        if d >= rec["_last_date"]:
+            rec["year_end"] = rk
+            rec["_last_date"] = d
+    for rec in by_year.values():
+        rec.pop("_last_date", None)
+    return by_year
+
+
+def rank_yearly_chart(history: list, height: int = 300) -> str:
+    """Grouped bar chart: best rank vs year-end rank, per year.
+
+    Y axis is reversed so rank #1 sits at the top.
+    """
+    by_year = _aggregate_yearly_ranks(history)
+    if not by_year:
+        return ""
+
+    years = sorted(by_year.keys())
+    best = [by_year[y]["best"] for y in years]
+    year_end = [by_year[y]["year_end"] for y in years]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=years, y=best, name="Best of year",
+        marker_color=COLORS["accent"],
+        text=[str(v) for v in best],
+        textposition="outside",
+        textfont=dict(color=COLORS["text"], size=10),
+        hovertemplate="<b>%{x}</b><br>Best: #%{y}<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=years, y=year_end, name="Year-end",
+        marker_color=COLORS["peach"],
+        text=[str(v) for v in year_end],
+        textposition="outside",
+        textfont=dict(color=COLORS["text"], size=10),
+        hovertemplate="<b>%{x}</b><br>Year-end: #%{y}<extra></extra>",
+    ))
+    fig.update_layout(
+        barmode="group",
+        xaxis=dict(title="Year", dtick=1),
+        yaxis=dict(title="Rank", autorange="reversed", rangemode="tozero"),
+    )
+    return _to_html(fig, height=height)
+
+
+def ranking_history_chart(history: list, height: int = 320) -> str:
+    """Week-by-week ranking history line chart with career-high marker.
+
+    `history` is a list of {"ranking_date": "YYYYMMDD", "rank": int, ...}
+    sorted by date ascending.
+    """
+    if not history:
+        return ""
+
+    # Build (date, rank) series, skipping malformed rows
+    xs: list = []
+    ys: list = []
+    for row in history:
+        d = str(row.get("ranking_date") or "")
+        rk = row.get("rank")
+        if rk is None or len(d) != 8:
+            continue
+        try:
+            iso = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+            rk = int(rk)
+        except (TypeError, ValueError):
+            continue
+        xs.append(iso)
+        ys.append(rk)
+
+    if not xs:
+        return ""
+
+    # Career-high = lowest rank (earliest occurrence)
+    ch_idx = min(range(len(ys)), key=lambda i: ys[i])
+    ch_date = xs[ch_idx]
+    ch_rank = ys[ch_idx]
+    # Pretty date for label
+    try:
+        y, m, d = ch_date.split("-")
+        ch_label = f"Career High #{ch_rank} — {d}/{m}/{y}"
+    except ValueError:
+        ch_label = f"Career High #{ch_rank}"
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="lines", name="Rank",
+        line=dict(color=COLORS["green"], width=1.6),
+        hovertemplate="%{x}<br>Rank: #%{y}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=[ch_date], y=[ch_rank],
+        mode="markers+text",
+        name="Career High",
+        marker=dict(color=COLORS["red"], size=11,
+                    line=dict(color=COLORS["text"], width=1)),
+        text=[ch_label],
+        textposition="bottom center",
+        textfont=dict(color=COLORS["red"], size=11),
+        hovertemplate=f"<b>{ch_label}</b><extra></extra>",
+        showlegend=False,
+    ))
+    fig.update_layout(
+        xaxis=dict(title="Date", type="date"),
+        yaxis=dict(title="Rank", autorange="reversed", rangemode="tozero"),
+        showlegend=False,
+    )
+    return _to_html(fig, height=height)
+

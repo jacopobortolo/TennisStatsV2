@@ -1037,6 +1037,157 @@ class TennisAbstractScraper:
                               f"Extended stats complete for {player_name}")
         return results
 
+    # ------------------------------------------------------------------
+    # Historical ranking snapshots (per-week back-fill)
+    # ------------------------------------------------------------------
+
+    def scrape_atp_history_snapshot(self, date_str, top_n=500):
+        """Fetch ATP official singles ranking for a specific Monday.
+
+        date_str: 'YYYY-MM-DD' (Monday).
+        Returns list of dicts: {rank, name, country, points, tour}.
+        Uses atptour.com which supports ?dateWeek=YYYY-MM-DD&rankRange=1-N
+        in a single request (top_n up to ~5000 in one page).
+        """
+        url = (f"https://www.atptour.com/en/rankings/singles"
+               f"?rankRange=1-{int(top_n)}&dateWeek={date_str}")
+        scraper = cloudscraper.create_scraper()
+        try:
+            resp = scraper.get(url, timeout=30)
+        except Exception as exc:
+            logger.warning("ATP history fetch failed for %s: %s",
+                           date_str, exc)
+            return []
+        if resp.status_code != 200:
+            logger.warning("ATP history %s returned %d",
+                           date_str, resp.status_code)
+            return []
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tables = soup.find_all("table")
+        if not tables:
+            return []
+        target = tables[0]
+        results = []
+        for tr in target.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 3:
+                continue
+            rank_txt = tds[0].get_text(strip=True).rstrip(".")
+            if not rank_txt.isdigit():
+                continue
+            a = tr.find("a", href=lambda h: h and "/players/" in h)
+            if not a:
+                continue
+            href = a.get("href", "")
+            name = a.get_text(" ", strip=True)
+            # href shape: /en/players/jannik-sinner/s0ag/overview
+            slug_parts = href.strip("/").split("/")
+            atp_pid = slug_parts[3] if len(slug_parts) > 3 else ""
+            slug = slug_parts[2] if len(slug_parts) > 2 else ""
+            full_name = slug.replace("-", " ").title() if slug else name
+            pts_txt = tds[2].get_text(strip=True).replace(",", "")
+            try:
+                points = int(pts_txt) if pts_txt.isdigit() else None
+            except ValueError:
+                points = None
+            results.append({
+                "rank": int(rank_txt),
+                "name": full_name,
+                "country": "",
+                "points": points,
+                "tour": "atp",
+                "source_id": atp_pid,
+            })
+        return results
+
+    def scrape_wta_history_snapshot(self, date_str, top_n=500,
+                                    page_sleep=1.5):
+        """Fetch WTA singles ranking for a specific Monday from
+        tennisexplorer.com.
+
+        date_str: 'YYYY-MM-DD'.  TE paginates 50 rows/page → top_n=500
+        means 10 sequential GETs.
+        Returns list of dicts: {rank, name, country, points, tour}.
+        """
+        per_page = 50
+        pages = max(1, (int(top_n) + per_page - 1) // per_page)
+        results = []
+        scraper = cloudscraper.create_scraper()
+        for p in range(1, pages + 1):
+            url = (f"https://www.tennisexplorer.com/ranking/wta-women/"
+                   f"?date={date_str}&page={p}")
+            try:
+                resp = scraper.get(url, timeout=30)
+            except Exception as exc:
+                logger.warning("TE WTA %s p%d failed: %s",
+                               date_str, p, exc)
+                break
+            if resp.status_code != 200:
+                logger.warning("TE WTA %s p%d returned %d",
+                               date_str, p, resp.status_code)
+                break
+            soup = BeautifulSoup(resp.text, "html.parser")
+            target = None
+            for tbl in soup.find_all("table", class_="result"):
+                rows = tbl.find_all("tr")
+                if 30 < len(rows) < 80:
+                    target = tbl
+                    break
+            if target is None:
+                logger.warning("TE WTA %s p%d: ranking table not found",
+                               date_str, p)
+                break
+            for tr in target.find_all("tr"):
+                tds = tr.find_all("td")
+                if len(tds) < 5:
+                    continue
+                rank_txt = tds[0].get_text(strip=True).rstrip(".")
+                if not rank_txt.isdigit():
+                    continue
+                # Player cell is td[2] for TE
+                name_cell = tds[2]
+                a = name_cell.find("a")
+                # TE format: "Sabalenka Aryna" → swap to "Aryna Sabalenka"
+                raw = a.get_text(" ", strip=True) if a else \
+                    name_cell.get_text(" ", strip=True)
+                # Strip "(YYYY)" disambig suffix if present
+                raw = re.sub(r"\s*\(\d{4}\)\s*$", "", raw).strip()
+                parts = raw.split()
+                if len(parts) >= 2:
+                    # Last token is first name, rest is surname
+                    first = parts[-1]
+                    last = " ".join(parts[:-1])
+                    full_name = f"{first} {last}"
+                else:
+                    full_name = raw
+                country = tds[3].get_text(strip=True)
+                pts_txt = tds[4].get_text(strip=True).replace(",", "")
+                try:
+                    points = int(pts_txt) if pts_txt.isdigit() else None
+                except ValueError:
+                    points = None
+                slug = ""
+                if a and a.get("href"):
+                    m = re.search(r"/player/([^/]+)/?", a["href"])
+                    if m:
+                        slug = m.group(1)
+                results.append({
+                    "rank": int(rank_txt),
+                    "name": full_name,
+                    "country": country,
+                    "points": points,
+                    "tour": "wta",
+                    "source_id": slug,
+                })
+                if len(results) >= top_n:
+                    break
+            if len(results) >= top_n:
+                break
+            if p < pages:
+                time.sleep(page_sleep)
+        return results
+
 
 # ---------------------------------------------------------------------------
 # Extended stats row conversion helpers

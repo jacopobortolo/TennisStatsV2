@@ -7,6 +7,7 @@ import logging
 import threading
 import unicodedata
 import uuid
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -1024,6 +1025,27 @@ class TennisDatabase:
 
         return results, target_date
 
+    def get_player_ranking_history(self, player_id, tour):
+        """Return the full official ranking history for a player.
+
+        Result is a list of dicts ordered by date ascending, each:
+            {"ranking_date": "YYYYMMDD", "rank": int, "points": int|None}
+
+        Only rows with a non-NULL rank are included (LIVE/preview rows
+        without a real rank are skipped).  Index `idx_rankings_pid_date`
+        keeps this fast.
+        """
+        if not player_id:
+            return []
+        cur = self.conn.execute("""
+            SELECT ranking_date, rank, points
+            FROM rankings
+            WHERE player_id = ? AND tour = ? AND rank IS NOT NULL
+              AND ranking_date GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'
+            ORDER BY ranking_date
+        """, (str(player_id), tour))
+        return [dict(r) for r in cur.fetchall()]
+
     # ------------------------------------------------------------------
     # Rank-filling helpers
     # ------------------------------------------------------------------
@@ -1691,7 +1713,210 @@ class TennisDatabase:
             return marker, 0
 
         count = self.import_scraped_rankings(rankings, ranking_date=marker)
+
+        # Persist OFFICIAL singles snapshot also under a real Monday-of-week
+        # date so it shows up on the player ranking-history charts and slowly
+        # accumulates a weekly history (the upstream Sackmann CSVs stop at
+        # 2024-12-30, so without this our charts would have no 2025+ data).
+        if (source or "").upper() == "OFFICIAL" \
+                and (discipline or "singles").lower() == "singles":
+            try:
+                self._promote_marker_to_dated_snapshot(tour, marker)
+            except Exception:
+                logger.exception(
+                    "Failed to promote %s snapshot to dated row", marker)
+
         return marker, count
+
+    def _promote_marker_to_dated_snapshot(self, tour, marker):
+        """Copy a marker-keyed ranking snapshot under today's Monday date.
+
+        Idempotent: replaces any existing rows for that (tour, monday).
+        """
+        today = date.today()
+        monday = today - timedelta(days=today.weekday())
+        monday_str = monday.strftime("%Y%m%d")
+        cur = self.conn.execute(
+            "DELETE FROM rankings WHERE tour = ? AND ranking_date = ?",
+            (tour, monday_str),
+        )
+        self.conn.execute("""
+            INSERT INTO rankings
+                (ranking_date, rank, player_id, points, tour, age,
+                 rank_diff, pts_diff, next_tournament, ioc)
+            SELECT ?, rank, player_id, points, tour, age,
+                   rank_diff, pts_diff, next_tournament, ioc
+            FROM rankings
+            WHERE tour = ? AND ranking_date = ?
+        """, (monday_str, tour, marker))
+        self.conn.commit()
+        logger.info("Promoted %s snapshot to ranking_date=%s (%s)",
+                    marker, monday_str, tour)
+
+    def backfill_official_snapshots_to_today(self):
+        """Promote any existing OFFICIAL singles markers to today's Monday.
+
+        One-shot helper to seed the ranking history charts immediately
+        without waiting for the next scheduled scrape.  Idempotent.
+        Returns dict {tour: rows_copied}.
+        """
+        out = {}
+        for tour in ("atp", "wta"):
+            marker = self.scraped_ranking_marker(source="OFFICIAL",
+                                                 discipline="singles")
+            cnt = self.conn.execute(
+                "SELECT COUNT(*) FROM rankings WHERE tour=? AND ranking_date=?",
+                (tour, marker),
+            ).fetchone()[0]
+            if cnt:
+                self._promote_marker_to_dated_snapshot(tour, marker)
+                out[tour] = cnt
+            else:
+                out[tour] = 0
+        return out
+
+    def backfill_rankings_history(self, tour, start_date, end_date,
+                                  top_n=500, sleep_s=2.0,
+                                  progress_callback=None):
+        """Back-fill weekly historical ranking snapshots from third-party
+        sources to fill the gap between the frozen Sackmann CSVs (last
+        week 2024-12-30) and the current scraped snapshot.
+
+        Parameters
+        ----------
+        tour : str
+            'atp' (uses atptour.com) or 'wta' (uses tennisexplorer.com).
+        start_date, end_date : str | datetime.date
+            Inclusive date range.  Iterates by week (Mondays only).
+            Strings must be 'YYYY-MM-DD'.
+        top_n : int
+            Number of ranks to fetch per snapshot (default 500).
+        sleep_s : float
+            Delay between snapshot fetches (per Monday).
+
+        Idempotent: skips dates already present in the DB for this tour.
+        Returns dict {date_str: rows_inserted}.
+        """
+        from .scraper import TennisAbstractScraper
+
+        if isinstance(start_date, str):
+            start = date.fromisoformat(start_date)
+        else:
+            start = start_date
+        if isinstance(end_date, str):
+            end = date.fromisoformat(end_date)
+        else:
+            end = end_date
+
+        # Snap to Monday
+        start = start - timedelta(days=start.weekday())
+        end = end - timedelta(days=end.weekday())
+
+        scraper = TennisAbstractScraper()
+
+        # Build the list of weeks to fetch.
+        # ATP doesn't publish every Monday (off-season weeks skipped),
+        # so query atptour.com once for the list of valid date_week
+        # values and intersect with the requested range.  WTA via TE
+        # accepts any Monday but may return empty on off-weeks; we
+        # accept that as "no data".
+        if tour == "atp":
+            try:
+                weeks = self._fetch_atp_available_weeks()
+                weeks = [d for d in weeks if start <= d <= end]
+                weeks.sort()
+                logger.info("[backfill atp] %d valid ATP ranking weeks "
+                            "in [%s..%s]", len(weeks),
+                            start.isoformat(), end.isoformat())
+            except Exception as exc:
+                logger.warning("[backfill atp] week-list fetch failed "
+                               "(%s); falling back to every Monday", exc)
+                weeks = []
+                d = start
+                while d <= end:
+                    weeks.append(d)
+                    d += timedelta(days=7)
+        else:
+            weeks = []
+            d = start
+            while d <= end:
+                weeks.append(d)
+                d += timedelta(days=7)
+
+        out = {}
+        total_weeks = len(weeks)
+        for wk_idx, cur_d in enumerate(weeks, 1):
+            iso = cur_d.isoformat()
+            yyyymmdd = cur_d.strftime("%Y%m%d")
+            # Skip if already present
+            existing = self.conn.execute(
+                "SELECT COUNT(*) FROM rankings "
+                "WHERE tour=? AND ranking_date=?",
+                (tour, yyyymmdd),
+            ).fetchone()[0]
+            if existing:
+                logger.info("[backfill %s] %s: %d rows already present, skip",
+                            tour, iso, existing)
+                out[iso] = 0
+                if progress_callback:
+                    progress_callback(wk_idx, total_weeks,
+                                      f"{iso}: skipped")
+                continue
+
+            if tour == "atp":
+                rows = scraper.scrape_atp_history_snapshot(iso, top_n=top_n)
+            elif tour == "wta":
+                rows = scraper.scrape_wta_history_snapshot(iso, top_n=top_n)
+            else:
+                raise ValueError(f"Unsupported tour: {tour}")
+
+            if not rows:
+                logger.warning("[backfill %s] %s: no rows scraped", tour, iso)
+                out[iso] = 0
+            else:
+                # Reuse existing import path (handles name→player_id)
+                inserted = self.import_scraped_rankings(
+                    rows, ranking_date=yyyymmdd)
+                out[iso] = inserted
+                logger.info("[backfill %s] %s: %d rows imported",
+                            tour, iso, inserted)
+
+            if progress_callback:
+                progress_callback(wk_idx, total_weeks,
+                                  f"{iso}: {out[iso]} rows")
+
+            if wk_idx < total_weeks and sleep_s > 0:
+                import time as _t
+                _t.sleep(sleep_s)
+        return out
+
+    def _fetch_atp_available_weeks(self):
+        """Return a sorted list of date objects for which atptour.com
+        publishes a singles ranking (extracted from the date dropdown).
+        """
+        import re as _re
+        import cloudscraper as _cs
+        from bs4 import BeautifulSoup as _BS
+        sc = _cs.create_scraper()
+        resp = sc.get("https://www.atptour.com/en/rankings/singles",
+                      timeout=30)
+        if resp.status_code != 200:
+            raise RuntimeError(f"ATP rankings page status "
+                               f"{resp.status_code}")
+        soup = _BS(resp.text, "html.parser")
+        seen = set()
+        for o in soup.find_all("option"):
+            val = (o.get("value") or "").strip()
+            if _re.match(r"^\d{4}-\d{2}-\d{2}$", val):
+                seen.add(val)
+        out = []
+        for s in seen:
+            try:
+                out.append(date.fromisoformat(s))
+            except ValueError:
+                continue
+        out.sort()
+        return out
 
     def get_scraped_match_count(self):
         """Return how many scraped matches are in the database."""
