@@ -351,19 +351,40 @@ def _normalize_name(name):
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
+def _strip_draw_size(token):
+    """Remove the trailing draw-size annotation from a tournament label.
+
+    The OFFICIAL ranking exposes the current/previous tournament as
+    ``<Tournament> <Round>(<DrawSize>)``.  The ``(DrawSize)`` part flips
+    while the event progresses (e.g. ``R32(R128)`` -> ``R32(R64)``)
+    even when the player has not played a new match, so it must be
+    excluded from the fingerprint comparison.
+    """
+    if not token:
+        return ""
+    return re.sub(r"\s*\([^)]*\)\s*$", "", token).strip()
+
+
 def _activity_changed(old_fp, new_fp):
     """Pure-in-memory equivalent of ``has_(extended_)new_activity``.
 
     Returns True if *new_fp* contains tournament text not already
     present in *old_fp*.  Used by the bulk activity-check path so we
     don't issue 1000+ Turso round-trips per loop.
+
+    The ``(DrawSize)`` suffix is stripped from each side before the
+    comparison, so a draw-size update alone does not trigger a re-scrape.
     """
     if old_fp is None:
         return True
     if old_fp == new_fp:
         return False
-    old_combined = old_fp.replace("|", "")
-    new_cur, new_prev = (new_fp.split("|", 1) + [""])[:2]
+    def _norm(fp):
+        cur, prev = (fp.split("|", 1) + [""])[:2]
+        return _strip_draw_size(cur), _strip_draw_size(prev)
+    old_cur, old_prev = _norm(old_fp)
+    new_cur, new_prev = _norm(new_fp)
+    old_combined = f"{old_cur}{old_prev}"
     cur_is_new = bool(new_cur) and new_cur not in old_combined
     prev_is_new = bool(new_prev) and new_prev not in old_combined
     return cur_is_new or prev_is_new
