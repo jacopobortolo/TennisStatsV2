@@ -2121,6 +2121,33 @@ class TennisDatabase:
         ).fetchall()
         return {r[0]: (r[1], r[2]) for r in rows}
 
+    def get_players_with_due_upcoming(self, today_yyyymmdd: str | None = None):
+        """Return the set of player names that have at least one match
+        currently flagged ``is_upcoming = 1`` whose ``tourney_date`` is
+        on/before *today*.
+
+        These players need a re-scrape because their "upcoming" rows
+        should now have a completed result on tennisabstract.
+
+        ``today_yyyymmdd`` defaults to UTC today.
+        """
+        if today_yyyymmdd is None:
+            from datetime import datetime, timezone
+            today_yyyymmdd = datetime.now(timezone.utc).strftime("%Y%m%d")
+        try:
+            rows = self.conn.execute(
+                "SELECT DISTINCT winner_name FROM matches "
+                "WHERE is_upcoming = 1 AND tourney_date <= ? "
+                "UNION "
+                "SELECT DISTINCT loser_name FROM matches "
+                "WHERE is_upcoming = 1 AND tourney_date <= ?",
+                (today_yyyymmdd, today_yyyymmdd),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # is_upcoming column doesn't exist yet (pre-migration)
+            return set()
+        return {r[0] for r in rows if r[0]}
+
     # ------------------------------------------------------------------
     # Extended stats queries
     # ------------------------------------------------------------------

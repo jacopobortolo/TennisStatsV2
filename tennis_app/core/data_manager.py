@@ -605,6 +605,14 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
     # issuing two queries per player (1000+ remote calls for top-1000).
     cache_snapshot = db.get_all_scrape_cache() if db is not None else {}
 
+    # Players with at least one upcoming match whose date is <= today.
+    # Those rows should now have a completed result on tennisabstract,
+    # so force a re-scrape regardless of fingerprint state.  This catches
+    # the case where a player advances within the same tournament and
+    # the OFFICIAL fingerprint stays identical for hours/days.
+    due_upcoming = (db.get_players_with_due_upcoming()
+                    if db is not None else set())
+
     for name in player_names:
         norm = _normalize_name(name)
         fp = activity_map.get(norm)
@@ -614,27 +622,31 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
             continue
 
         cache_row = cache_snapshot.get(name)
+        has_due_upcoming = name in due_upcoming
 
         if fp is not None:
             # We have activity data from OFFICIAL
             cur_t, prev_t = fp.split("|", 1)
             if not cur_t and not prev_t:
                 # Inactive player: use 7-day cache
-                if not _cache_row_is_fresh(cache_row, 168):
+                if has_due_upcoming or not _cache_row_is_fresh(cache_row, 168):
                     stale.add(name)
                     fingerprints[name] = fp
-            elif _activity_changed(cache_row[1] if cache_row else None, fp):
-                # Fingerprint changed to new non-empty value: scrape
+            elif has_due_upcoming or _activity_changed(
+                    cache_row[1] if cache_row else None, fp):
+                # Fingerprint changed OR an upcoming match is now due:
+                # scrape to capture the new completed result.
                 stale.add(name)
                 fingerprints[name] = fp
             else:
-                # Fingerprint unchanged or only cleared: keep stored
+                # Fingerprint unchanged and no due upcoming: keep stored
                 # fingerprint in sync (update without re-scraping)
                 fingerprints[name] = fp
                 logger.debug("Skipping %s (activity unchanged)", name)
         else:
             # Player not found in OFFICIAL: fall back to time-based cache
-            if not _cache_row_is_fresh(cache_row, cache_expire_hours):
+            if has_due_upcoming or not _cache_row_is_fresh(
+                    cache_row, cache_expire_hours):
                 stale.add(name)
 
     logger.info("Event-driven check: %d/%d players (top %d) need refresh",
