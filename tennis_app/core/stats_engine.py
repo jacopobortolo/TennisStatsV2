@@ -275,6 +275,7 @@ def compute_match_stats(match, player_id, player_name=None):
         stats["straight_sets"] = score_data["is_straight_sets"] if won else False
 
     stats["minutes"] = match.get("minutes")
+    stats["round"] = match.get("round") or ""
 
     return stats
 
@@ -390,6 +391,31 @@ def aggregate_stats(match_stats_list):
     bp_conv = agg.get("bp_converted", 0) or 0
     if bp_lost > 0:
         agg["breakpoints_prevail"] = round(bp_conv / bp_lost, 2)
+
+    # --- Tournament progression by round ---
+    # For each round, count how many times the player played (and won) that round.
+    # "Titles" = won the F.  "Finals" = played F (win or loss).  etc.
+    _round_order = ["F", "SF", "QF", "R16", "R32", "R64", "R128", "RR"]
+    rounds_played: dict[str, int] = {}
+    rounds_won: dict[str, int] = {}
+    for s in match_stats_list:
+        r = s.get("round") or ""
+        if not r:
+            continue
+        rounds_played[r] = rounds_played.get(r, 0) + 1
+        if s.get("won"):
+            rounds_won[r] = rounds_won.get(r, 0) + 1
+    if rounds_played:
+        agg["rounds_played"] = rounds_played
+        agg["rounds_won"] = rounds_won
+        # Convenience fields for the most common rounds
+        agg["titles"] = rounds_won.get("F", 0)
+        agg["finals"] = rounds_played.get("F", 0)
+        agg["semis"] = rounds_played.get("SF", 0)
+        agg["quarters"] = rounds_played.get("QF", 0)
+        agg["r16"] = rounds_played.get("R16", 0)
+        agg["r32"] = rounds_played.get("R32", 0)
+        agg["r64"] = rounds_played.get("R64", 0)
 
     return agg
 

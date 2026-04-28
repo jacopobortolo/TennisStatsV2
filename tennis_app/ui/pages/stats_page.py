@@ -504,6 +504,63 @@ class StatsPage(QWidget):
         layout.addWidget(grid)
         layout.addWidget(Separator())
 
+        # --- Tournament Progression ---
+        if agg.get("rounds_played"):
+            self._section_header(layout, "Tournament Progression")
+            prog_grid = StatGrid(columns=4)
+            rp = agg["rounds_played"]
+            rw = agg.get("rounds_won", {})
+
+            def _pct(w, t):
+                return f" ({round(w/t*100)}%)" if t else ""
+
+            if agg.get("titles") is not None:
+                finals = agg.get("finals", 0)
+                titles = agg["titles"]
+                prog_grid.add_stat(
+                    "Titles", f"{titles}{_pct(titles, finals)}",
+                    icon="🏆")
+            if agg.get("finals", 0) > 0:
+                f_w = rw.get("F", 0)
+                f_p = rp.get("F", 0)
+                prog_grid.add_stat(
+                    "Finals", f"{f_w}W – {f_p - f_w}L",
+                    icon="🥈")
+            if agg.get("semis", 0) > 0:
+                sf_w = rw.get("SF", 0)
+                sf_p = rp.get("SF", 0)
+                prog_grid.add_stat(
+                    "Semi-Finals", f"{sf_w}W – {sf_p - sf_w}L",
+                    icon="4️⃣")
+            if agg.get("quarters", 0) > 0:
+                qf_w = rw.get("QF", 0)
+                qf_p = rp.get("QF", 0)
+                prog_grid.add_stat(
+                    "Quarter-Finals", f"{qf_w}W – {qf_p - qf_w}L")
+            if agg.get("r16", 0) > 0:
+                r16_w = rw.get("R16", 0)
+                r16_p = rp.get("R16", 0)
+                prog_grid.add_stat(
+                    "Round of 16", f"{r16_w}W – {r16_p - r16_w}L")
+            if agg.get("r32", 0) > 0:
+                r32_w = rw.get("R32", 0)
+                r32_p = rp.get("R32", 0)
+                prog_grid.add_stat(
+                    "Round of 32", f"{r32_w}W – {r32_p - r32_w}L")
+            if agg.get("r64", 0) > 0:
+                r64_w = rw.get("R64", 0)
+                r64_p = rp.get("R64", 0)
+                prog_grid.add_stat(
+                    "Round of 64", f"{r64_w}W – {r64_p - r64_w}L")
+            # RR (round robin) if present
+            rr_p = rp.get("RR", 0)
+            if rr_p > 0:
+                rr_w = rw.get("RR", 0)
+                prog_grid.add_stat(
+                    "Round Robin", f"{rr_w}W – {rr_p - rr_w}L")
+            layout.addWidget(prog_grid)
+            layout.addWidget(Separator())
+
         # --- Serve ---
         self._section_header(layout, "Serve")
         serve_grid = StatGrid(columns=4)
