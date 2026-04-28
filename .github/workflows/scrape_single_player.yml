@@ -66,7 +66,12 @@ jobs:
       - name: Build single-player file
         run: |
           mkdir -p _tmp
-          printf '%s\n' "${{ github.event.inputs.player_name }}" > _tmp/single_player.txt
+          # Format expected by scrape_extended_top_alumni: pid|name|tour
+          # pid is unused when reading from file, so a placeholder is fine.
+          printf 'MANUAL|%s|%s\n' \
+            "${{ github.event.inputs.player_name }}" \
+            "${{ github.event.inputs.tour }}" \
+            > _tmp/single_player.txt
           echo "--- file content ---"
           cat _tmp/single_player.txt
 
