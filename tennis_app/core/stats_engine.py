@@ -128,7 +128,7 @@ def parse_score(score_str):
 # Match-level stat computation (from existing DB fields)
 # ---------------------------------------------------------------------------
 
-def compute_match_stats(match, player_id):
+def compute_match_stats(match, player_id, player_name=None):
     """
     Compute derived statistics for a single match from the player's perspective.
 
@@ -138,10 +138,19 @@ def compute_match_stats(match, player_id):
         A match row from the database.
     player_id : str
         The player whose stats we're computing.
+    player_name : str, optional
+        Full name of the player (used as fallback when winner_id is empty,
+        which happens for SCRAPED matches where ID resolution failed).
 
     Returns dict of computed stats (None values for unavailable data).
     """
     is_winner = str(match.get("winner_id")) == str(player_id)
+
+    # Fallback for SCRAPED matches where both winner_id and loser_id are ''
+    if not is_winner and not match.get("winner_id") and player_name:
+        w_name = (match.get("winner_name") or "").replace("-", " ").strip().lower()
+        p_norm = player_name.replace("-", " ").strip().lower()
+        is_winner = w_name == p_norm
 
     # Prefix: 'w_' for player stats, 'l_' for opponent stats
     if is_winner:
@@ -389,7 +398,7 @@ def aggregate_stats(match_stats_list):
 # Pressure Points (tennisratio-style)
 # ---------------------------------------------------------------------------
 
-def compute_pressure_stats(matches, player_id):
+def compute_pressure_stats(matches, player_id, player_name=None):
     """
     Compute pressure-point statistics for a player.
 
@@ -401,7 +410,7 @@ def compute_pressure_stats(matches, player_id):
     """
     stats_list = []
     for m in matches:
-        ms = compute_match_stats(m, player_id)
+        ms = compute_match_stats(m, player_id, player_name=player_name)
         if ms:
             stats_list.append(ms)
 
@@ -478,7 +487,7 @@ def filter_matches(matches, surface=None, year=None, tourney_level=None,
 
 def compute_player_advanced_stats(matches, player_id, surface=None,
                                   year=None, tourney_level=None,
-                                  round_=None):
+                                  round_=None, player_name=None):
     """
     Convenience function: filter matches, compute per-match stats,
     aggregate, and return the full advanced stats dict.
@@ -490,12 +499,13 @@ def compute_player_advanced_stats(matches, player_id, surface=None,
 
     per_match = []
     for m in filtered:
-        ms = compute_match_stats(m, player_id)
+        ms = compute_match_stats(m, player_id, player_name=player_name)
         if ms:
             per_match.append(ms)
 
     agg = aggregate_stats(per_match)
-    pressure = compute_pressure_stats(filtered, player_id)
+    pressure = compute_pressure_stats(filtered, player_id,
+                                      player_name=player_name)
     agg["pressure"] = pressure
 
     return agg
@@ -505,7 +515,7 @@ def compute_player_advanced_stats(matches, player_id, surface=None,
 # Year-by-year advanced stats
 # ---------------------------------------------------------------------------
 
-def compute_yearly_advanced_stats(matches, player_id):
+def compute_yearly_advanced_stats(matches, player_id, player_name=None):
     """
     Compute advanced stats broken down by year.
 
@@ -519,7 +529,8 @@ def compute_yearly_advanced_stats(matches, player_id):
 
     result = {}
     for yr in sorted(by_year.keys()):
-        stats = compute_player_advanced_stats(by_year[yr], player_id)
+        stats = compute_player_advanced_stats(
+            by_year[yr], player_id, player_name=player_name)
         if stats:
             result[yr] = stats
 

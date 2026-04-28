@@ -117,15 +117,17 @@ class _StatsComputeWorker(QThread):
 
             per_match = []
             for m in filtered:
-                ms = compute_match_stats(m, player_id)
+                ms = compute_match_stats(m, player_id, player_name=name)
                 if ms:
                     per_match.append(ms)
 
             agg = aggregate_stats(per_match)
-            pressure = compute_pressure_stats(filtered, player_id)
+            pressure = compute_pressure_stats(filtered, player_id,
+                                              player_name=name)
             ext_counts = self._db.get_extended_stats_count(
                 clean_player_name(name) or name)
-            yearly = compute_yearly_advanced_stats(self._matches, player_id)
+            yearly = compute_yearly_advanced_stats(
+                self._matches, player_id, player_name=name)
 
             # --- Build all chart HTML in the background ---
             # Spider chart
