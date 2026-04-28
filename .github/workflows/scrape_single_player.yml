@@ -20,13 +20,9 @@ on:
           - atp
           - wta
       force:
-        description: 'Re-scrape even if cache is fresh'
+        description: 'Re-scrape extended stats even if cache is fresh'
         required: false
         default: 'true'
-      sleep:
-        description: 'Seconds between requests (politeness)'
-        required: false
-        default: '2.0'
 
 concurrency:
   group: tennis-single-${{ github.event.inputs.player_name }}
@@ -63,28 +59,14 @@ jobs:
             exit 1
           fi
 
-      - name: Build single-player file
-        run: |
-          mkdir -p _tmp
-          # Format expected by scrape_extended_top_alumni: pid|name|tour
-          # pid is unused when reading from file, so a placeholder is fine.
-          printf 'MANUAL|%s|%s\n' \
-            "${{ github.event.inputs.player_name }}" \
-            "${{ github.event.inputs.tour }}" \
-            > _tmp/single_player.txt
-          echo "--- file content ---"
-          cat _tmp/single_player.txt
-
       - name: Scrape player (${{ github.event.inputs.player_name }})
         run: |
           EXTRA=""
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
             EXTRA="--force"
           fi
-          python -m tennis_app.scripts.scrape_extended_top_alumni \
+          python -m tennis_app.scripts.scrape_single_player \
             --cloud \
-            --tours "${{ github.event.inputs.tour }}" \
-            --max-rank 100000 \
-            --sleep "${{ github.event.inputs.sleep || '2.0' }}" \
-            --players-file _tmp/single_player.txt \
+            --name "${{ github.event.inputs.player_name }}" \
+            --tour "${{ github.event.inputs.tour }}" \
             $EXTRA
