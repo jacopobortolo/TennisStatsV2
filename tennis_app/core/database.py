@@ -1619,6 +1619,27 @@ class TennisDatabase:
             except sqlite3.OperationalError:
                 pass  # column missing on first run before migration
 
+        # Drop "upcoming" rows whose date is already in the past.  These
+        # are stale placeholders left behind on tennisabstract when a
+        # match was played but the result hasn't been published yet.
+        # Importing them would re-create the same stale upcoming rows we
+        # just deleted above, leaving the matches stuck in "upcoming"
+        # forever in the UI.
+        if "is_upcoming" in matches_df.columns and \
+                "tourney_date" in matches_df.columns:
+            from datetime import datetime, timezone
+            today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+            stale_mask = (
+                (matches_df["is_upcoming"] == 1)
+                & (matches_df["tourney_date"].astype(str) < today_str)
+            )
+            n_stale = int(stale_mask.sum())
+            if n_stale:
+                logger.info(
+                    "Dropping %d stale upcoming rows (date < %s)",
+                    n_stale, today_str)
+                matches_df = matches_df[~stale_mask].copy()
+
         # Remove duplicates within the DataFrame (same date + winner + loser + tourney)
         matches_df = matches_df.drop_duplicates(
             subset=["tourney_date", "winner_name", "loser_name", "tourney_name", "round"],
