@@ -442,8 +442,20 @@ def compute_pressure_stats(matches, player_id):
 # ---------------------------------------------------------------------------
 
 def filter_matches(matches, surface=None, year=None, tourney_level=None,
-                   opponent_id=None):
-    """Filter a list of match dicts by surface, year, level, opponent."""
+                   opponent_id=None, round_=None):
+    """Filter a list of match dicts by surface, year, level, round, opponent.
+
+    ``tourney_level`` and ``round_`` may be a scalar or an iterable of
+    scalars (multi-select).
+    """
+    def _as_set(value):
+        if value in (None, "", []):
+            return None
+        if isinstance(value, (list, tuple, set)):
+            vals = {v for v in value if v not in (None, "")}
+            return vals or None
+        return {value}
+
     result = matches
     if surface:
         result = [m for m in result if m.get("surface") == surface]
@@ -451,8 +463,12 @@ def filter_matches(matches, surface=None, year=None, tourney_level=None,
         yr = str(year)
         result = [m for m in result
                   if str(m.get("tourney_date", ""))[:4] == yr]
-    if tourney_level:
-        result = [m for m in result if m.get("tourney_level") == tourney_level]
+    levels = _as_set(tourney_level)
+    if levels:
+        result = [m for m in result if m.get("tourney_level") in levels]
+    rounds = _as_set(round_)
+    if rounds:
+        result = [m for m in result if m.get("round") in rounds]
     if opponent_id:
         oid = str(opponent_id)
         result = [m for m in result
@@ -461,13 +477,14 @@ def filter_matches(matches, surface=None, year=None, tourney_level=None,
 
 
 def compute_player_advanced_stats(matches, player_id, surface=None,
-                                  year=None, tourney_level=None):
+                                  year=None, tourney_level=None,
+                                  round_=None):
     """
     Convenience function: filter matches, compute per-match stats,
     aggregate, and return the full advanced stats dict.
     """
     filtered = filter_matches(matches, surface=surface, year=year,
-                              tourney_level=tourney_level)
+                              tourney_level=tourney_level, round_=round_)
     if not filtered:
         return {}
 

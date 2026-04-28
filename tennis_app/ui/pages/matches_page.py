@@ -8,7 +8,10 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTimer
 
-from ..widgets import SearchBar, DataTable, Separator, PillButtonGroup, PlayerSearchEdit
+from ..widgets import (
+    SearchBar, DataTable, Separator, PillButtonGroup,
+    MultiPillButtonGroup, PlayerSearchEdit,
+)
 from ..theme import COLORS
 from ..match_detail_dialog import MatchDetailDialog
 
@@ -65,12 +68,11 @@ class MatchesPage(QWidget):
         filter_row.addWidget(self.year_combo)
 
         filter_row.addWidget(QLabel("Round:"))
-        self.round_combo = QComboBox()
-        self.round_combo.addItems(
+        self.round_pills = MultiPillButtonGroup(
             ["All", "F", "SF", "QF", "R16", "R32", "R64", "R128", "RR"])
-        filter_row.addWidget(self.round_combo)
+        filter_row.addWidget(self.round_pills)
 
-        self.level_pills = PillButtonGroup(
+        self.level_pills = MultiPillButtonGroup(
             ["All", "GS", "M", "ATP", "CH",
              "DC", "Fin"])
         filter_row.addWidget(self.level_pills)
@@ -173,8 +175,7 @@ class MatchesPage(QWidget):
         self.level_pills.changed.connect(lambda _: self._filter_timer.start())
         self.year_combo.currentIndexChanged.connect(
             lambda _: self._filter_timer.start())
-        self.round_combo.currentIndexChanged.connect(
-            lambda _: self._filter_timer.start())
+        self.round_pills.changed.connect(lambda _: self._filter_timer.start())
 
     def _refetch_matches(self):
         """Re-query the DB using current filter values for the selected player."""
@@ -188,19 +189,19 @@ class MatchesPage(QWidget):
         surface = None if surface == "All" else surface
         year = self.year_combo.currentText()
         year = None if year == "All" else int(year)
-        round_ = self.round_combo.currentText()
-        round_ = None if round_ == "All" else round_
+        rounds = self.round_pills.values() or None
 
         _level_map = {
-            "All": None, "GS": "G", "M": "M",
+            "GS": "G", "M": "M",
             "ATP": "A", "CH": "C", "DC": "D", "Fin": "F",
         }
-        tourney_level = _level_map.get(self.level_pills.value())
+        tourney_level = [_level_map[v] for v in self.level_pills.values()
+                         if v in _level_map] or None
 
         self._all_matches = self.db.get_player_matches(
             self._current_player_id, surface=surface,
             tourney_level=tourney_level,
-            year=year, round_=round_,
+            year=year, round_=rounds,
             tour=self._current_player_tour,
         )
         self._current_page = 1

@@ -95,6 +95,78 @@ class PillButtonGroup(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Multi Pill Button Group — multi-select pill buttons with sticky "All" entry
+# ---------------------------------------------------------------------------
+
+class MultiPillButtonGroup(QWidget):
+    """Horizontal row of pill toggle buttons supporting multi-selection.
+
+    The first option is treated as the "select all / clear" sentinel:
+    clicking it deselects every other button.  Selecting any other button
+    deselects the sentinel.  When nothing is selected the sentinel turns
+    back on.
+
+    Emits ``changed(list[str])`` with the active values (excluding the
+    sentinel).  An empty list means "no filter" (sentinel active).
+    """
+    changed = Signal(list)
+
+    def __init__(self, options: list[str], parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self._buttons: dict[str, QPushButton] = {}
+        self._all_label: str = options[0] if options else "All"
+        # Active set excludes the sentinel; empty means "all"
+        self._selected: set[str] = set()
+
+        for text in options:
+            btn = QPushButton(text)
+            btn.setObjectName("pillBtn")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setCheckable(False)
+            btn.clicked.connect(lambda checked=False, t=text: self._on_click(t))
+            layout.addWidget(btn)
+            self._buttons[text] = btn
+
+        layout.addStretch()
+        self._apply_styles()
+
+    def _on_click(self, text: str):
+        if text == self._all_label:
+            if not self._selected:
+                return  # already in "all" state
+            self._selected.clear()
+        else:
+            if text in self._selected:
+                self._selected.discard(text)
+            else:
+                self._selected.add(text)
+        self._apply_styles()
+        self.changed.emit(self.values())
+
+    def _apply_styles(self):
+        all_active = not self._selected
+        for text, btn in self._buttons.items():
+            active = (text == self._all_label and all_active) \
+                or (text != self._all_label and text in self._selected)
+            btn.setProperty("active", active)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def values(self) -> list[str]:
+        """Return active selections (sentinel excluded). Empty = no filter."""
+        return sorted(self._selected)
+
+    def set_values(self, items: list[str]):
+        self._selected = {x for x in items if x in self._buttons
+                          and x != self._all_label}
+        self._apply_styles()
+
+
+# ---------------------------------------------------------------------------
 # Stat Card — small metric box (icon + label + value)
 # ---------------------------------------------------------------------------
 

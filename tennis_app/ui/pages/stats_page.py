@@ -15,7 +15,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from ..widgets import (
     ScrollablePage, PlayerSearchEdit, StatGrid, Separator,
-    SectionHeader, PillButtonGroup,
+    SectionHeader, PillButtonGroup, MultiPillButtonGroup,
 )
 from ..charts import spider_chart, pressure_chart, line_chart_trends, get_chart_base_url
 from ..theme import COLORS
@@ -108,6 +108,7 @@ class _StatsComputeWorker(QThread):
                 surface=filters["surface"],
                 year=filters["year"],
                 tourney_level=filters["tourney_level"],
+                round_=filters.get("round_"),
             )
 
             if not filtered:
@@ -162,7 +163,8 @@ class _StatsComputeWorker(QThread):
             # normalizes via clean_player_name before writing to the DB).
             db_name = clean_player_name(name) or name
             fkw = dict(surface=filters["surface"], year=filters["year"],
-                       tourney_level=filters["tourney_level"])
+                       tourney_level=filters["tourney_level"],
+                       round_=filters.get("round_"))
             ext_data = {}
             if ext_counts.get("match_winners_errors", 0) > 0:
                 ext_data["winners_errors"] = self._db.get_player_winners_errors(db_name, **fkw)
@@ -182,7 +184,15 @@ class _StatsComputeWorker(QThread):
             if filters["year"]:
                 filter_text.append(filters["year"])
             if filters["tourney_level"]:
-                filter_text.append(f"Level: {filters['tourney_level']}")
+                lv = filters["tourney_level"]
+                if isinstance(lv, (list, tuple, set)):
+                    lv = "+".join(sorted(lv))
+                filter_text.append(f"Level: {lv}")
+            if filters.get("round_"):
+                rd = filters["round_"]
+                if isinstance(rd, (list, tuple, set)):
+                    rd = "+".join(sorted(rd))
+                filter_text.append(f"Round: {rd}")
             filter_str = " | ".join(filter_text) if filter_text else "All matches"
 
             self.data_ready.emit({
@@ -289,10 +299,19 @@ class StatsPage(QWidget):
         level_label.setObjectName("dimLabel")
         level_label.setStyleSheet("background: transparent;")
         filter_row.addWidget(level_label)
-        self.level_pills = PillButtonGroup(
+        self.level_pills = MultiPillButtonGroup(
             ["All", "G", "M", "A", "F", "D"])
         self.level_pills.changed.connect(lambda _: self._filter_timer.start())
         filter_row.addWidget(self.level_pills)
+
+        round_label = QLabel("Round:")
+        round_label.setObjectName("dimLabel")
+        round_label.setStyleSheet("background: transparent;")
+        filter_row.addWidget(round_label)
+        self.round_pills = MultiPillButtonGroup(
+            ["All", "F", "SF", "QF", "R16", "R32", "R64", "R128", "RR"])
+        self.round_pills.changed.connect(lambda _: self._filter_timer.start())
+        filter_row.addWidget(self.round_pills)
 
         filter_row.addStretch()
         tb_layout.addLayout(filter_row)
@@ -310,11 +329,13 @@ class StatsPage(QWidget):
     def _get_filters(self):
         surface = self.surface_pills.value()
         year = self.year_combo.currentText()
-        level = self.level_pills.value()
+        levels = self.level_pills.values() or None
+        rounds = self.round_pills.values() or None
         return {
             "surface": surface if surface != "All" else None,
             "year": year if year != "All" else None,
-            "tourney_level": level if level != "All" else None,
+            "tourney_level": levels,
+            "round_": rounds,
         }
 
     def _on_player_selected(self, player):

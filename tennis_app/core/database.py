@@ -84,6 +84,30 @@ def _is_remote_conn(conn) -> bool:
     return type(conn).__name__ == "RemoteConnection"
 
 
+def _eq_or_in(column, value, conditions, params):
+    """Append a ``column = ?`` or ``column IN (?,?,…)`` filter.
+
+    Accepts a scalar (single equality) or a list/tuple/set of values
+    (turned into an ``IN`` clause).  Empty iterables are ignored.
+    """
+    if value is None:
+        return
+    if isinstance(value, (list, tuple, set)):
+        vals = [v for v in value if v not in (None, "")]
+        if not vals:
+            return
+        if len(vals) == 1:
+            conditions.append(f"{column} = ?")
+            params.append(vals[0])
+        else:
+            placeholders = ",".join("?" * len(vals))
+            conditions.append(f"{column} IN ({placeholders})")
+            params.extend(vals)
+    else:
+        conditions.append(f"{column} = ?")
+        params.append(value)
+
+
 class TennisDatabase:
     """SQLite-backed database for tennis analytics."""
 
@@ -737,9 +761,7 @@ class TennisDatabase:
         if surface:
             conditions.append("surface = ?")
             params.append(surface)
-        if tourney_level:
-            conditions.append("tourney_level = ?")
-            params.append(tourney_level)
+        _eq_or_in("tourney_level", tourney_level, conditions, params)
         if year:
             conditions.append("tourney_date BETWEEN ? AND ?")
             params.extend([f"{year}0000", f"{year}9999"])
@@ -749,9 +771,7 @@ class TennisDatabase:
                 "(winner_id = ? AND loser_id = ?))"
             )
             params.extend([player_id, opponent_id, opponent_id, player_id])
-        if round_:
-            conditions.append("round = ?")
-            params.append(round_)
+        _eq_or_in("round", round_, conditions, params)
         # Always exclude scheduled/upcoming matches from analytics views.
         conditions.append("(is_upcoming = 0 OR is_upcoming IS NULL)")
 
@@ -2181,8 +2201,13 @@ class TennisDatabase:
     # Extended stats queries
     # ------------------------------------------------------------------
 
-    def get_player_winners_errors(self, player_name, surface=None, year=None, tourney_level=None):
-        """Get winners/errors data for a player."""
+    def _build_ext_filters(self, player_name, surface, year,
+                           tourney_level, round_):
+        """Build the WHERE clause + params shared by extended-stats getters.
+
+        ``tourney_level`` and ``round_`` may be a scalar or an iterable of
+        scalars (multi-select).
+        """
         conditions = ["player_name = ?"]
         params = [player_name]
         if surface:
@@ -2191,124 +2216,75 @@ class TennisDatabase:
         if year:
             conditions.append("tourney_date BETWEEN ? AND ?")
             params.extend([f"{year}0000", f"{year}9999"])
-        if tourney_level:
-            conditions.append("tourney_level = ?")
-            params.append(tourney_level)
-        where = " AND ".join(conditions)
+        _eq_or_in("tourney_level", tourney_level, conditions, params)
+        _eq_or_in("round", round_, conditions, params)
+        return " AND ".join(conditions), params
+
+    def get_player_winners_errors(self, player_name, surface=None, year=None,
+                                  tourney_level=None, round_=None):
+        """Get winners/errors data for a player."""
+        where, params = self._build_ext_filters(
+            player_name, surface, year, tourney_level, round_)
         cur = self.conn.execute(
             f"SELECT * FROM match_winners_errors WHERE {where} "
             "ORDER BY tourney_date DESC", params)
         return [dict(r) for r in cur.fetchall()]
 
-    def get_player_serve_speed(self, player_name, surface=None, year=None, tourney_level=None):
+    def get_player_serve_speed(self, player_name, surface=None, year=None,
+                               tourney_level=None, round_=None):
         """Get serve speed data for a player."""
-        conditions = ["player_name = ?"]
-        params = [player_name]
-        if surface:
-            conditions.append("surface = ?")
-            params.append(surface)
-        if year:
-            conditions.append("tourney_date BETWEEN ? AND ?")
-            params.extend([f"{year}0000", f"{year}9999"])
-        if tourney_level:
-            conditions.append("tourney_level = ?")
-            params.append(tourney_level)
-        where = " AND ".join(conditions)
+        where, params = self._build_ext_filters(
+            player_name, surface, year, tourney_level, round_)
         cur = self.conn.execute(
             f"SELECT * FROM match_serve_speed WHERE {where} "
             "ORDER BY tourney_date DESC", params)
         return [dict(r) for r in cur.fetchall()]
 
-    def get_player_pbp_stats(self, player_name, surface=None, year=None, tourney_level=None):
+    def get_player_pbp_stats(self, player_name, surface=None, year=None,
+                             tourney_level=None, round_=None):
         """Get point-by-point stats for a player."""
-        conditions = ["player_name = ?"]
-        params = [player_name]
-        if surface:
-            conditions.append("surface = ?")
-            params.append(surface)
-        if year:
-            conditions.append("tourney_date BETWEEN ? AND ?")
-            params.extend([f"{year}0000", f"{year}9999"])
-        if tourney_level:
-            conditions.append("tourney_level = ?")
-            params.append(tourney_level)
-        where = " AND ".join(conditions)
+        where, params = self._build_ext_filters(
+            player_name, surface, year, tourney_level, round_)
         cur = self.conn.execute(
             f"SELECT * FROM match_pbp_stats WHERE {where} "
             "ORDER BY tourney_date DESC", params)
         return [dict(r) for r in cur.fetchall()]
 
-    def get_player_mcp_serve(self, player_name, surface=None, year=None, tourney_level=None):
+    def get_player_mcp_serve(self, player_name, surface=None, year=None,
+                             tourney_level=None, round_=None):
         """Get MCP serve direction data for a player."""
-        conditions = ["player_name = ?"]
-        params = [player_name]
-        if surface:
-            conditions.append("surface = ?")
-            params.append(surface)
-        if year:
-            conditions.append("tourney_date BETWEEN ? AND ?")
-            params.extend([f"{year}0000", f"{year}9999"])
-        if tourney_level:
-            conditions.append("tourney_level = ?")
-            params.append(tourney_level)
-        where = " AND ".join(conditions)
+        where, params = self._build_ext_filters(
+            player_name, surface, year, tourney_level, round_)
         cur = self.conn.execute(
             f"SELECT * FROM match_mcp_serve WHERE {where} "
             "ORDER BY tourney_date DESC", params)
         return [dict(r) for r in cur.fetchall()]
 
-    def get_player_mcp_return(self, player_name, surface=None, year=None, tourney_level=None):
+    def get_player_mcp_return(self, player_name, surface=None, year=None,
+                              tourney_level=None, round_=None):
         """Get MCP return data for a player."""
-        conditions = ["player_name = ?"]
-        params = [player_name]
-        if surface:
-            conditions.append("surface = ?")
-            params.append(surface)
-        if year:
-            conditions.append("tourney_date BETWEEN ? AND ?")
-            params.extend([f"{year}0000", f"{year}9999"])
-        if tourney_level:
-            conditions.append("tourney_level = ?")
-            params.append(tourney_level)
-        where = " AND ".join(conditions)
+        where, params = self._build_ext_filters(
+            player_name, surface, year, tourney_level, round_)
         cur = self.conn.execute(
             f"SELECT * FROM match_mcp_return WHERE {where} "
             "ORDER BY tourney_date DESC", params)
         return [dict(r) for r in cur.fetchall()]
 
-    def get_player_mcp_rally(self, player_name, surface=None, year=None, tourney_level=None):
+    def get_player_mcp_rally(self, player_name, surface=None, year=None,
+                             tourney_level=None, round_=None):
         """Get MCP rally data for a player."""
-        conditions = ["player_name = ?"]
-        params = [player_name]
-        if surface:
-            conditions.append("surface = ?")
-            params.append(surface)
-        if year:
-            conditions.append("tourney_date BETWEEN ? AND ?")
-            params.extend([f"{year}0000", f"{year}9999"])
-        if tourney_level:
-            conditions.append("tourney_level = ?")
-            params.append(tourney_level)
-        where = " AND ".join(conditions)
+        where, params = self._build_ext_filters(
+            player_name, surface, year, tourney_level, round_)
         cur = self.conn.execute(
             f"SELECT * FROM match_mcp_rally WHERE {where} "
             "ORDER BY tourney_date DESC", params)
         return [dict(r) for r in cur.fetchall()]
 
-    def get_player_mcp_tactics(self, player_name, surface=None, year=None, tourney_level=None):
+    def get_player_mcp_tactics(self, player_name, surface=None, year=None,
+                               tourney_level=None, round_=None):
         """Get MCP tactics data for a player."""
-        conditions = ["player_name = ?"]
-        params = [player_name]
-        if surface:
-            conditions.append("surface = ?")
-            params.append(surface)
-        if year:
-            conditions.append("tourney_date BETWEEN ? AND ?")
-            params.extend([f"{year}0000", f"{year}9999"])
-        if tourney_level:
-            conditions.append("tourney_level = ?")
-            params.append(tourney_level)
-        where = " AND ".join(conditions)
+        where, params = self._build_ext_filters(
+            player_name, surface, year, tourney_level, round_)
         cur = self.conn.execute(
             f"SELECT * FROM match_mcp_tactics WHERE {where} "
             "ORDER BY tourney_date DESC", params)
