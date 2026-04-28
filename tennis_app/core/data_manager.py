@@ -626,7 +626,16 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
             continue
 
         cache_row = cache_snapshot.get(name)
-        has_due_upcoming = norm in due_upcoming
+        # Trigger re-scrape ONLY if there's a due upcoming AND the
+        # player's last scrape is older than the cooldown.  Without the
+        # cooldown, every successful scrape immediately re-creates new
+        # upcoming rows for the next round (e.g. just-finished R64 leaves
+        # a fresh R32 placeholder), which would re-flag the player as
+        # stale on the very next run and cause an infinite scrape loop.
+        has_due_upcoming = (
+            norm in due_upcoming
+            and not _cache_row_is_fresh(cache_row, cache_expire_hours)
+        )
 
         if fp is not None:
             # We have activity data from OFFICIAL
@@ -638,8 +647,8 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                     fingerprints[name] = fp
             elif has_due_upcoming or _activity_changed(
                     cache_row[1] if cache_row else None, fp):
-                # Fingerprint changed OR an upcoming match is now due:
-                # scrape to capture the new completed result.
+                # Fingerprint changed OR an upcoming match is now due
+                # (and cooldown elapsed): scrape to capture the new result.
                 stale.add(name)
                 fingerprints[name] = fp
             else:
@@ -649,8 +658,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                 logger.debug("Skipping %s (activity unchanged)", name)
         else:
             # Player not found in OFFICIAL: fall back to time-based cache
-            if has_due_upcoming or not _cache_row_is_fresh(
-                    cache_row, cache_expire_hours):
+            if not _cache_row_is_fresh(cache_row, cache_expire_hours):
                 stale.add(name)
 
     logger.info("Event-driven check: %d/%d players (top %d) need refresh",
