@@ -610,8 +610,12 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
     # so force a re-scrape regardless of fingerprint state.  This catches
     # the case where a player advances within the same tournament and
     # the OFFICIAL fingerprint stays identical for hours/days.
-    due_upcoming = (db.get_players_with_due_upcoming()
-                    if db is not None else set())
+    # NOTE: DB rows store the diacritic-stripped CSV-canonical spelling,
+    # while ranking names may carry accents (e.g. "Rafael J\u00f3dar" vs
+    # "Rafael Jodar").  Normalise both sides for the membership check.
+    _due_raw = (db.get_players_with_due_upcoming()
+                if db is not None else set())
+    due_upcoming = {_normalize_name(n) for n in _due_raw}
 
     for name in player_names:
         norm = _normalize_name(name)
@@ -622,7 +626,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
             continue
 
         cache_row = cache_snapshot.get(name)
-        has_due_upcoming = name in due_upcoming
+        has_due_upcoming = norm in due_upcoming
 
         if fp is not None:
             # We have activity data from OFFICIAL
