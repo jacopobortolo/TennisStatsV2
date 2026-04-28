@@ -113,7 +113,7 @@ def main(argv=None) -> int:
                 progress_callback=lambda c, t, m: logger.info(
                     "  [%d/%d] %s", c, t, m),
                 db=db,
-                cache_expire_hours=6,
+                cache_expire_hours=24,
                 min_year=args.min_year,
             )
             if not matches_df.empty:
