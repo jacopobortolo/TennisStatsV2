@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QComboBox, QSpinBox, QSizePolicy,
 )
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor, QBrush
 
 from ..widgets import (
     SearchBar, DataTable, Separator, PillButtonGroup,
@@ -259,6 +260,25 @@ class MatchesPage(QWidget):
             ])
 
         self.table.populate(rows)
+
+        # Colour the Score cell: bright green = win, bright red = loss
+        _pid = str(self._current_player_id or "")
+        _pname = (self._current_player or "").replace("-", " ").strip().lower()
+        _green = QBrush(QColor("#1a7a3c"))
+        _red   = QBrush(QColor("#7a1a1a"))
+        _score_col = 7
+        for r, m in enumerate(page):
+            wid = str(m.get("winner_id") or "")
+            wname = (m.get("winner_name") or "").replace("-", " ").strip().lower()
+            if wid and _pid:
+                is_win = wid == _pid
+            elif _pname:
+                is_win = wname == _pname
+            else:
+                continue
+            item = self.table.item(r, _score_col)
+            if item:
+                item.setBackground(_green if is_win else _red)
 
         page_text = (f"Page {self._current_page} of {total_pages}"
                      if rpp else "All")
