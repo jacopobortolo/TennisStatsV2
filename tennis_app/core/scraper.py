@@ -196,18 +196,40 @@ class TennisAbstractScraper:
         # Try HTML page first (has embedded JS data), then JS fallback,
         # for each URL variant.  Stop at the first one that yields data.
         def _try_one(url_name):
-            try:
-                url = f"{BASE_URL}/cgi-bin/{cgi}?p={url_name}"
-                resp = self._make_request(url)
-                if resp and "No player found" not in resp.text:
-                    matches = self._parse_matches_from_html(resp.text)
-                    if matches:
-                        logger.info("Found %d matches in HTML for %s",
-                                    len(matches), url_name)
-                        return matches
-            except Exception as exc:
-                logger.warning("Could not get HTML matches for %s: %s",
-                               url_name, exc)
+            url = f"{BASE_URL}/cgi-bin/{cgi}?p={url_name}"
+            # Two HTML attempts before falling back to the static JS file.
+            # The JS endpoint often serves a stale career-only snapshot
+            # (months/years old), so we want to lean hard on the live HTML.
+            for attempt in (1, 2):
+                try:
+                    resp = self._make_request(url, raise_on_error=False)
+                    if resp is None:
+                        logger.warning(
+                            "HTML returned None for %s (attempt %d/2)",
+                            url_name, attempt)
+                    elif "No player found" in resp.text:
+                        # Genuine "missing player" — no point retrying.
+                        logger.info(
+                            "HTML 'No player found' for %s", url_name)
+                        break
+                    else:
+                        matches = self._parse_matches_from_html(resp.text)
+                        if matches:
+                            logger.info(
+                                "Found %d matches in HTML for %s",
+                                len(matches), url_name)
+                            return matches
+                        logger.warning(
+                            "HTML response for %s parsed to 0 matches "
+                            "(attempt %d/2, html_len=%d)",
+                            url_name, attempt, len(resp.text))
+                except Exception as exc:
+                    logger.warning("HTML fetch failed for %s (attempt %d/2): %s",
+                                   url_name, attempt, exc)
+                if attempt == 1:
+                    # Short backoff between HTML retries (in addition to
+                    # the jitter applied by _make_request).
+                    time.sleep(random.uniform(2.0, 4.0))
             for js_url in (
                 f"{BASE_URL}/jsmatches/{url_name}.js",
                 f"{BASE_URL}/jsmatches/{url_name}Career.js",
@@ -217,8 +239,24 @@ class TennisAbstractScraper:
                     if resp and resp.status_code == 200:
                         matches = self._parse_matches_from_js(resp.text)
                         if matches:
-                            logger.info("Found %d matches from JS: %s",
-                                        len(matches), js_url)
+                            # Warn if the JS fallback looks stale: the file
+                            # is sometimes a career-only snapshot that lags
+                            # the live HTML by months.  This makes it visible
+                            # in production logs so we can distinguish a
+                            # legitimately empty post-min_year result from
+                            # a stale fallback masking new matches.
+                            try:
+                                latest = max(
+                                    int(m[0]) for m in matches
+                                    if m and m[0] not in (None, "")
+                                )
+                                logger.info(
+                                    "Found %d matches from JS: %s "
+                                    "(latest=%s)",
+                                    len(matches), js_url, latest)
+                            except (ValueError, TypeError):
+                                logger.info("Found %d matches from JS: %s",
+                                            len(matches), js_url)
                             return matches
                 except Exception as exc:
                     logger.warning("Could not get JS matches from %s: %s",
