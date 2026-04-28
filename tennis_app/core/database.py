@@ -1582,6 +1582,14 @@ class TennisDatabase:
             # Players with at least 50 % of the max count are scraped players
             scraped_players = set(
                 total_counts[total_counts >= max_count * 0.5].index)
+
+        # Canonicalize scraped player names so DELETE matches DB rows
+        # (which always store the CSV-canonical spelling, no diacritics).
+        # Without this, players whose ranking name has accents
+        # (e.g. "Rafael J\u00f3dar") never get their old rows cleared, and
+        # the dedup LEFT JOIN below silently drops the new "played"
+        # rows because they collide with stale is_upcoming placeholders.
+        scraped_players = {_canonicalize(p) for p in scraped_players if p}
         # Remove old scraped matches for ALL scraped players (single query).
         # Skipped when replace_existing=False (incremental mode \u2014 we trust
         # the dedup LEFT JOIN below to avoid duplicates and preserve any
