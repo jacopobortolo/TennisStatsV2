@@ -163,10 +163,13 @@ class _StatsComputeWorker(QThread):
             # Extended stats DB queries — use the normalized name so it
             # matches the storage name written by the scraper (which also
             # normalizes via clean_player_name before writing to the DB).
+            # NOTE: tourney_level and round_ are NOT passed here because
+            # those columns are not reliably populated in the extended stats
+            # tables (many rows have NULL).  Only surface and year are
+            # applied; tourney_level / round filtering is handled above via
+            # filter_matches on the main matches table.
             db_name = clean_player_name(name) or name
-            fkw = dict(surface=filters["surface"], year=filters["year"],
-                       tourney_level=filters["tourney_level"],
-                       round_=filters.get("round_"))
+            fkw = dict(surface=filters["surface"], year=filters["year"])
             ext_data = {}
             if ext_counts.get("match_winners_errors", 0) > 0:
                 ext_data["winners_errors"] = self._db.get_player_winners_errors(db_name, **fkw)
