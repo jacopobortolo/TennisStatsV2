@@ -46,6 +46,11 @@ class _ProfileWorker(QThread):
                 return
 
             stats = self._db.get_player_career_stats(self._player_id, tour=self._tour)
+            streaks = {}
+            try:
+                streaks = self._db.get_player_streaks(self._player_id, tour=self._tour)
+            except Exception:
+                pass
             rank_history = []
             try:
                 rank_history = self._db.get_player_ranking_history(
@@ -62,6 +67,7 @@ class _ProfileWorker(QThread):
             self.data_ready.emit({
                 "player": dict(player),
                 "stats": stats,
+                "streaks": streaks,
                 "rank_history": rank_history,
                 "html_donut": html_donut,
                 "html_yearly": html_yearly,
@@ -195,9 +201,18 @@ class PlayerPage(QWidget):
         lbl.setAlignment(Qt.AlignCenter)
         self.profile_area.content_layout.addWidget(lbl)
 
+    @staticmethod
+    def _fit_table(table):
+        """Set the table's fixed height so it shows all rows without scrolling."""
+        hh = table.horizontalHeader()
+        row_h = table.verticalHeader().defaultSectionSize()
+        h = hh.height() + row_h * table.rowCount() + 4
+        table.setFixedHeight(h)
+
     def _on_profile_data(self, payload):
         player = payload["player"]
         stats = payload["stats"]
+        streaks = payload.get("streaks", {})
         rank_history = payload["rank_history"]
         html_donut = payload["html_donut"]
         html_yearly = payload["html_yearly"]
@@ -296,12 +311,80 @@ class PlayerPage(QWidget):
         # --- Tournament level ---
         layout.addWidget(SectionHeader("Record by Tournament Level"))
 
-        level_grid = StatGrid(columns=4)
-        for level, rec in stats.get("levels", {}).items():
+        level_order = [
+            "Grand Slam", "Masters 1000", "ATP 250/500",
+            "Tour Finals", "Davis Cup",
+        ]
+        level_table = DataTable([
+            ("Level",    130), ("W-L",   80), ("Win %",  60),
+            ("🏆 Titles", 70), ("🥈 Finals (W–L)", 110),
+            ("SF",  50), ("QF",  50), ("R16", 50), ("R32", 50),
+        ])
+        level_rows = []
+        levels_data = stats.get("levels", {})
+        level_rounds_data = stats.get("level_rounds", {})
+        for lvl in level_order:
+            rec = levels_data.get(lvl)
+            if not rec:
+                continue
             w, l = rec["wins"], rec["losses"]
             p = round(w / (w + l) * 100, 1) if (w + l) else 0
-            level_grid.add_stat(level, f"{w}-{l} ({p}%)")
-        layout.addWidget(level_grid)
+            lr = level_rounds_data.get(lvl, {})
+            titles_w = lr.get("F_w", 0)
+            finals_l = lr.get("F_l", 0)
+            finals_str = f"{titles_w}W–{finals_l}L" if (titles_w or finals_l) else "–"
+            level_rows.append([
+                lvl,
+                f"{w}–{l}",
+                f"{p}%",
+                str(titles_w) if titles_w else "–",
+                finals_str,
+                str(lr.get("SF",  0)) or "–",
+                str(lr.get("QF",  0)) or "–",
+                str(lr.get("R16", 0)) or "–",
+                str(lr.get("R32", 0)) or "–",
+            ])
+        level_table.populate(level_rows)
+        self._fit_table(level_table)
+        layout.addWidget(level_table)
+
+        # Streak table: Overall + per-level
+        if streaks:
+            layout.addWidget(SectionHeader("Win & Sets Streaks"))
+            streak_table = DataTable([
+                ("Level",           130),
+                ("Best Win Streak",  120),
+                ("Curr Win Streak",  120),
+                ("Best Sets Streak", 120),
+                ("Curr Sets Streak", 120),
+            ])
+            streak_rows = [[
+                "Overall",
+                str(streaks.get("best_win_streak", 0)),
+                str(streaks.get("current_win_streak", 0)),
+                str(streaks.get("best_sets_streak", 0)),
+                str(streaks.get("current_sets_streak", 0)),
+            ]]
+            level_order_streaks = [
+                "Grand Slam", "Masters 1000", "ATP 250/500",
+                "Tour Finals", "Davis Cup",
+            ]
+            by_level = streaks.get("by_level", {})
+            for lvl in level_order_streaks:
+                lv = by_level.get(lvl)
+                if not lv:
+                    continue
+                streak_rows.append([
+                    lvl,
+                    str(lv["best_win"]),
+                    str(lv["cur_win"]),
+                    str(lv["best_sets"]),
+                    str(lv["cur_sets"]),
+                ])
+            streak_table.populate(streak_rows)
+            self._fit_table(streak_table)
+            layout.addWidget(streak_table)
+
         layout.addWidget(Separator())
 
         # --- Yearly chart ---
@@ -339,19 +422,23 @@ class PlayerPage(QWidget):
             "R16": "Round of 16", "R32": "Round of 32",
             "R64": "Round of 64", "R128": "Round of 128", "RR": "Round Robin",
         }
+        round_order = ["F", "SF", "QF", "R16", "R32", "R64", "R128", "RR"]
         round_table = DataTable([
             ("Round", 120), ("Wins", 80), ("Losses", 80), ("Win %", 80),
         ])
+        rounds_data = stats.get("rounds", {})
         round_rows = []
-        for rnd, rec in stats.get("rounds", {}).items():
+        for rnd in round_order:
+            rec = rounds_data.get(rnd)
+            if not rec:
+                continue
             w, l = rec["wins"], rec["losses"]
             p = round(w / (w + l) * 100, 1) if (w + l) else 0
             round_rows.append([
                 round_names.get(rnd, rnd), str(w), str(l), f"{p}%"
             ])
         round_table.populate(round_rows)
-        round_table.setMinimumHeight(200)
-        round_table.setMaximumHeight(300)
+        self._fit_table(round_table)
         layout.addWidget(round_table)
 
     def _go_to_stats(self, player_name: str):

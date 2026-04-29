@@ -13,6 +13,8 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QSizePolicy, QFrame,
+    QDialog, QTreeWidget, QTreeWidgetItem, QDialogButtonBox,
+    QAbstractItemView,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QBrush
@@ -79,7 +81,9 @@ class InsightsPage(QWidget):
         self.db = db
         self._ioc_list: list[str] = []
         self._breakdown_data: list[dict] = []
+        self._breakdown_sorted: list[dict] = []
         self._instance_data: list[dict] = []
+        self._last_search_params: dict = {}
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -153,6 +157,7 @@ class InsightsPage(QWidget):
 
         self.breakdown_table = DataTable(self._BREAKDOWN_COLS)
         self.breakdown_table.setMinimumHeight(220)
+        self.breakdown_table.doubleClicked.connect(self._on_breakdown_dclick)
         root.addWidget(self.breakdown_table)
 
         root.addWidget(Separator())
@@ -187,6 +192,7 @@ class InsightsPage(QWidget):
         root.addWidget(SectionHeader("Instances Found"))
         self.instance_table = DataTable(self._INSTANCE_COLS)
         self.instance_table.setMinimumHeight(220)
+        self.instance_table.doubleClicked.connect(self._on_instance_dclick)
         root.addWidget(self.instance_table, 1)
 
         # ---- Status labels ----
@@ -264,6 +270,10 @@ class InsightsPage(QWidget):
 
         self._breakdown_data = data
         self._populate_breakdown(data, ioc, year_from, year_to)
+        self._last_search_params = {
+            "ioc": ioc, "tour": tour,
+            "year_from": year_from, "year_to": year_to,
+        }
 
     def _run_concentration(self):
         ioc = self.ioc_combo.currentText().strip()
@@ -292,6 +302,10 @@ class InsightsPage(QWidget):
 
         self._instance_data = data
         self._populate_instances(data, ioc, min_count, rounds, levels)
+        self._last_search_params = {
+            "ioc": ioc, "tour": tour,
+            "year_from": year_from, "year_to": year_to,
+        }
 
     # ------------------------------------------------------------------
     # Data display helpers
@@ -348,6 +362,7 @@ class InsightsPage(QWidget):
                 ROUND_ORDER.get(d["round"], 99),
             ),
         )
+        self._breakdown_sorted = sorted_data
 
         max_wins = max((d.get("wins", 0) for d in sorted_data), default=1)
         max_losses = max((d.get("losses", 0) for d in sorted_data), default=1)
@@ -429,5 +444,194 @@ class InsightsPage(QWidget):
                 item.setForeground(QBrush(_count_color(d.get("ioc_count", 0), max_cnt)))
 
         self.instance_status_label.setText(
-            f"{len(data)} instances where ≥{min_count} {ioc} players "
-            f"reached the same round · {round_str} · {level_str}")
+            f"{len(data)} instances where \u2265{min_count} {ioc} players "
+            f"reached the same round \u00b7 {round_str} \u00b7 {level_str}")
+
+    # ------------------------------------------------------------------
+    # Double-click handlers
+    # ------------------------------------------------------------------
+
+    def _on_breakdown_dclick(self, index):
+        row = index.row()
+        if row < 0 or row >= len(self._breakdown_sorted):
+            return
+        d = self._breakdown_sorted[row]
+        p = self._last_search_params
+        if not p:
+            return
+        try:
+            players = self.db.get_nationality_round_players(
+                ioc=p["ioc"],
+                tourney_level=d["tourney_level"],
+                round_=d["round"],
+                tour=p["tour"],
+                year_from=p["year_from"],
+                year_to=p["year_to"],
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Detail query error: {exc}")
+            return
+        level_label = LEVEL_LABEL.get(d["tourney_level"], d["tourney_level"])
+        title = f"{p['ioc']} \u2022 {level_label} \u2022 {d['round']}"
+        dlg = _RoundPlayersDialog(title, players, mode="breakdown", parent=self)
+        dlg.exec()
+
+    def _on_instance_dclick(self, index):
+        row = index.row()
+        if row < 0 or row >= len(self._instance_data):
+            return
+        d = self._instance_data[row]
+        p = self._last_search_params
+        if not p:
+            return
+        try:
+            players = self.db.get_ioc_instance_players(
+                ioc=p["ioc"],
+                tourney_name=d["tourney_name"],
+                year=int(d["year"]),
+                round_=d["round"],
+                tour=p["tour"],
+            )
+        except Exception as exc:
+            self.instance_status_label.setText(f"Detail query error: {exc}")
+            return
+        level_label = LEVEL_LABEL.get(d.get("tourney_level", ""), d.get("tourney_level", ""))
+        title = (
+            f"{p['ioc']} \u2022 {d.get('tourney_name','')} "
+            f"{d.get('year','')} \u2022 {d.get('round','')} \u2022 {level_label}"
+        )
+        dlg = _RoundPlayersDialog(title, players, mode="instance", parent=self)
+        dlg.exec()
+
+
+# ---------------------------------------------------------------------------
+# Detail dialog
+# ---------------------------------------------------------------------------
+
+class _RoundPlayersDialog(QDialog):
+    """
+    Shows players who reached a given round.
+
+    mode='breakdown': player tree — each player node has tournament sub-items.
+    mode='instance' : flat table — player | W/L | opponent | score.
+    """
+
+    def __init__(self, title: str, data: list[dict], mode: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(640, 520)
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
+
+        hdr = QLabel(title)
+        hdr.setStyleSheet(
+            f"font-size: 13pt; font-weight: 700; color: {COLORS['accent']};"
+        )
+        layout.addWidget(hdr)
+
+        if mode == "breakdown":
+            self._build_breakdown_tree(layout, data)
+        else:
+            self._build_instance_table(layout, data)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {COLORS['bg_primary']}; }}"
+            f"QLabel {{ color: {COLORS['text']}; }}"
+            f"QTreeWidget {{ background-color: {COLORS['bg_card']};"
+            f"  color: {COLORS['text']};"
+            f"  border: 1px solid {COLORS['border']};"
+            f"  alternate-background-color: {COLORS['bg_secondary']}; }}"
+            f"QTreeWidget::item:selected {{ background-color: {COLORS['accent_dim']}; }}"
+            f"QHeaderView::section {{ background-color: {COLORS['bg_secondary']};"
+            f"  color: {COLORS['text_dim']}; padding: 4px;"
+            f"  border: none; border-bottom: 1px solid {COLORS['border']}; }}"
+            f"QPushButton {{ background-color: {COLORS['bg_card']};"
+            f"  color: {COLORS['text']}; border: 1px solid {COLORS['border']};"
+            f"  padding: 5px 14px; border-radius: 4px; }}"
+            f"QPushButton:hover {{ background-color: {COLORS['bg_hover']}; }}"
+        )
+
+    def _build_breakdown_tree(self, layout: QVBoxLayout, data: list[dict]):
+        """Tree: player (W-L) → tournament entries."""
+        info = QLabel(
+            f"{len(data)} player(s) \u2014 clicca \u25b6 per espandere i tornei"
+        )
+        info.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 9pt;")
+        layout.addWidget(info)
+
+        tree = QTreeWidget()
+        tree.setAlternatingRowColors(True)
+        tree.setColumnCount(3)
+        tree.setHeaderLabels(["Player", "W", "L"])
+        tree.setColumnWidth(0, 400)
+        tree.setColumnWidth(1, 55)
+        tree.setColumnWidth(2, 55)
+        tree.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        for d in data:
+            wins   = d.get("wins", 0) or 0
+            losses = d.get("losses", 0) or 0
+            player_item = QTreeWidgetItem([
+                d.get("player_name", ""),
+                str(wins),
+                str(losses),
+            ])
+            player_item.setForeground(1, QBrush(QColor(COLORS["green"])))
+            player_item.setForeground(2, QBrush(QColor(COLORS["red"])))
+            raw = d.get("tournaments") or ""
+            for entry in sorted(raw.split(","), reverse=True):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                if "|" in entry:
+                    side, tourney = entry.split("|", 1)
+                else:
+                    side, tourney = "", entry
+                result_str = "W" if side == "W" else "L"
+                child = QTreeWidgetItem([f"  {tourney.strip()}", result_str, ""])
+                child.setForeground(0, QBrush(QColor(COLORS["text_dim"])))
+                child_color = QColor(COLORS["green"]) if side == "W" else QColor(COLORS["red"])
+                child.setForeground(1, QBrush(child_color))
+                player_item.addChild(child)
+            tree.addTopLevelItem(player_item)
+
+        layout.addWidget(tree, 1)
+
+    def _build_instance_table(self, layout: QVBoxLayout, data: list[dict]):
+        """Flat table: Player | W/L | Opponent | Score."""
+        wins   = sum(1 for d in data if d.get("side") == "W")
+        losses = sum(1 for d in data if d.get("side") == "L")
+        info = QLabel(f"{wins} won \u00b7 {losses} lost")
+        info.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 9pt;")
+        layout.addWidget(info)
+
+        tree = QTreeWidget()
+        tree.setAlternatingRowColors(True)
+        tree.setColumnCount(4)
+        tree.setHeaderLabels(["Player", "Result", "Opponent", "Score"])
+        tree.setColumnWidth(0, 200)
+        tree.setColumnWidth(1, 65)
+        tree.setColumnWidth(2, 200)
+        tree.setColumnWidth(3, 130)
+        tree.setRootIsDecorated(False)
+
+        for d in data:
+            side = d.get("side", "")
+            item = QTreeWidgetItem([
+                d.get("player_name", ""),
+                "Won" if side == "W" else "Lost",
+                d.get("opponent_name", ""),
+                d.get("score", ""),
+            ])
+            color = QColor(COLORS["green"]) if side == "W" else QColor(COLORS["red"])
+            item.setForeground(1, QBrush(color))
+            tree.addTopLevelItem(item)
+
+        layout.addWidget(tree, 1)
+

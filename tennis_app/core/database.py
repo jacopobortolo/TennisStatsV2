@@ -894,6 +894,7 @@ class TennisDatabase:
                        w_bpFaced as bp_faced
                 FROM matches WHERE {win_match}{tour_cond}
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND UPPER(COALESCE(score,'')) NOT LIKE '%W/O%'
                 UNION ALL
                 SELECT 'L' as side, surface, tourney_level, round, tourney_date,
                        l_ace as aces, l_df as dfs, l_svpt as svpt,
@@ -902,6 +903,7 @@ class TennisDatabase:
                        l_bpFaced as bp_faced
                 FROM matches WHERE {lose_match}{tour_cond}
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND UPPER(COALESCE(score,'')) NOT LIKE '%W/O%'
             )
             GROUP BY side, surface, tourney_level, round, yr
         """, win_params + tour_params + lose_params + tour_params).fetchall()
@@ -910,6 +912,7 @@ class TennisDatabase:
         losses = 0
         surfaces = {}
         levels = {}
+        level_rounds = {}   # level_name -> {F_w, F_l, SF, QF, R16, R32, R64}
         rounds = {}
         titles = 0
         yearly = {}
@@ -951,6 +954,19 @@ class TennisDatabase:
             if lev_name:
                 levels.setdefault(lev_name, {"wins": 0, "losses": 0})
                 levels[lev_name]["wins" if side == "W" else "losses"] += cnt
+
+                # Per-level round breakdown
+                lr = level_rounds.setdefault(lev_name, {
+                    "F_w": 0, "F_l": 0, "SF": 0, "QF": 0,
+                    "R16": 0, "R32": 0, "R64": 0,
+                })
+                if rnd == "F":
+                    if side == "W":
+                        lr["F_w"] += cnt
+                    else:
+                        lr["F_l"] += cnt
+                elif rnd in ("SF", "QF", "R16", "R32", "R64"):
+                    lr[rnd] += cnt
 
             # Round
             if rnd in ("F", "SF", "QF", "R16", "R32", "R64", "R128", "RR"):
@@ -1000,12 +1016,165 @@ class TennisDatabase:
             "titles": titles,
             "surfaces": surfaces,
             "levels": levels,
+            "level_rounds": level_rounds,
             "rounds": rounds,
             "serve": serve,
             "yearly": yearly,
         }
         self._career_stats_cache[_cache_key] = result
         return result
+
+    def get_player_streaks(self, player_id: str, tour: str | None = None) -> dict:
+        """
+        Compute consecutive-win / consecutive-sets streaks for a player,
+        both overall and broken down by tourney_level.
+
+        Returns:
+            best_win_streak      : longest ever win streak (overall)
+            current_win_streak   : active win streak (overall)
+            best_sets_streak     : longest run of consecutive sets won (overall)
+            current_sets_streak  : active sets streak (overall)
+            by_level             : dict level_name -> {best_win, cur_win,
+                                                       best_sets, cur_sets}
+        """
+        import re as _re
+
+        level_names = {
+            "G": "Grand Slam", "M": "Masters 1000", "A": "ATP 250/500",
+            "D": "Davis Cup", "F": "Tour Finals",
+        }
+
+        tour_cond = " AND m.tour = ?" if tour else ""
+        tour_params = (tour,) if tour else ()
+
+        name_row = self.conn.execute(
+            "SELECT name_first, name_last FROM players WHERE player_id = ? LIMIT 1",
+            (player_id,),
+        ).fetchone()
+        pname = f"{name_row[0]} {name_row[1]}".strip() if name_row else None
+        pname_nohyphen = pname.replace("-", " ") if pname else None
+
+        if pname_nohyphen:
+            win_match = (
+                "(m.winner_id = ? OR (m.winner_id = '' "
+                "AND REPLACE(m.winner_name, '-', ' ') = ?))"
+            )
+            lose_match = (
+                "(m.loser_id = ? OR (m.loser_id = '' "
+                "AND REPLACE(m.loser_name, '-', ' ') = ?))"
+            )
+            win_p = (player_id, pname_nohyphen)
+            lose_p = (player_id, pname_nohyphen)
+        else:
+            win_match = "m.winner_id = ?"
+            lose_match = "m.loser_id = ?"
+            win_p = (player_id,)
+            lose_p = (player_id,)
+
+        sql = f"""
+            SELECT side, score, tourney_level FROM (
+                SELECT 'W' AS side, score, tourney_date, match_num,
+                       tourney_level
+                FROM matches m
+                WHERE {win_match}{tour_cond}
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND UPPER(COALESCE(score,'')) NOT LIKE '%W/O%'
+                UNION ALL
+                SELECT 'L' AS side, score, tourney_date, match_num,
+                       tourney_level
+                FROM matches m
+                WHERE {lose_match}{tour_cond}
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND UPPER(COALESCE(score,'')) NOT LIKE '%W/O%'
+            )
+            ORDER BY tourney_date ASC, match_num ASC
+        """
+        rows = self.conn.execute(
+            sql, win_p + tour_params + lose_p + tour_params
+        ).fetchall()
+
+
+        # overall accumulators
+        best_win = 0
+        cur_win = 0
+        best_sets = 0
+        cur_sets = 0
+
+        # per-level accumulators  {level_name: [best_win, cur_win, best_sets, cur_sets]}
+        lv: dict[str, list[int]] = {}
+
+        def _parse_sets(score: str, won: bool):
+            """Yield True/False per set indicating whether player won it."""
+            clean = _re.sub(r'\s*(RET|Ret|ret)\.?$', '', score).strip()
+            for token in clean.split():
+                m_tok = _re.match(r'\[?(\d+)-(\d+)\]?(?:\(\d+\))?$', token)
+                if not m_tok:
+                    continue
+                w_g, l_g = int(m_tok.group(1)), int(m_tok.group(2))
+                if w_g == l_g:
+                    continue
+                yield (w_g > l_g) if won else (l_g > w_g)
+
+        for r in rows:
+            side = r["side"]
+            score = r["score"] or ""
+            lev_name = level_names.get(r["tourney_level"] or "")
+            won = (side == "W")
+
+            # ---- overall win streak (ALL match types in chronological order) ----
+            if won:
+                cur_win += 1
+                if cur_win > best_win:
+                    best_win = cur_win
+            else:
+                cur_win = 0
+
+            # ---- overall sets streak ----
+            for player_won_set in _parse_sets(score, won):
+                if player_won_set:
+                    cur_sets += 1
+                    if cur_sets > best_sets:
+                        best_sets = cur_sets
+                else:
+                    cur_sets = 0
+
+            # ---- per-level (only recognized levels) ----
+            if not lev_name:
+                continue
+
+            if lev_name not in lv:
+                lv[lev_name] = [0, 0, 0, 0]  # best_win, cur_win, best_sets, cur_sets
+            lv_acc = lv[lev_name]
+            if won:
+                lv_acc[1] += 1
+                if lv_acc[1] > lv_acc[0]:
+                    lv_acc[0] = lv_acc[1]
+            else:
+                lv_acc[1] = 0
+
+            for player_won_set in _parse_sets(score, won):
+                if player_won_set:
+                    lv_acc[3] += 1
+                    if lv_acc[3] > lv_acc[2]:
+                        lv_acc[2] = lv_acc[3]
+                else:
+                    lv_acc[3] = 0
+
+        by_level = {
+            name: {
+                "best_win": acc[0], "cur_win": acc[1],
+                "best_sets": acc[2], "cur_sets": acc[3],
+            }
+            for name, acc in lv.items()
+        }
+
+        return {
+            "best_win_streak": best_win,
+            "current_win_streak": cur_win,
+            "best_sets_streak": best_sets,
+            "current_sets_streak": cur_sets,
+            "by_level": by_level,
+        }
 
     def get_head_to_head(self, player1_id, player2_id, tour=None):
         """Get head-to-head record and matches between two players."""
@@ -1589,6 +1758,121 @@ class TennisDatabase:
             + [tour, year_from, year_to, ioc, ioc, tour] + level_params + round_params
             + [min_count]
         )
+        cur = self.conn.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_nationality_round_players(
+        self,
+        ioc: str,
+        tourney_level: str,
+        round_: str,
+        tour: str = "atp",
+        year_from: int = 1968,
+        year_to: int = 2099,
+    ) -> list[dict]:
+        """
+        For a given IOC + level + round, return each player with their
+        appearances (total), wins, losses, and the list of tournaments.
+        Ordered by appearances DESC.
+        """
+        ioc_winner = (
+            "(winner_ioc = ?"
+            " OR (COALESCE(winner_ioc,'')='' AND winner_name IN ("
+            "     SELECT name_first||' '||name_last FROM players"
+            "     WHERE ioc=? AND tour=?)))"
+        )
+        ioc_loser = (
+            "(loser_ioc = ?"
+            " OR (COALESCE(loser_ioc,'')='' AND loser_name IN ("
+            "     SELECT name_first||' '||name_last FROM players"
+            "     WHERE ioc=? AND tour=?)))"
+        )
+        sql = f"""
+            SELECT player_name,
+                   COUNT(*) AS appearances,
+                   SUM(CASE WHEN side='W' THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN side='L' THEN 1 ELSE 0 END) AS losses,
+                   GROUP_CONCAT(side || '|' || tourney_info) AS tournaments
+            FROM (
+                SELECT winner_name AS player_name,
+                       'W' AS side,
+                       tourney_name || ' (' || SUBSTR(tourney_date,1,4) || ')' AS tourney_info
+                FROM matches
+                WHERE tour = ? AND round = ? AND tourney_level = ?
+                  AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND {ioc_winner}
+                UNION ALL
+                SELECT loser_name AS player_name,
+                       'L' AS side,
+                       tourney_name || ' (' || SUBSTR(tourney_date,1,4) || ')' AS tourney_info
+                FROM matches
+                WHERE tour = ? AND round = ? AND tourney_level = ?
+                  AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND {ioc_loser}
+            )
+            GROUP BY LOWER(TRIM(player_name))
+            ORDER BY appearances DESC, player_name
+        """
+        params = [
+            tour, round_, tourney_level, year_from, year_to, ioc, ioc, tour,
+            tour, round_, tourney_level, year_from, year_to, ioc, ioc, tour,
+        ]
+        cur = self.conn.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_ioc_instance_players(
+        self,
+        ioc: str,
+        tourney_name: str,
+        year: int,
+        round_: str,
+        tour: str = "atp",
+    ) -> list[dict]:
+        """
+        For a specific tournament-year-round instance, return each IOC player
+        with their result (W/L) and opponent name.
+        """
+        ioc_winner = (
+            "(winner_ioc = ?"
+            " OR (COALESCE(winner_ioc,'')='' AND winner_name IN ("
+            "     SELECT name_first||' '||name_last FROM players"
+            "     WHERE ioc=? AND tour=?)))"
+        )
+        ioc_loser = (
+            "(loser_ioc = ?"
+            " OR (COALESCE(loser_ioc,'')='' AND loser_name IN ("
+            "     SELECT name_first||' '||name_last FROM players"
+            "     WHERE ioc=? AND tour=?)))"
+        )
+        sql = f"""
+            SELECT player_name, side, opponent_name, score
+            FROM (
+                SELECT winner_name AS player_name, 'W' AS side,
+                       loser_name  AS opponent_name, score
+                FROM matches
+                WHERE tour = ? AND round = ? AND tourney_name = ?
+                  AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) = ?
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND {ioc_winner}
+                UNION ALL
+                SELECT loser_name  AS player_name, 'L' AS side,
+                       winner_name AS opponent_name, score
+                FROM matches
+                WHERE tour = ? AND round = ? AND tourney_name = ?
+                  AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) = ?
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND {ioc_loser}
+            )
+            ORDER BY side DESC, player_name
+        """
+        params = [
+            tour, round_, tourney_name, year, ioc, ioc, tour,
+            tour, round_, tourney_name, year, ioc, ioc, tour,
+        ]
         cur = self.conn.execute(sql, params)
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
