@@ -60,6 +60,7 @@ NAV_ITEMS = [
     ("⚔️  H2H",          "h2h"),
     ("🏆  Tournaments",  "tournaments"),
     ("📈  Stats",        "stats"),
+    ("🌍  Nations",      "nations"),
 ]
 
 
@@ -214,6 +215,7 @@ class MainWindow(QMainWindow):
         from .pages.h2h_page import H2HPage
         from .pages.tournaments_page import TournamentsPage
         from .pages.stats_page import StatsPage
+        from .pages.insights_page import InsightsPage
 
         self._page_cls = {
             "player": PlayerPage,
@@ -222,6 +224,7 @@ class MainWindow(QMainWindow):
             "h2h": H2HPage,
             "tournaments": TournamentsPage,
             "stats": StatsPage,
+            "nations": InsightsPage,
         }
 
         # Remove loading placeholder (only on first build)

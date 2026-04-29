@@ -1418,6 +1418,182 @@ class TennisDatabase:
         return [r[0] for r in cur.fetchall()]
 
     # ------------------------------------------------------------------
+    # Nationality / Insights queries
+    # ------------------------------------------------------------------
+
+    def get_distinct_ioc_codes(self, tour: str = "atp") -> list[str]:
+        """Return sorted list of distinct IOC country codes present in matches."""
+        cur = self.conn.execute("""
+            SELECT DISTINCT ioc FROM (
+                SELECT winner_ioc AS ioc FROM matches
+                WHERE tour = ? AND winner_ioc IS NOT NULL AND winner_ioc != ''
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                UNION
+                SELECT loser_ioc AS ioc FROM matches
+                WHERE tour = ? AND loser_ioc IS NOT NULL AND loser_ioc != ''
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+            )
+            ORDER BY ioc
+        """, (tour, tour))
+        return [r[0] for r in cur.fetchall()]
+
+    def get_nationality_round_breakdown(
+        self,
+        ioc: str,
+        tour: str = "atp",
+        year_from: int = 1968,
+        year_to: int = 2099,
+        tourney_levels: list | None = None,
+    ) -> list[dict]:
+        """
+        For each (tourney_level, round) return appearances and unique_players.
+        Uses IOC column when available; falls back to players table lookup by
+        name for recently-scraped matches that have empty winner_ioc/loser_ioc.
+        """
+        level_clause = ""
+        level_params: list = []
+        if tourney_levels:
+            placeholders = ",".join("?" * len(tourney_levels))
+            level_clause = f"AND tourney_level IN ({placeholders})"
+            level_params = list(tourney_levels)
+
+        # ioc_match_w / ioc_match_l: true when the player's nationality is ioc,
+        # either via the stored IOC column or via a name lookup in the players table.
+        ioc_winner = (
+            "(winner_ioc = ?"
+            " OR (COALESCE(winner_ioc,'')='' AND winner_name IN ("
+            "     SELECT name_first||' '||name_last FROM players"
+            "     WHERE ioc=? AND tour=?)))"
+        )
+        ioc_loser = (
+            "(loser_ioc = ?"
+            " OR (COALESCE(loser_ioc,'')='' AND loser_name IN ("
+            "     SELECT name_first||' '||name_last FROM players"
+            "     WHERE ioc=? AND tour=?)))"
+        )
+
+        sql = f"""
+            SELECT tourney_level, round,
+                   SUM(CASE WHEN side='W' THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN side='L' THEN 1 ELSE 0 END) AS losses,
+                   COUNT(*) AS appearances,
+                   COUNT(DISTINCT COALESCE(NULLIF(player_id,''), player_name))
+                     AS unique_players
+            FROM (
+                SELECT tourney_level, round,
+                       winner_id AS player_id, winner_name AS player_name,
+                       'W' AS side
+                FROM matches
+                WHERE tour = ?
+                  AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND {ioc_winner}
+                  {level_clause}
+                UNION ALL
+                SELECT tourney_level, round,
+                       loser_id AS player_id, loser_name AS player_name,
+                       'L' AS side
+                FROM matches
+                WHERE tour = ?
+                  AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND {ioc_loser}
+                  {level_clause}
+            )
+            GROUP BY tourney_level, round
+            ORDER BY tourney_level, round
+        """
+        params = (
+            [tour, year_from, year_to, ioc, ioc, tour] + level_params
+            + [tour, year_from, year_to, ioc, ioc, tour] + level_params
+        )
+        cur = self.conn.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_ioc_concentration_instances(
+        self,
+        ioc: str,
+        min_count: int = 2,
+        tour: str = "atp",
+        year_from: int = 1968,
+        year_to: int = 2099,
+        tourney_levels: list | None = None,
+        rounds: list | None = None,
+    ) -> list[dict]:
+        """
+        Return tournament-year-round instances where >= min_count distinct players
+        of the given IOC were present (either as winner or loser).
+        Uses name-based IOC fallback for scraped matches with missing IOC column.
+        """
+        level_clause = ""
+        level_params: list = []
+        if tourney_levels:
+            placeholders = ",".join("?" * len(tourney_levels))
+            level_clause = f"AND tourney_level IN ({placeholders})"
+            level_params = list(tourney_levels)
+
+        round_clause = ""
+        round_params: list = []
+        if rounds:
+            placeholders = ",".join("?" * len(rounds))
+            round_clause = f"AND round IN ({placeholders})"
+            round_params = list(rounds)
+
+        ioc_winner = (
+            "(winner_ioc = ?"
+            " OR (COALESCE(winner_ioc,'')='' AND winner_name IN ("
+            "     SELECT name_first||' '||name_last FROM players"
+            "     WHERE ioc=? AND tour=?)))"
+        )
+        ioc_loser = (
+            "(loser_ioc = ?"
+            " OR (COALESCE(loser_ioc,'')='' AND loser_name IN ("
+            "     SELECT name_first||' '||name_last FROM players"
+            "     WHERE ioc=? AND tour=?)))"
+        )
+
+        sql = f"""
+            SELECT tourney_name, tourney_level, surface,
+                   CAST(SUBSTR(tourney_date, 1, 4) AS INTEGER) AS year,
+                   round,
+                   COUNT(DISTINCT COALESCE(NULLIF(player_id,''), player_name))
+                     AS ioc_count
+            FROM (
+                SELECT tourney_name, tourney_level, surface, tourney_date,
+                       round, winner_id AS player_id, winner_name AS player_name
+                FROM matches
+                WHERE tour = ?
+                  AND CAST(SUBSTR(tourney_date, 1, 4) AS INTEGER) BETWEEN ? AND ?
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND {ioc_winner}
+                  {level_clause} {round_clause}
+                UNION
+                SELECT tourney_name, tourney_level, surface, tourney_date,
+                       round, loser_id AS player_id, loser_name AS player_name
+                FROM matches
+                WHERE tour = ?
+                  AND CAST(SUBSTR(tourney_date, 1, 4) AS INTEGER) BETWEEN ? AND ?
+                  AND (is_upcoming = 0 OR is_upcoming IS NULL)
+                  AND {ioc_loser}
+                  {level_clause} {round_clause}
+            )
+            GROUP BY tourney_name,
+                     CAST(SUBSTR(tourney_date, 1, 4) AS INTEGER),
+                     round
+            HAVING ioc_count >= ?
+            ORDER BY year DESC, tourney_level, round
+        """
+        params = (
+            [tour, year_from, year_to, ioc, ioc, tour] + level_params + round_params
+            + [tour, year_from, year_to, ioc, ioc, tour] + level_params + round_params
+            + [min_count]
+        )
+        cur = self.conn.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    # ------------------------------------------------------------------
     # Name-based queries (for scraped data without player IDs)
     # ------------------------------------------------------------------
 
