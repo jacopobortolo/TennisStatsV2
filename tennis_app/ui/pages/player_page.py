@@ -312,8 +312,12 @@ class PlayerPage(QWidget):
         layout.addWidget(SectionHeader("Record by Tournament Level"))
 
         level_order = [
-            "Grand Slam", "Masters 1000", "ATP 250/500",
-            "Tour Finals", "Davis Cup",
+            "Grand Slam",
+            "Masters 1000", "Premier Mandatory",
+            "ATP 250/500",  "Premier",
+            "Tour Finals",
+            "Davis Cup",    "International",
+            "Elite Trophy",
         ]
         level_table = DataTable([
             ("Level",    130), ("W-L",   80), ("Win %",  60),
@@ -366,8 +370,12 @@ class PlayerPage(QWidget):
                 str(streaks.get("current_sets_streak", 0)),
             ]]
             level_order_streaks = [
-                "Grand Slam", "Masters 1000", "ATP 250/500",
-                "Tour Finals", "Davis Cup",
+                "Grand Slam",
+                "Masters 1000", "Premier Mandatory",
+                "ATP 250/500",  "Premier",
+                "Tour Finals",
+                "Davis Cup",    "International",
+                "Elite Trophy",
             ]
             by_level = streaks.get("by_level", {})
             for lvl in level_order_streaks:

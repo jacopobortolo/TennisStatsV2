@@ -558,48 +558,75 @@ class _RoundPlayersDialog(QDialog):
         )
 
     def _build_breakdown_tree(self, layout: QVBoxLayout, data: list[dict]):
-        """Tree: player (W-L) → tournament entries."""
+        """Flat table: Player | Tournament | Result — one row per appearance."""
+        total_apps = sum(d.get("wins", 0) + d.get("losses", 0) for d in data)
         info = QLabel(
-            f"{len(data)} player(s) \u2014 clicca \u25b6 per espandere i tornei"
+            f"{len(data)} player(s) \u00b7 {total_apps} appearances"
         )
         info.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 9pt;")
         layout.addWidget(info)
 
         tree = QTreeWidget()
         tree.setAlternatingRowColors(True)
-        tree.setColumnCount(3)
-        tree.setHeaderLabels(["Player", "W", "L"])
-        tree.setColumnWidth(0, 400)
-        tree.setColumnWidth(1, 55)
-        tree.setColumnWidth(2, 55)
+        tree.setColumnCount(4)
+        tree.setHeaderLabels(["Player", "Tournament", "Result", "Totale"])
+        tree.setColumnWidth(0, 180)
+        tree.setColumnWidth(1, 240)
+        tree.setColumnWidth(2, 65)
+        tree.setColumnWidth(3, 75)
+        tree.header().setStretchLastSection(True)
         tree.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        def _entry_sort_key(e: str):
+            # P (projected) first, then W, then L; within each group reverse-alpha
+            if e.startswith("P|"):
+                return (0, e)
+            if e.startswith("W|"):
+                return (1, e)
+            return (2, e)
 
         for d in data:
             wins   = d.get("wins", 0) or 0
             losses = d.get("losses", 0) or 0
-            player_item = QTreeWidgetItem([
-                d.get("player_name", ""),
-                str(wins),
-                str(losses),
-            ])
-            player_item.setForeground(1, QBrush(QColor(COLORS["green"])))
-            player_item.setForeground(2, QBrush(QColor(COLORS["red"])))
             raw = d.get("tournaments") or ""
-            for entry in sorted(raw.split(","), reverse=True):
-                entry = entry.strip()
-                if not entry:
-                    continue
+            entries = [e.strip() for e in raw.split(",") if e.strip()]
+            if not entries:
+                # Show player with no tournament detail
+                player_item = QTreeWidgetItem([
+                    d.get("player_name", ""), "–",
+                    "", f"{wins}W–{losses}L",
+                ])
+                tree.addTopLevelItem(player_item)
+                continue
+            first = True
+            for entry in sorted(entries, key=_entry_sort_key):
                 if "|" in entry:
                     side, tourney = entry.split("|", 1)
                 else:
                     side, tourney = "", entry
-                result_str = "W" if side == "W" else "L"
-                child = QTreeWidgetItem([f"  {tourney.strip()}", result_str, ""])
-                child.setForeground(0, QBrush(QColor(COLORS["text_dim"])))
-                child_color = QColor(COLORS["green"]) if side == "W" else QColor(COLORS["red"])
-                child.setForeground(1, QBrush(child_color))
-                player_item.addChild(child)
-            tree.addTopLevelItem(player_item)
+                if side == "W":
+                    result_str = "W"
+                    color = QColor(COLORS["green"])
+                elif side == "P":
+                    result_str = "upcoming"
+                    color = QColor(COLORS.get("accent", "#00b4d8"))
+                else:
+                    result_str = "L"
+                    color = QColor(COLORS["red"])
+                totale_str = f"{wins}W–{losses}L" if first else ""
+                item = QTreeWidgetItem([
+                    d.get("player_name", "") if first else "",
+                    tourney.strip(),
+                    result_str,
+                    totale_str,
+                ])
+                item.setForeground(2, QBrush(color))
+                if not first:
+                    item.setForeground(0, QBrush(QColor(COLORS["text_dim"])))
+                if first and wins + losses > 1:
+                    item.setForeground(3, QBrush(QColor(COLORS["text_dim"])))
+                tree.addTopLevelItem(item)
+                first = False
 
         layout.addWidget(tree, 1)
 

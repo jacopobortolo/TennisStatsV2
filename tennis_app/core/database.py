@@ -926,8 +926,11 @@ class TennisDatabase:
         total_bp_faced = 0
 
         level_names = {
-            "G": "Grand Slam", "M": "Masters 1000", "A": "ATP 250/500",
-            "D": "Davis Cup", "F": "Tour Finals",
+            "G": "Grand Slam",
+            "M": "Masters 1000",      "PM": "Premier Mandatory",
+            "A": "ATP 250/500",       "P": "Premier",
+            "D": "Davis Cup",         "I": "International",
+            "F": "Tour Finals",       "E": "Elite Trophy",
         }
 
         for r in rows:
@@ -1040,8 +1043,11 @@ class TennisDatabase:
         import re as _re
 
         level_names = {
-            "G": "Grand Slam", "M": "Masters 1000", "A": "ATP 250/500",
-            "D": "Davis Cup", "F": "Tour Finals",
+            "G": "Grand Slam",
+            "M": "Masters 1000",      "PM": "Premier Mandatory",
+            "A": "ATP 250/500",       "P": "Premier",
+            "D": "Davis Cup",         "I": "International",
+            "F": "Tour Finals",       "E": "Elite Trophy",
         }
 
         tour_cond = " AND m.tour = ?" if tour else ""
@@ -1649,6 +1655,7 @@ class TennisDatabase:
                    COUNT(DISTINCT COALESCE(NULLIF(player_id,''), player_name))
                      AS unique_players
             FROM (
+                -- Played matches (winner side)
                 SELECT tourney_level, round,
                        winner_id AS player_id, winner_name AS player_name,
                        'W' AS side
@@ -1659,6 +1666,7 @@ class TennisDatabase:
                   AND {ioc_winner}
                   {level_clause}
                 UNION ALL
+                -- Played matches (loser side)
                 SELECT tourney_level, round,
                        loser_id AS player_id, loser_name AS player_name,
                        'L' AS side
@@ -1668,12 +1676,55 @@ class TennisDatabase:
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_loser}
                   {level_clause}
+                UNION ALL
+                -- Upcoming appearances: winners of round X are guaranteed
+                -- to appear in round X+1.  Only include if that next-round
+                -- match does NOT already exist in the DB (either played or
+                -- scheduled) to avoid double-counting.
+                SELECT w.tourney_level,
+                       CASE w.round
+                         WHEN 'R128' THEN 'R64'  WHEN 'R64' THEN 'R32'
+                         WHEN 'R32'  THEN 'R16'  WHEN 'R16' THEN 'QF'
+                         WHEN 'QF'   THEN 'SF'   WHEN 'SF'  THEN 'F'
+                       END AS round,
+                       w.winner_id AS player_id,
+                       w.winner_name AS player_name,
+                       'P' AS side
+                FROM matches w
+                WHERE w.tour = ?
+                  AND CAST(SUBSTR(w.tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
+                  AND w.round IN ('R128','R64','R32','R16','QF','SF')
+                  AND (w.is_upcoming = 0 OR w.is_upcoming IS NULL)
+                  AND (
+                      w.winner_ioc = ?
+                      OR (COALESCE(w.winner_ioc,'')='' AND w.winner_name IN (
+                          SELECT name_first||' '||name_last FROM players
+                          WHERE ioc=? AND tour=?))
+                  )
+                  {level_clause.replace('tourney_level', 'w.tourney_level')}
+                  -- Exclude if a match already exists at the projected round
+                  AND NOT EXISTS (
+                      SELECT 1 FROM matches nx
+                      WHERE nx.tour = w.tour
+                        AND nx.tourney_name = w.tourney_name
+                        AND nx.tourney_date = w.tourney_date
+                        AND (nx.winner_id = w.winner_id
+                             OR nx.winner_name = w.winner_name
+                             OR nx.loser_id   = w.winner_id
+                             OR nx.loser_name  = w.winner_name)
+                        AND nx.round = CASE w.round
+                              WHEN 'R128' THEN 'R64'  WHEN 'R64' THEN 'R32'
+                              WHEN 'R32'  THEN 'R16'  WHEN 'R16' THEN 'QF'
+                              WHEN 'QF'   THEN 'SF'   WHEN 'SF'  THEN 'F'
+                            END
+                  )
             )
             GROUP BY tourney_level, round
             ORDER BY tourney_level, round
         """
         params = (
             [tour, year_from, year_to, ioc, ioc, tour] + level_params
+            + [tour, year_from, year_to, ioc, ioc, tour] + level_params
             + [tour, year_from, year_to, ioc, ioc, tour] + level_params
         )
         cur = self.conn.execute(sql, params)
@@ -1721,6 +1772,13 @@ class TennisDatabase:
             "     SELECT name_first||' '||name_last FROM players"
             "     WHERE ioc=? AND tour=?)))"
         )
+        ioc_winner_m = (
+            "(m.winner_ioc = ?"
+            " OR (COALESCE(m.winner_ioc,'')='' AND m.winner_name IN ("
+            "     SELECT name_first||' '||name_last FROM players"
+            "     WHERE ioc=? AND tour=?)))"
+        )
+        level_clause_m = level_clause.replace("tourney_level", "m.tourney_level")
 
         sql = f"""
             SELECT tourney_name, tourney_level, surface,
@@ -1746,6 +1804,36 @@ class TennisDatabase:
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_loser}
                   {level_clause} {round_clause}
+                UNION
+                SELECT m.tourney_name, m.tourney_level, m.surface, m.tourney_date,
+                       CASE m.round
+                         WHEN 'R128' THEN 'R64'  WHEN 'R64' THEN 'R32'
+                         WHEN 'R32'  THEN 'R16'  WHEN 'R16' THEN 'QF'
+                         WHEN 'QF'   THEN 'SF'   WHEN 'SF'  THEN 'F'
+                       END AS round,
+                       m.winner_id AS player_id, m.winner_name AS player_name
+                FROM matches m
+                WHERE m.tour = ?
+                  AND CAST(SUBSTR(m.tourney_date, 1, 4) AS INTEGER) BETWEEN ? AND ?
+                  AND m.round IN ('R128','R64','R32','R16','QF','SF')
+                  AND (m.is_upcoming = 0 OR m.is_upcoming IS NULL)
+                  AND {ioc_winner_m}
+                  {level_clause_m}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM matches nx
+                      WHERE nx.tour = m.tour
+                        AND nx.tourney_name = m.tourney_name
+                        AND nx.tourney_date = m.tourney_date
+                        AND (nx.winner_id = m.winner_id
+                             OR nx.winner_name = m.winner_name
+                             OR nx.loser_id   = m.winner_id
+                             OR nx.loser_name  = m.winner_name)
+                        AND nx.round = CASE m.round
+                              WHEN 'R128' THEN 'R64'  WHEN 'R64' THEN 'R32'
+                              WHEN 'R32'  THEN 'R16'  WHEN 'R16' THEN 'QF'
+                              WHEN 'QF'   THEN 'SF'   WHEN 'SF'  THEN 'F'
+                            END
+                  )
             )
             GROUP BY tourney_name,
                      CAST(SUBSTR(tourney_date, 1, 4) AS INTEGER),
@@ -1756,6 +1844,7 @@ class TennisDatabase:
         params = (
             [tour, year_from, year_to, ioc, ioc, tour] + level_params + round_params
             + [tour, year_from, year_to, ioc, ioc, tour] + level_params + round_params
+            + [tour, year_from, year_to, ioc, ioc, tour] + level_params
             + [min_count]
         )
         cur = self.conn.execute(sql, params)
@@ -1774,6 +1863,8 @@ class TennisDatabase:
         """
         For a given IOC + level + round, return each player with their
         appearances (total), wins, losses, and the list of tournaments.
+        Includes projected upcoming appearances (side='P') for players who
+        already won the previous round but have no match yet at this round.
         Ordered by appearances DESC.
         """
         ioc_winner = (
@@ -1788,6 +1879,45 @@ class TennisDatabase:
             "     SELECT name_first||' '||name_last FROM players"
             "     WHERE ioc=? AND tour=?)))"
         )
+        _prev_round_map = {
+            'F': 'SF', 'SF': 'QF', 'QF': 'R16',
+            'R16': 'R32', 'R32': 'R64', 'R64': 'R128',
+        }
+        prev_round = _prev_round_map.get(round_)
+        projected_union = ""
+        projected_params: list = []
+        if prev_round:
+            projected_union = f"""
+                UNION ALL
+                SELECT m.winner_name AS player_name,
+                       'P' AS side,
+                       m.tourney_name || ' (' || SUBSTR(m.tourney_date,1,4) || ')' AS tourney_info
+                FROM matches m
+                WHERE m.tour = ? AND m.round = ? AND m.tourney_level = ?
+                  AND CAST(SUBSTR(m.tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
+                  AND (m.is_upcoming = 0 OR m.is_upcoming IS NULL)
+                  AND (
+                      m.winner_ioc = ?
+                      OR (COALESCE(m.winner_ioc,'')='' AND m.winner_name IN (
+                          SELECT name_first||' '||name_last FROM players
+                          WHERE ioc=? AND tour=?))
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM matches nx
+                      WHERE nx.tour = m.tour
+                        AND nx.tourney_name = m.tourney_name
+                        AND nx.tourney_date = m.tourney_date
+                        AND (nx.winner_id = m.winner_id
+                             OR nx.winner_name = m.winner_name
+                             OR nx.loser_id   = m.winner_id
+                             OR nx.loser_name  = m.winner_name)
+                        AND nx.round = ?
+                  )
+            """
+            projected_params = [
+                tour, prev_round, tourney_level, year_from, year_to,
+                ioc, ioc, tour, round_,
+            ]
         sql = f"""
             SELECT player_name,
                    COUNT(*) AS appearances,
@@ -1812,6 +1942,7 @@ class TennisDatabase:
                   AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_loser}
+                {projected_union}
             )
             GROUP BY LOWER(TRIM(player_name))
             ORDER BY appearances DESC, player_name
@@ -1819,7 +1950,7 @@ class TennisDatabase:
         params = [
             tour, round_, tourney_level, year_from, year_to, ioc, ioc, tour,
             tour, round_, tourney_level, year_from, year_to, ioc, ioc, tour,
-        ]
+        ] + projected_params
         cur = self.conn.execute(sql, params)
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
