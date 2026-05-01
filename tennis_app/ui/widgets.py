@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QPushButton, QListWidget, QListWidgetItem,
 )
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, Signal, QTimer, QThread
 from PySide6.QtGui import QColor, QFont, QPalette
 
 from .theme import COLORS, FONTS
@@ -284,10 +284,26 @@ class PlayerSearchEdit(QWidget):
     """
     player_selected = Signal(object)  # emits the player dict
 
+    class _SearchWorker(QThread):
+        results_ready = Signal(list)
+
+        def __init__(self, db, query, parent=None):
+            super().__init__(parent)
+            self._db = db
+            self._query = query
+
+        def run(self):
+            try:
+                results = self._db.search_players(self._query, limit=10)
+            except Exception:
+                results = []
+            self.results_ready.emit(results)
+
     def __init__(self, db, placeholder="Player name...", parent=None):
         super().__init__(parent)
         self._db = db
         self._players: list[dict] = []
+        self._search_worker = None
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -333,7 +349,20 @@ class PlayerSearchEdit(QWidget):
         if len(query) < 2:
             self._popup.hide()
             return
-        results = self._db.search_players(query, limit=10)
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.quit()
+            self._search_worker.wait(200)
+        worker = self._SearchWorker(self._db, query, parent=self)
+        worker.results_ready.connect(self._on_search_results)
+        self._search_worker = worker
+        worker.start()
+
+    def _on_search_results(self, results):
+        # Guard: text might have changed by the time results arrive
+        current_query = self.line_edit.text().strip()
+        if len(current_query) < 2:
+            self._popup.hide()
+            return
         self._players = results
         self._popup.clear()
         if not results:

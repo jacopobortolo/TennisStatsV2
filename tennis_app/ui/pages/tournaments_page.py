@@ -6,12 +6,84 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSplitter, QSizePolicy,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor, QBrush
 
 from ..widgets import SearchBar, DataTable, Separator, PillButtonGroup
 from ..theme import COLORS
 from ..match_detail_dialog import MatchDetailDialog
+
+
+# ---------------------------------------------------------------------------
+# Background workers
+# ---------------------------------------------------------------------------
+
+class _TournamentListWorker(QThread):
+    """Fetch tournament list off the UI thread."""
+    finished = Signal(list)
+
+    def __init__(self, db, year, tour, is_doubles, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self._year = year
+        self._tour = tour
+        self._is_doubles = is_doubles
+
+    def run(self):
+        try:
+            if self._is_doubles:
+                result = self._db.get_doubles_tournament_list(
+                    year=self._year, tour=self._tour)
+            else:
+                result = self._db.get_tournament_list(
+                    year=self._year, tour=self._tour)
+        except Exception:
+            result = []
+        self.finished.emit(result)
+
+
+class _TournamentDrawWorker(QThread):
+    """Fetch tournament draw/results off the UI thread."""
+    finished = Signal(list)
+
+    def __init__(self, db, tourney_name, year, tour, is_doubles, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self._tourney_name = tourney_name
+        self._year = year
+        self._tour = tour
+        self._is_doubles = is_doubles
+
+    def run(self):
+        try:
+            if self._is_doubles:
+                result = self._db.get_doubles_tournament_results(
+                    tourney_name=self._tourney_name,
+                    year=self._year, tour=self._tour)
+            else:
+                result = self._db.get_tournament_results(
+                    tourney_name=self._tourney_name,
+                    year=self._year, tour=self._tour)
+        except Exception:
+            result = []
+        self.finished.emit(result)
+
+
+class _YearsWorker(QThread):
+    """Fetch available years off the UI thread."""
+    finished = Signal(list)
+
+    def __init__(self, db, tour, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self._tour = tour
+
+    def run(self):
+        try:
+            result = self._db.get_available_years(tour=self._tour)
+        except Exception:
+            result = []
+        self.finished.emit(result)
 
 ROUND_ORDER = {
     "F": 0, "SF": 1, "QF": 2, "R16": 3, "R32": 4,
@@ -26,8 +98,20 @@ class TournamentsPage(QWidget):
         super().__init__(parent)
         self.db = db
         self._tourney_cache = {}
-        self._current_draw_matches = []  # list of match dicts for the draw table
+        self._current_draw_matches = []
+        self._list_worker = None
+        self._draw_worker = None
+        self._years_worker = None
+        self._first_show = True
+        self._pending_query = None  # query string to apply after list loads
         self._build_ui()
+
+    def showEvent(self, event):
+        """Defer first data load until the page is actually visible."""
+        super().showEvent(event)
+        if self._first_show:
+            self._first_show = False
+            self._on_tour_change()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -56,9 +140,8 @@ class TournamentsPage(QWidget):
 
         filter_row.addWidget(QLabel("Year:"))
         self.year_combo = QComboBox()
-        years = self.db.get_available_years(tour="atp")
-        years.sort(reverse=True)
-        self.year_combo.addItems([str(y) for y in years])
+        # Years populated lazily on first showEvent via _on_tour_change
+        self.year_combo.currentIndexChanged.connect(lambda _: self._search())
         filter_row.addWidget(self.year_combo)
 
         filter_row.addStretch()
@@ -109,25 +192,42 @@ class TournamentsPage(QWidget):
 
     def _on_tour_change(self, _=None):
         tour = self.tour_pills.value().lower()
-        years = self.db.get_available_years(tour=tour)
-        years.sort(reverse=True)
+        if self._years_worker and self._years_worker.isRunning():
+            self._years_worker.quit()
+            self._years_worker.wait(500)
+        worker = _YearsWorker(self.db, tour, parent=self)
+        worker.finished.connect(self._on_years_loaded)
+        self._years_worker = worker
+        worker.start()
+
+    def _on_years_loaded(self, years):
+        years_sorted = sorted(years, reverse=True)
         self.year_combo.blockSignals(True)
         self.year_combo.clear()
-        self.year_combo.addItems([str(y) for y in years])
+        self.year_combo.addItem("All")
+        self.year_combo.addItems([str(y) for y in years_sorted])
         self.year_combo.blockSignals(False)
+        self._search()
 
     def _search(self, query: str = ""):
-        year = self.year_combo.currentText()
+        year_text = self.year_combo.currentText()
+        year = int(year_text) if year_text else None
         tour = self.tour_pills.value().lower()
         is_doubles = self.type_pills.value() == "Doubles"
+        self._pending_query = query
 
-        if is_doubles:
-            tournaments = self.db.get_doubles_tournament_list(
-                year=int(year) if year else None, tour=tour)
-        else:
-            tournaments = self.db.get_tournament_list(
-                year=int(year) if year else None, tour=tour)
+        if self._list_worker and self._list_worker.isRunning():
+            self._list_worker.quit()
+            self._list_worker.wait(500)
 
+        worker = _TournamentListWorker(
+            self.db, year, tour, is_doubles, parent=self)
+        worker.finished.connect(self._on_list_loaded)
+        self._list_worker = worker
+        worker.start()
+
+    def _on_list_loaded(self, tournaments):
+        query = self._pending_query or ""
         if query:
             tournaments = [
                 t for t in tournaments
@@ -167,25 +267,28 @@ class TournamentsPage(QWidget):
         if not tourney_name:
             return
 
-        year = self.year_combo.currentText()
+        year_text = self.year_combo.currentText()
+        year = int(year_text) if year_text else None
         tour = self.tour_pills.value().lower()
         is_doubles = self.type_pills.value() == "Doubles"
 
-        self.draw_header.setText(f"{tourney_name} ({year})")
+        self.draw_header.setText(f"{tourney_name} ({year_text}) — Loading...")
+        self.draw_table.setRowCount(0)
 
-        if is_doubles:
-            matches = self.db.get_doubles_tournament_results(
-                tourney_name=tourney_name,
-                year=int(year) if year else None,
-                tour=tour,
-            )
-        else:
-            matches = self.db.get_tournament_results(
-                tourney_name=tourney_name,
-                year=int(year) if year else None,
-                tour=tour,
-            )
+        if self._draw_worker and self._draw_worker.isRunning():
+            self._draw_worker.quit()
+            self._draw_worker.wait(500)
 
+        worker = _TournamentDrawWorker(
+            self.db, tourney_name, year, tour, is_doubles, parent=self)
+        worker.finished.connect(
+            lambda matches, tn=tourney_name, yt=year_text, id_=is_doubles:
+                self._on_draw_loaded(matches, tn, yt, id_))
+        self._draw_worker = worker
+        worker.start()
+
+    def _on_draw_loaded(self, matches, tourney_name, year_text, is_doubles):
+        self.draw_header.setText(f"{tourney_name} ({year_text})")
         matches.sort(key=lambda m: ROUND_ORDER.get(m.get("round", ""), 99))
 
         # Store for double-click handler

@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QDialog, QTreeWidget, QTreeWidgetItem, QDialogButtonBox,
     QAbstractItemView,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor, QBrush
 
 from ..widgets import (
@@ -56,6 +56,46 @@ def _count_color(val: int, max_val: int) -> QColor:
 
 # ---- Page --------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Background worker
+# ---------------------------------------------------------------------------
+
+class _InsightsWorker(QThread):
+    """Run a heavy Nations query off the UI thread."""
+    data_ready = Signal(list, str)  # (results, mode: 'breakdown'|'concentration')
+    error = Signal(str)
+
+    def __init__(self, db, mode, params, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self._mode = mode
+        self._params = params
+
+    def run(self):
+        try:
+            p = self._params
+            if self._mode == "breakdown":
+                data = self._db.get_nationality_round_breakdown(
+                    ioc=p["ioc"], tour=p["tour"],
+                    year_from=p["year_from"], year_to=p["year_to"],
+                    tourney_levels=p.get("levels"),
+                )
+            else:
+                data = self._db.get_ioc_concentration_instances(
+                    ioc=p["ioc"], min_count=p["min_count"], tour=p["tour"],
+                    year_from=p["year_from"], year_to=p["year_to"],
+                    tourney_levels=p.get("levels"), rounds=p.get("rounds"),
+                )
+            self.data_ready.emit(data, self._mode)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Page
+# ---------------------------------------------------------------------------
+
 class InsightsPage(QWidget):
     """Nations & Fun Facts page."""
 
@@ -84,6 +124,7 @@ class InsightsPage(QWidget):
         self._breakdown_sorted: list[dict] = []
         self._instance_data: list[dict] = []
         self._last_search_params: dict = {}
+        self._insights_worker = None
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -258,22 +299,17 @@ class InsightsPage(QWidget):
             year_from, year_to = year_to, year_from
         levels = self._active_levels()
 
-        try:
-            data = self.db.get_nationality_round_breakdown(
-                ioc=ioc, tour=tour,
-                year_from=year_from, year_to=year_to,
-                tourney_levels=levels,
-            )
-        except Exception as exc:
-            self.status_label.setText(f"Query error: {exc}")
-            return
-
-        self._breakdown_data = data
-        self._populate_breakdown(data, ioc, year_from, year_to)
         self._last_search_params = {
             "ioc": ioc, "tour": tour,
             "year_from": year_from, "year_to": year_to,
         }
+        self.search_btn.setEnabled(False)
+        self.status_label.setText("Searching...")
+        self._start_insights_worker(
+            "breakdown",
+            {"ioc": ioc, "tour": tour, "year_from": year_from,
+             "year_to": year_to, "levels": levels},
+        )
 
     def _run_concentration(self):
         ioc = self.ioc_combo.currentText().strip()
@@ -290,22 +326,50 @@ class InsightsPage(QWidget):
         rounds = self.conc_round_pills.values() or None
         min_count = self.min_count_spin.value()
 
-        try:
-            data = self.db.get_ioc_concentration_instances(
-                ioc=ioc, min_count=min_count, tour=tour,
-                year_from=year_from, year_to=year_to,
-                tourney_levels=levels, rounds=rounds,
-            )
-        except Exception as exc:
-            self.status_label.setText(f"Query error: {exc}")
-            return
-
-        self._instance_data = data
-        self._populate_instances(data, ioc, min_count, rounds, levels)
         self._last_search_params = {
             "ioc": ioc, "tour": tour,
             "year_from": year_from, "year_to": year_to,
         }
+        self.find_btn.setEnabled(False)
+        self.instance_status_label.setText("Searching...")
+        self._start_insights_worker(
+            "concentration",
+            {"ioc": ioc, "min_count": min_count, "tour": tour,
+             "year_from": year_from, "year_to": year_to,
+             "levels": levels, "rounds": rounds},
+        )
+
+    def _start_insights_worker(self, mode, params):
+        if self._insights_worker and self._insights_worker.isRunning():
+            self._insights_worker.quit()
+            self._insights_worker.wait(500)
+        worker = _InsightsWorker(self.db, mode, params, parent=self)
+        worker.data_ready.connect(self._on_insights_data)
+        worker.error.connect(self._on_insights_error)
+        self._insights_worker = worker
+        worker.start()
+
+    def _on_insights_data(self, data, mode):
+        self.search_btn.setEnabled(True)
+        self.find_btn.setEnabled(True)
+        p = self._last_search_params
+        if mode == "breakdown":
+            self._breakdown_data = data
+            self._populate_breakdown(data, p["ioc"], p["year_from"], p["year_to"])
+        else:
+            self._instance_data = data
+            params = self._insights_worker._params if self._insights_worker else {}
+            self._populate_instances(
+                data, p["ioc"],
+                params.get("min_count", 2),
+                params.get("rounds"),
+                params.get("levels"),
+            )
+
+    def _on_insights_error(self, msg):
+        self.search_btn.setEnabled(True)
+        self.find_btn.setEnabled(True)
+        self.status_label.setText(f"Query error: {msg}")
 
     # ------------------------------------------------------------------
     # Data display helpers

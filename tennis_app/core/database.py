@@ -578,6 +578,18 @@ class TennisDatabase:
                 ON match_mcp_rally(player_name, tourney_date);
             CREATE INDEX IF NOT EXISTS idx_mcp_tactics_player_date
                 ON match_mcp_tactics(player_name, tourney_date);
+
+            -- IOC: composite indexes for Nations-page queries
+            CREATE INDEX IF NOT EXISTS idx_matches_winner_ioc
+                ON matches(tour, winner_ioc, tourney_date);
+            CREATE INDEX IF NOT EXISTS idx_matches_loser_ioc
+                ON matches(tour, loser_ioc, tourney_date);
+
+            -- Expression indexes so REPLACE(name, '-', ' ') = ? is fast
+            CREATE INDEX IF NOT EXISTS idx_matches_winner_name_norm
+                ON matches(REPLACE(winner_name, '-', ' '));
+            CREATE INDEX IF NOT EXISTS idx_matches_loser_name_norm
+                ON matches(REPLACE(loser_name, '-', ' '));
         """)
         self.conn.commit()
 
@@ -589,6 +601,12 @@ class TennisDatabase:
             logger.info("Running ANALYZE to update query planner statistics...")
             self.conn.execute("ANALYZE")
             self.conn.execute("PRAGMA user_version = 2")
+            self.conn.commit()
+        if version < 3:
+            # Re-analyze after adding IOC and REPLACE() expression indexes
+            logger.info("Running ANALYZE for new indexes (version 3)...")
+            self.conn.execute("ANALYZE matches")
+            self.conn.execute("PRAGMA user_version = 3")
             self.conn.commit()
 
     def has_data(self, tour="atp"):
@@ -1667,7 +1685,8 @@ class TennisDatabase:
                        'W' AS side
                 FROM matches
                 WHERE tour = ?
-                  AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
+                  AND tourney_date BETWEEN CAST(? AS TEXT)||'0101'
+                                      AND CAST(? AS TEXT)||'1231'
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_winner}
                   {level_clause}
@@ -1678,7 +1697,8 @@ class TennisDatabase:
                        'L' AS side
                 FROM matches
                 WHERE tour = ?
-                  AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
+                  AND tourney_date BETWEEN CAST(? AS TEXT)||'0101'
+                                      AND CAST(? AS TEXT)||'1231'
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_loser}
                   {level_clause}
@@ -1698,7 +1718,8 @@ class TennisDatabase:
                        'P' AS side
                 FROM matches w
                 WHERE w.tour = ?
-                  AND CAST(SUBSTR(w.tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
+                  AND w.tourney_date BETWEEN CAST(? AS TEXT)||'0101'
+                                        AND CAST(? AS TEXT)||'1231'
                   AND w.round IN ('R128','R64','R32','R16','QF','SF')
                   AND (w.is_upcoming = 0 OR w.is_upcoming IS NULL)
                   AND (
@@ -1797,7 +1818,8 @@ class TennisDatabase:
                        round, winner_id AS player_id, winner_name AS player_name
                 FROM matches
                 WHERE tour = ?
-                  AND CAST(SUBSTR(tourney_date, 1, 4) AS INTEGER) BETWEEN ? AND ?
+                  AND tourney_date BETWEEN CAST(? AS TEXT)||'0101'
+                                      AND CAST(? AS TEXT)||'1231'
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_winner}
                   {level_clause} {round_clause}
@@ -1806,7 +1828,8 @@ class TennisDatabase:
                        round, loser_id AS player_id, loser_name AS player_name
                 FROM matches
                 WHERE tour = ?
-                  AND CAST(SUBSTR(tourney_date, 1, 4) AS INTEGER) BETWEEN ? AND ?
+                  AND tourney_date BETWEEN CAST(? AS TEXT)||'0101'
+                                      AND CAST(? AS TEXT)||'1231'
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_loser}
                   {level_clause} {round_clause}
@@ -1820,7 +1843,8 @@ class TennisDatabase:
                        m.winner_id AS player_id, m.winner_name AS player_name
                 FROM matches m
                 WHERE m.tour = ?
-                  AND CAST(SUBSTR(m.tourney_date, 1, 4) AS INTEGER) BETWEEN ? AND ?
+                  AND m.tourney_date BETWEEN CAST(? AS TEXT)||'0101'
+                                        AND CAST(? AS TEXT)||'1231'
                   AND m.round IN ('R128','R64','R32','R16','QF','SF')
                   AND (m.is_upcoming = 0 OR m.is_upcoming IS NULL)
                   AND {ioc_winner_m}

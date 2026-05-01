@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QSizePolicy,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QColor, QBrush
 
 from ..widgets import (
@@ -16,6 +16,53 @@ from ..widgets import (
 from ..theme import COLORS
 from ..match_detail_dialog import MatchDetailDialog
 
+
+# ---------------------------------------------------------------------------
+# Background worker
+# ---------------------------------------------------------------------------
+
+class _MatchesWorker(QThread):
+    """Fetch matches + upcoming banner data off the UI thread."""
+    data_ready = Signal(list, object)  # (matches, upcoming_row_or_None)
+    error = Signal(str)
+
+    def __init__(self, db, player_id, player_name, tour,
+                 surface, tourney_level, year, rounds, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self._player_id = player_id
+        self._player_name = player_name
+        self._tour = tour
+        self._surface = surface
+        self._tourney_level = tourney_level
+        self._year = year
+        self._rounds = rounds
+
+    def run(self):
+        try:
+            matches = self._db.get_player_matches(
+                self._player_id,
+                surface=self._surface,
+                tourney_level=self._tourney_level,
+                year=self._year,
+                round_=self._rounds,
+                tour=self._tour,
+            )
+            upcoming = None
+            if self._player_name:
+                try:
+                    upcoming = self._db.get_player_upcoming_match(
+                        self._player_name)
+                except Exception:
+                    pass
+            self.data_ready.emit(matches, upcoming)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Page
+# ---------------------------------------------------------------------------
 
 class MatchesPage(QWidget):
     """Page for browsing match history with filters and pagination."""
@@ -28,6 +75,7 @@ class MatchesPage(QWidget):
         self._current_player_id = None
         self._current_player_tour = None
         self._current_page = 1
+        self._matches_worker = None
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
         self._filter_timer.setInterval(250)
@@ -143,6 +191,25 @@ class MatchesPage(QWidget):
         self._current_player = f"{player['name_first']} {player['name_last']}"
         self._refetch_matches()
 
+    def _refresh_upcoming_banner_from_data(self, row):
+        """Populate upcoming-match banner from pre-fetched row (or None)."""
+        if not row:
+            self.upcoming_label.setVisible(False)
+            return
+        date = str(row.get("tourney_date") or "")
+        if len(date) == 8:
+            date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+        opp = row.get("opponent") or "?"
+        opp_rank = row.get("opponent_rank")
+        opp_str = f"{opp} (#{int(opp_rank)})" if opp_rank else opp
+        tourney = row.get("tourney_name") or ""
+        round_ = row.get("round") or ""
+        round_str = f" \u2013 {round_}" if round_ else ""
+        self.upcoming_label.setText(
+            f"Next match: {opp_str}  \u00b7  {tourney}{round_str}  \u00b7  {date}"
+        )
+        self.upcoming_label.setVisible(True)
+
     def _refresh_upcoming_banner(self):
         """Show next scheduled match for the selected player, if any."""
         if not self._current_player:
@@ -183,9 +250,6 @@ class MatchesPage(QWidget):
         if not self._current_player_id:
             return
 
-        # Refresh upcoming-match banner (independent of filters).
-        self._refresh_upcoming_banner()
-
         surface = self.surface_pills.value()
         surface = None if surface == "All" else surface
         year = self.year_combo.currentText()
@@ -199,13 +263,32 @@ class MatchesPage(QWidget):
         tourney_level = [_level_map[v] for v in self.level_pills.values()
                          if v in _level_map] or None
 
-        self._all_matches = self.db.get_player_matches(
-            self._current_player_id, surface=surface,
-            tourney_level=tourney_level,
-            year=year, round_=rounds,
-            tour=self._current_player_tour,
+        # Stop any previous query
+        if self._matches_worker and self._matches_worker.isRunning():
+            self._matches_worker.quit()
+            self._matches_worker.wait(1000)
+
+        self.status_label.setText("Loading...")
+
+        worker = _MatchesWorker(
+            self.db,
+            self._current_player_id,
+            self._current_player,
+            self._current_player_tour,
+            surface, tourney_level, year, rounds,
+            parent=self,
         )
+        worker.data_ready.connect(self._on_matches_loaded)
+        worker.error.connect(
+            lambda msg: self.status_label.setText(f"Error: {msg}"))
+        self._matches_worker = worker
+        worker.start()
+
+    def _on_matches_loaded(self, matches, upcoming):
+        """Called from worker thread via signal when data is ready."""
+        self._all_matches = matches
         self._current_page = 1
+        self._refresh_upcoming_banner_from_data(upcoming)
         self._display_page()
 
     def _rows_per_page(self):
