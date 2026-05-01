@@ -50,7 +50,7 @@ def main() -> int:
         if not args.no_matches:
             from tennis_app.core.data_manager import scrape_player_matches
             logger.info("Scraping matches for %s (%s)...", args.name, args.tour)
-            df, last_date = scrape_player_matches(
+            df, last_date, _match_signature = scrape_player_matches(
                 args.name, tour=args.tour, min_year=args.min_year)
             logger.info("  fetched %d match rows (latest=%s)",
                         len(df), last_date)

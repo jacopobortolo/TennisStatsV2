@@ -5,6 +5,7 @@ from tennisabstract.com for recent data.
 """
 
 import datetime
+import hashlib
 import os
 import re
 import time
@@ -285,6 +286,30 @@ def _get_scraper():
     return _scraper_instance
 
 
+def _build_match_signature(df):
+    """Digest recent completed matches; ignores scheduled/upcoming rows."""
+    if df is None or df.empty:
+        return None
+    completed = df
+    if "is_upcoming" in completed.columns:
+        completed = completed[completed["is_upcoming"].fillna(0).astype(int) != 1]
+    if completed.empty:
+        return None
+    fields = [
+        "tourney_date", "tourney_name", "round", "winner_name",
+        "loser_name", "score", "winner_id", "loser_id",
+    ]
+    sort_fields = [c for c in fields if c in completed.columns]
+    completed = completed.sort_values(sort_fields, kind="stable")
+    rows = []
+    for _, row in completed.iterrows():
+        rows.append("\x1f".join(
+            str(row.get(col, "") or "").strip() for col in fields
+        ))
+    payload = "\x1e".join(rows)
+    return hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest()
+
+
 def scrape_player_matches(player_name, min_year=None, tour="atp",
                           max_matches=None):
     """
@@ -295,9 +320,12 @@ def scrape_player_matches(player_name, min_year=None, tour="atp",
     If *max_matches* is set, only the N most recent matches are kept
     (after the min_year filter).
 
-    Returns (DataFrame, last_match_date_str).
+    Returns (DataFrame, last_match_date_str, match_signature).
     ``last_match_date_str`` is the YYYYMMDD string of the most recent
     match across ALL years (before the min_year filter), or None.
+    ``match_signature`` is a digest of the recent completed matches and
+    changes when a result appears even if TennisAbstract keeps the same
+    tournament date for every match in the event.
     """
     scraper = _get_scraper()
     raw = scraper.fetch_player_matches(player_name, tour=tour)
@@ -317,7 +345,7 @@ def scrape_player_matches(player_name, min_year=None, tour="atp",
 
     df = convert_scraped_to_db_format(raw, player_name, min_year=min_year,
                                       max_matches=max_matches, tour=tour)
-    return df, last_match_date
+    return df, last_match_date, _build_match_signature(df)
 
 
 def scrape_current_rankings(tour="atp", discipline="singles", source="LIVE"):
@@ -403,6 +431,44 @@ def _cache_row_is_fresh(cache_row, expire_hours):
         return False
     return (datetime.datetime.now() - last
             < datetime.timedelta(hours=expire_hours))
+
+
+def _matches_changed(cache_row, match_signature):
+    """Return True if the completed-match digest changed."""
+    if not match_signature:
+        return False
+    if not cache_row or len(cache_row) < 4 or not cache_row[3]:
+        return True
+    return str(match_signature) != str(cache_row[3])
+
+
+def _db_match_signature(db, player_name, tour="atp", limit=20):
+    """Build the same completed-match digest from existing SCRAPED rows."""
+    if db is None:
+        return None
+    try:
+        rows = db.conn.execute(
+            """
+            SELECT tourney_date, tourney_name, round, winner_name,
+                   loser_name, score, winner_id, loser_id, is_upcoming
+            FROM matches
+            WHERE tour = ?
+              AND tourney_id = 'SCRAPED'
+              AND (is_upcoming = 0 OR is_upcoming IS NULL)
+              AND (winner_name = ? OR loser_name = ?)
+            ORDER BY tourney_date DESC, match_num DESC
+            LIMIT ?
+            """,
+            (tour, player_name, player_name, limit),
+        ).fetchall()
+    except Exception:
+        return None
+    if not rows:
+        return None
+    return _build_match_signature(pd.DataFrame(rows, columns=[
+        "tourney_date", "tourney_name", "round", "winner_name",
+        "loser_name", "score", "winner_id", "loser_id", "is_upcoming",
+    ]))
 
 
 def _resolve_ranking_name(ranking_name, db, tour="atp"):
@@ -599,6 +665,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
 
     # Determine which players need re-scraping
     stale = set()
+    stale_reasons = {}
     fingerprints = {}  # name → fingerprint (for players we'll scrape)
 
     # Bulk-load the entire scrape_cache in ONE round-trip instead of
@@ -613,7 +680,8 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
     # NOTE: DB rows store the diacritic-stripped CSV-canonical spelling,
     # while ranking names may carry accents (e.g. "Rafael J\u00f3dar" vs
     # "Rafael Jodar").  Normalise both sides for the membership check.
-    _due_raw = (db.get_players_with_due_upcoming()
+    today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    _due_raw = (db.get_players_with_due_upcoming(today_str)
                 if db is not None else set())
     due_upcoming = {_normalize_name(n) for n in _due_raw}
 
@@ -623,19 +691,15 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
 
         if db is None:
             stale.add(name)
+            stale_reasons[name] = "no_db"
             continue
 
         cache_row = cache_snapshot.get(name)
-        # Trigger re-scrape ONLY if there's a due upcoming AND the
-        # player's last scrape is older than the cooldown.  Without the
-        # cooldown, every successful scrape immediately re-creates new
-        # upcoming rows for the next round (e.g. just-finished R64 leaves
-        # a fresh R32 placeholder), which would re-flag the player as
-        # stale on the very next run and cause an infinite scrape loop.
-        has_due_upcoming = (
-            norm in due_upcoming
-            and not _cache_row_is_fresh(cache_row, cache_expire_hours)
-        )
+        # Trigger re-scrape whenever a local upcoming placeholder is due.
+        # Confirmation is handled after the HTTP scrape by comparing the
+        # completed-match signature; unconfirmed scrapes are not imported,
+        # so the upcoming placeholder stays available for the next retry.
+        has_due_upcoming = norm in due_upcoming
 
         if fp is not None:
             # We have activity data from OFFICIAL
@@ -644,12 +708,16 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                 # Inactive player: use 7-day cache
                 if has_due_upcoming or not _cache_row_is_fresh(cache_row, 168):
                     stale.add(name)
+                    stale_reasons[name] = (
+                        "due_upcoming" if has_due_upcoming else "time")
                     fingerprints[name] = fp
             elif has_due_upcoming or _activity_changed(
                     cache_row[1] if cache_row else None, fp):
                 # Fingerprint changed OR an upcoming match is now due
                 # (and cooldown elapsed): scrape to capture the new result.
                 stale.add(name)
+                stale_reasons[name] = (
+                    "due_upcoming" if has_due_upcoming else "activity")
                 fingerprints[name] = fp
             else:
                 # Fingerprint unchanged and no due upcoming: keep stored
@@ -660,6 +728,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
             # Player not found in OFFICIAL: fall back to time-based cache
             if not _cache_row_is_fresh(cache_row, cache_expire_hours):
                 stale.add(name)
+                stale_reasons[name] = "time"
 
     logger.info("Event-driven check: %d/%d players (top %d) need refresh",
                 len(stale), len(player_names), top_n)
@@ -701,12 +770,12 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
     def _fetch_one(entry):
         name = entry["name"]
         try:
-            df, last_match_date = scrape_player_matches(
+            df, last_match_date, match_signature = scrape_player_matches(
                 name, min_year=min_year, tour=tour,
                 max_matches=max_matches_per_player)
-            return name, df, last_match_date, None
+            return name, df, last_match_date, match_signature, None
         except Exception as exc:
-            return name, None, None, exc
+            return name, None, None, None, exc
 
     if total_to_scrape > 0:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -714,7 +783,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                        for _, entry in actual_targets}
             for future in as_completed(futures):
                 scrape_idx += 1
-                name, df, last_match_date, exc = future.result()
+                name, df, last_match_date, match_signature, exc = future.result()
 
                 if progress_callback:
                     progress_callback(scrape_idx, total_to_scrape,
@@ -727,12 +796,14 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
 
                 # Decide whether to persist the new fingerprint.
                 #
-                # If the scrape produced real matches: store new fingerprint
-                # so future runs can detect further activity changes.
+                # If the scrape produced real matches and changed the recent
+                # completed-match digest: store the new fingerprint so future runs can
+                # detect further activity changes.
                 #
-                # If the scrape produced NO matches but the player already
-                # had a cache entry (i.e. fingerprint changed but
-                # tennisabstract hasn't published the result yet):
+                # If the scrape did not change completed matches but the player
+                # already had a cache entry (i.e. fingerprint changed but
+                # tennisabstract hasn't published the result yet, while older
+                # matches are still returned):
                 # preserve the OLD fingerprint by passing None.  This
                 # ensures the next run will see the activity change again
                 # and retry, instead of treating the empty scrape as
@@ -744,19 +815,46 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                 # who simply have no tennisabstract presence.
                 non_empty = df is not None and not df.empty
                 had_cache = name in cache_snapshot
+                cache_row = cache_snapshot.get(name)
+                needs_confirmed_activity = (
+                    stale_reasons.get(name) in {"activity", "due_upcoming"})
+                baseline_signature = None
+                if (needs_confirmed_activity and had_cache
+                        and (not cache_row or len(cache_row) < 4
+                             or not cache_row[3])):
+                    baseline_signature = _db_match_signature(db, name, tour)
+                compare_row = cache_row
+                if baseline_signature:
+                    compare_row = (
+                        cache_row[0], cache_row[1], cache_row[2],
+                        baseline_signature,
+                    )
+                changed_matches = _matches_changed(compare_row, match_signature)
+                confirmed = (
+                    non_empty
+                    and (changed_matches or not needs_confirmed_activity)
+                )
                 fp_to_store = (fingerprints.get(name)
-                               if non_empty or not had_cache else None)
+                               if confirmed or not had_cache
+                               else None)
                 if db is not None:
                     db.update_scrape_cache(
                         name,
                         len(df) if df is not None else 0,
                         last_match_date=last_match_date,
+                        match_signature=(match_signature
+                                         if fp_to_store is not None else None),
                         activity_fingerprint=fp_to_store,
                     )
-                if non_empty:
+                if confirmed:
                     all_frames.append(df)
                     scraped_names.append(name)
                     logger.info("Scraped %d matches for %s", len(df), name)
+                elif non_empty:
+                    logger.info(
+                        "Scraped %d matches for %s, but completed matches "
+                        "did not change (fingerprint preserved for retry)",
+                        len(df), name)
                 else:
                     if had_cache:
                         logger.info(

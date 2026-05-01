@@ -221,7 +221,8 @@ class TennisDatabase:
                 last_scraped TEXT NOT NULL,
                 match_count INTEGER DEFAULT 0,
                 last_match_date TEXT,
-                activity_fingerprint TEXT
+                activity_fingerprint TEXT,
+                match_signature TEXT
             );
 
             CREATE TABLE IF NOT EXISTS doubles_matches (
@@ -474,6 +475,11 @@ class TennisDatabase:
         # Migrate scrape_cache: add activity_fingerprint column.
         try:
             cur.execute("ALTER TABLE scrape_cache ADD COLUMN activity_fingerprint TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Migrate scrape_cache: add match_signature column.
+        try:
+            cur.execute("ALTER TABLE scrape_cache ADD COLUMN match_signature TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
         # Migrate extended_stats_cache: add activity_fingerprint column.
@@ -2701,16 +2707,17 @@ class TennisDatabase:
     @_locked_write
     def update_scrape_cache(self, player_name, match_count,
                             last_match_date=None,
+                            match_signature=None,
                             activity_fingerprint=None):
         """Record that a player was just scraped.
 
         If *activity_fingerprint* is None, the existing stored
         fingerprint is preserved (only ``last_scraped`` and
         ``match_count`` are updated).  Callers pass None when a scrape
-        produced no real matches but we still want to mark the run as
-        attempted; preserving the old fingerprint ensures the next run
-        will detect activity change and retry (instead of treating the
-        new fingerprint as already-scraped).
+        did not confirm the new activity yet (for example because
+        tennisabstract still has not published the latest result);
+        preserving the old fingerprint ensures the next run will detect
+        the same activity change and retry.
         """
         from datetime import datetime
         now_iso = datetime.now().isoformat()
@@ -2718,23 +2725,26 @@ class TennisDatabase:
             self.conn.execute(
                 "INSERT INTO scrape_cache "
                 "(player_name, last_scraped, match_count, "
-                "last_match_date, activity_fingerprint) "
-                "VALUES (?, ?, ?, ?, NULL) "
+                "last_match_date, activity_fingerprint, match_signature) "
+                "VALUES (?, ?, ?, ?, NULL, ?) "
                 "ON CONFLICT(player_name) DO UPDATE SET "
                 "last_scraped = excluded.last_scraped, "
                 "match_count = excluded.match_count, "
                 "last_match_date = COALESCE(excluded.last_match_date, "
-                "                          scrape_cache.last_match_date)",
-                (player_name, now_iso, match_count, last_match_date)
+                "                          scrape_cache.last_match_date), "
+                "match_signature = COALESCE(excluded.match_signature, "
+                "                           scrape_cache.match_signature)",
+                (player_name, now_iso, match_count, last_match_date,
+                 match_signature)
             )
         else:
             self.conn.execute(
                 "INSERT OR REPLACE INTO scrape_cache "
                 "(player_name, last_scraped, match_count, last_match_date, "
-                "activity_fingerprint) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "activity_fingerprint, match_signature) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (player_name, now_iso, match_count,
-                 last_match_date, activity_fingerprint)
+                 last_match_date, activity_fingerprint, match_signature)
             )
         self.conn.commit()
 
@@ -2751,15 +2761,18 @@ class TennisDatabase:
     def get_all_scrape_cache(self):
         """Bulk-load the entire scrape_cache table.
 
-        Returns a dict ``{player_name: (last_scraped_iso, fingerprint)}``.
+        Returns a dict
+        ``{player_name: (last_scraped_iso, fingerprint, last_match_date,
+        match_signature)}``.
         Used to avoid 1000+ sequential round-trips when checking activity
         for top-N rankings against a remote (Turso) database.
         """
         rows = self.conn.execute(
-            "SELECT player_name, last_scraped, activity_fingerprint "
+            "SELECT player_name, last_scraped, activity_fingerprint, "
+            "last_match_date, match_signature "
             "FROM scrape_cache"
         ).fetchall()
-        return {r[0]: (r[1], r[2]) for r in rows}
+        return {r[0]: (r[1], r[2], r[3], r[4]) for r in rows}
 
     def get_players_with_due_upcoming(self, today_yyyymmdd: str | None = None):
         """Return the set of player names that have at least one match
