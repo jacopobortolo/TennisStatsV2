@@ -211,7 +211,7 @@ class TournamentsPage(QWidget):
 
     def _search(self, query: str = ""):
         year_text = self.year_combo.currentText()
-        year = int(year_text) if year_text else None
+        year = int(year_text) if year_text and year_text != "All" else None
         tour = self.tour_pills.value().lower()
         is_doubles = self.type_pills.value() == "Doubles"
         self._pending_query = query
@@ -268,7 +268,7 @@ class TournamentsPage(QWidget):
             return
 
         year_text = self.year_combo.currentText()
-        year = int(year_text) if year_text else None
+        year = int(year_text) if year_text and year_text != "All" else None
         tour = self.tour_pills.value().lower()
         is_doubles = self.type_pills.value() == "Doubles"
 

@@ -149,11 +149,22 @@ class MatchesPage(QWidget):
         self.upcoming_label.setVisible(False)
         layout.addWidget(self.upcoming_label)
 
+        # --- Rank filter row ---
+        rank_row = QHBoxLayout()
+        rank_row.setSpacing(10)
+        rank_row.addWidget(QLabel("Opp. rank:"))
+        self.rank_pills = PillButtonGroup(
+            ["All", "Top 5", "Top 10", "Top 20", "Top 50", "Top 100"])
+        rank_row.addWidget(self.rank_pills)
+        rank_row.addStretch()
+        layout.addLayout(rank_row)
+
         # --- Table ---
         self.table = DataTable([
             ("Date", 90), ("Tournament", 170), ("Level", 80),
-            ("Surface", 65), ("Round", 55), ("Winner", 180),
-            ("Loser", 180), ("Score", 140), ("Min", 45),
+            ("Surface", 65), ("Round", 55), ("Winner", 160),
+            ("Loser", 160), ("W Rk", 50), ("L Rk", 50),
+            ("Score", 140), ("Min", 45),
         ])
         self.table.doubleClicked.connect(self._on_match_double_clicked)
         layout.addWidget(self.table, 1)
@@ -244,6 +255,7 @@ class MatchesPage(QWidget):
         self.year_combo.currentIndexChanged.connect(
             lambda _: self._filter_timer.start())
         self.round_pills.changed.connect(lambda _: self._filter_timer.start())
+        self.rank_pills.changed.connect(lambda _: self._display_page())
 
     def _refetch_matches(self):
         """Re-query the DB using current filter values for the selected player."""
@@ -291,18 +303,44 @@ class MatchesPage(QWidget):
         self._refresh_upcoming_banner_from_data(upcoming)
         self._display_page()
 
+    def _get_filtered_matches(self):
+        """Return _all_matches filtered by the opponent-rank pill."""
+        rank_val = self.rank_pills.value()
+        if rank_val == "All":
+            return self._all_matches
+        limit = int(rank_val.split()[-1])  # "Top 10" → 10
+        _pid = str(self._current_player_id or "")
+        _pname = (self._current_player or "").replace("-", " ").strip().lower()
+        result = []
+        for m in self._all_matches:
+            wid = str(m.get("winner_id") or "")
+            if _pid and wid:
+                is_win = (wid == _pid)
+            else:
+                wname = (m.get("winner_name") or "").replace("-", " ").strip().lower()
+                is_win = (wname == _pname)
+            opp_rank = m.get("loser_rank") if is_win else m.get("winner_rank")
+            try:
+                if opp_rank is not None and int(float(opp_rank)) <= limit:
+                    result.append(m)
+            except (ValueError, TypeError):
+                pass
+        return result
+
     def _rows_per_page(self):
         text = self.rows_combo.currentText()
         return None if text == "All" else int(text)
 
     def _total_pages(self):
         rpp = self._rows_per_page()
-        if not rpp or not self._all_matches:
+        filtered = self._get_filtered_matches()
+        if not rpp or not filtered:
             return 1
-        return max(1, (len(self._all_matches) + rpp - 1) // rpp)
+        return max(1, (len(filtered) + rpp - 1) // rpp)
 
     def _display_page(self):
-        if not self._all_matches:
+        filtered = self._get_filtered_matches()
+        if not filtered:
             self.table.setRowCount(0)
             self.status_label.setText("No matches found")
             self.page_label.setText("")
@@ -314,9 +352,9 @@ class MatchesPage(QWidget):
 
         if rpp:
             start = (self._current_page - 1) * rpp
-            page = self._all_matches[start:start + rpp]
+            page = filtered[start:start + rpp]
         else:
-            page = self._all_matches
+            page = filtered
 
         level_map = {
             "G": "Grand Slam", "M": "Masters", "A": "ATP",
@@ -330,6 +368,8 @@ class MatchesPage(QWidget):
                 date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
             level = level_map.get(
                 m.get("tourney_level", ""), m.get("tourney_level", ""))
+            w_rank = str(int(m["winner_rank"])) if m.get("winner_rank") else ""
+            l_rank = str(int(m["loser_rank"])) if m.get("loser_rank") else ""
             rows.append([
                 date,
                 m.get("tourney_name", ""),
@@ -338,6 +378,8 @@ class MatchesPage(QWidget):
                 m.get("round", ""),
                 self._format_player(m, "winner"),
                 self._format_player(m, "loser"),
+                w_rank,
+                l_rank,
                 m.get("score", ""),
                 str(int(m["minutes"])) if m.get("minutes") else "",
             ])
@@ -349,7 +391,7 @@ class MatchesPage(QWidget):
         _pname = (self._current_player or "").replace("-", " ").strip().lower()
         _green = QBrush(QColor("#1a7a3c"))
         _red   = QBrush(QColor("#7a1a1a"))
-        _score_col = 7
+        _score_col = 9
         for r, m in enumerate(page):
             wid = str(m.get("winner_id") or "")
             wname = (m.get("winner_name") or "").replace("-", " ").strip().lower()
@@ -367,7 +409,7 @@ class MatchesPage(QWidget):
                      if rpp else "All")
         self.page_label.setText(page_text)
         self.status_label.setText(
-            f"Showing {len(page)} of {len(self._all_matches)} matches "
+            f"Showing {len(page)} of {len(filtered)} matches "
             f"for {self._current_player}")
 
     def _prev_page(self):
@@ -382,15 +424,16 @@ class MatchesPage(QWidget):
 
     def _on_match_double_clicked(self, index):
         row = index.row()
-        # Map visible row → absolute index in _all_matches
+        # Map visible row → absolute index in filtered matches
+        filtered = self._get_filtered_matches()
         rpp = self._rows_per_page()
         if rpp:
             start = (self._current_page - 1) * rpp
             abs_row = start + row
         else:
             abs_row = row
-        if 0 <= abs_row < len(self._all_matches):
-            match = self._all_matches[abs_row]
+        if 0 <= abs_row < len(filtered):
+            match = filtered[abs_row]
             dlg = MatchDetailDialog(self.db, match, parent=self)
             dlg.exec()
 
