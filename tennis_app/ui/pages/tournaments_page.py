@@ -114,6 +114,17 @@ class TournamentsPage(QWidget):
             self._first_show = False
             self._on_tour_change()
 
+    def _on_tour_change(self):
+        """Reload the year dropdown for the currently selected tour."""
+        tour = self.tour_pills.value().lower()
+        if self._years_worker and self._years_worker.isRunning():
+            self._years_worker.quit()
+            self._years_worker.wait(500)
+        worker = _YearsWorker(self.db, tour, parent=self)
+        worker.finished.connect(self._on_years_loaded)
+        self._years_worker = worker
+        worker.start()
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -198,14 +209,6 @@ class TournamentsPage(QWidget):
         self.tour_pills.set_value(tour_label)  # silent — no changed signal
         self._pending_nav = (tourney_name, year_str)
         self._on_tour_change()  # loads years, then applies _pending_nav
-        tour = self.tour_pills.value().lower()
-        if self._years_worker and self._years_worker.isRunning():
-            self._years_worker.quit()
-            self._years_worker.wait(500)
-        worker = _YearsWorker(self.db, tour, parent=self)
-        worker.finished.connect(self._on_years_loaded)
-        self._years_worker = worker
-        worker.start()
 
     def _on_years_loaded(self, years):
         years_sorted = sorted(years, reverse=True)

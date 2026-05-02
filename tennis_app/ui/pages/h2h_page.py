@@ -329,7 +329,12 @@ class H2HPage(QWidget):
                 m.get("score", ""),
             ])
         match_table.populate(rows)
-        match_table.setMinimumHeight(300)
+        # Resize the table to show all rows without internal scrollbar
+        match_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        header_h = match_table.horizontalHeader().height()
+        row_h = match_table.rowHeight(0) if match_table.rowCount() > 0 else 30
+        match_table.setFixedHeight(
+            header_h + row_h * match_table.rowCount() + 2)
         # Store match list and wire double-click
         self._h2h_matches = list(h2h["matches"])
         match_table.doubleClicked.connect(self._on_match_double_clicked)

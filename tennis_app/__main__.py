@@ -7,6 +7,7 @@ Run with:
 """
 
 import logging
+import os
 import sys
 
 logging.basicConfig(
@@ -15,6 +16,28 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_webengine():
+    """Set WebEngine options before QApplication is created."""
+    os.environ.setdefault("QT_OPENGL", "software")
+    os.environ.setdefault("QT_QUICK_BACKEND", "software")
+    chromium_flags = [
+        "--disable-gpu",
+        "--disable-gpu-compositing",
+        "--disable-gpu-rasterization",
+        "--disable-webgl",
+        "--disable-features=CalculateNativeWinOcclusion",
+    ]
+    existing_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").strip()
+    if existing_flags:
+        chromium_flags.insert(0, existing_flags)
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(chromium_flags)
+    try:
+        from PySide6.QtGui import QGuiApplication
+        QGuiApplication.setDesktopSettingsAware(False)
+    except Exception as exc:
+        logger.debug("Could not set WebEngine application attributes: %s", exc)
 
 
 def _ensure_db_initialized():
@@ -61,7 +84,29 @@ def _run_cloud_sync(splash, app):
         logger.exception("Cloud sync failed; opening app with stale data")
 
 
+def _warm_up_webengine(app):
+    """Initialize QWebEngine and Plotly before the first chart is shown."""
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        from .ui.charts import get_chart_base_url, spider_chart
+
+        view = QWebEngineView()
+        view.setAttribute(Qt.WA_DontShowOnScreen, True)
+        view.resize(1, 1)
+        html = spider_chart(["A", "B", "C"], [10, 20, 30], height=120)
+        view.setHtml(html, get_chart_base_url())
+        app.processEvents()
+        logger.info("QWebEngine warm-up started")
+        return view
+    except Exception as exc:
+        logger.debug("Could not warm up QWebEngine: %s", exc)
+        return None
+
+
 def main():
+    _configure_webengine()
+
     from PySide6.QtWidgets import QApplication, QSplashScreen
     from PySide6.QtGui import QPixmap, QColor
     from .ui.main_window import MainWindow
@@ -76,6 +121,7 @@ def main():
     app.setStyle("Fusion")
     load_fonts()
     app.setStyleSheet(build_stylesheet())
+    app._webengine_warmup = _warm_up_webengine(app)
 
     splash = None
     if not no_sync:
