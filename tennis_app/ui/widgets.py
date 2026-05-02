@@ -532,7 +532,8 @@ class DataTable(QTableWidget):
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.verticalHeader().setVisible(False)
-        self.horizontalHeader().setStretchLastSection(True)
+        self.horizontalHeader().setStretchLastSection(False)
+        self.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
 
     def populate(self, rows: list[list[str]], color_rules: dict = None):
         """

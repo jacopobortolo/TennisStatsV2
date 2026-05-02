@@ -3,7 +3,7 @@ Player Search & Profile page.
 """
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSplitter,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QStackedWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QSizePolicy, QPushButton,
 )
@@ -93,7 +93,15 @@ class PlayerPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Search bar at top
+        self._stack = QStackedWidget()
+        layout.addWidget(self._stack, 1)
+
+        # ── Page 0: search ────────────────────────────────────────────────
+        search_page = QWidget()
+        sp_layout = QVBoxLayout(search_page)
+        sp_layout.setContentsMargins(0, 0, 0, 0)
+        sp_layout.setSpacing(0)
+
         search_container = QWidget()
         search_container.setStyleSheet(
             f"background-color: {COLORS['bg_secondary']}; "
@@ -103,43 +111,50 @@ class PlayerPage(QWidget):
 
         self.search_bar = SearchBar(
             placeholder="Search player name...",
-            button_text="🔍 Search",
+            button_text="\U0001f50d Search",
         )
         self.search_bar.searched.connect(self._on_search)
         sc_layout.addWidget(self.search_bar)
-
-        layout.addWidget(search_container)
-
-        # Splitter: left = results, right = profile
-        splitter = QSplitter(Qt.Horizontal)
-
-        # Left panel — search results table
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(8, 8, 4, 8)
+        sp_layout.addWidget(search_container)
 
         lbl = QLabel("Results")
         lbl.setObjectName("subHeaderLabel")
-        left_layout.addWidget(lbl)
+        lbl.setContentsMargins(12, 8, 0, 4)
+        sp_layout.addWidget(lbl)
 
         self.results_table = DataTable([
             ("Name", 180), ("Country", 60), ("Hand", 55), ("Born", 90),
         ])
         self.results_table.cellClicked.connect(self._on_select)
-        left_layout.addWidget(self.results_table)
+        sp_layout.addWidget(self.results_table, 1)
 
-        splitter.addWidget(left)
+        self._stack.addWidget(search_page)  # index 0
 
-        # Right panel — profile
+        # ── Page 1: profile ───────────────────────────────────────────────
+        profile_page = QWidget()
+        pp_layout = QVBoxLayout(profile_page)
+        pp_layout.setContentsMargins(0, 0, 0, 0)
+        pp_layout.setSpacing(0)
+
+        back_bar = QWidget()
+        back_bar.setStyleSheet(
+            f"background-color: {COLORS['bg_secondary']};")
+        back_layout = QHBoxLayout(back_bar)
+        back_layout.setContentsMargins(16, 8, 16, 8)
+        back_btn = QPushButton("\u2190 Change player")
+        back_btn.setObjectName("accentBtn")
+        back_btn.setCursor(Qt.PointingHandCursor)
+        back_btn.clicked.connect(self._show_search)
+        back_layout.addWidget(back_btn)
+        back_layout.addStretch()
+        pp_layout.addWidget(back_bar)
+
         self.profile_area = ScrollablePage()
-        splitter.addWidget(self.profile_area)
+        pp_layout.addWidget(self.profile_area, 1)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
+        self._stack.addWidget(profile_page)  # index 1
 
-        layout.addWidget(splitter, 1)
-
-        # Placeholder
+        # Placeholder shown before any player is selected
         placeholder = QLabel("Search and select a player to view their profile.")
         placeholder.setObjectName("dimLabel")
         placeholder.setAlignment(Qt.AlignCenter)
@@ -147,6 +162,10 @@ class PlayerPage(QWidget):
 
         # Store mapping from row → (tour, player_id)
         self._row_map = []
+
+    def _show_search(self):
+        """Switch back to the search/results panel."""
+        self._stack.setCurrentIndex(0)
 
     def _on_search(self, query: str):
         if len(query) < 2:
@@ -173,6 +192,7 @@ class PlayerPage(QWidget):
         if row < 0 or row >= len(self._row_map):
             return
         tour, player_id = self._row_map[row]
+        self._stack.setCurrentIndex(1)  # switch to profile panel
         self._show_profile(player_id, tour)
 
     def _show_profile(self, player_id, tour=None):

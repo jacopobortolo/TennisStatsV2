@@ -171,6 +171,31 @@ def sync_cloud_to_local(
             where="tourney_id='SCRAPED'",
             progress_callback=progress_callback,
         )
+        # Remove SCRAPED rows that duplicate local CSV rows (same year +
+        # tourney_name + round + winner + loser).  The cloud DB (Turso) has
+        # no historical CSVs so it accumulates SCRAPED rows for matches that
+        # are already in the local Sackmann archive — dedup here instead.
+        n_dedup = 0
+        local.execute("""
+            DELETE FROM matches
+            WHERE tourney_id = 'SCRAPED'
+              AND rowid IN (
+                SELECT scraped.rowid
+                FROM matches scraped
+                JOIN matches csv
+                  ON SUBSTR(csv.tourney_date, 1, 4) = SUBSTR(scraped.tourney_date, 1, 4)
+                 AND LOWER(csv.tourney_name) = LOWER(scraped.tourney_name)
+                 AND csv.round = scraped.round
+                 AND csv.winner_name = scraped.winner_name
+                 AND csv.loser_name  = scraped.loser_name
+                 AND csv.tourney_id != 'SCRAPED'
+                WHERE scraped.tourney_id = 'SCRAPED'
+              )
+        """)
+        n_dedup = local.execute("SELECT changes()").fetchone()[0]
+        if n_dedup:
+            logger.info("  matches: removed %d SCRAPED rows that duplicate CSV data",
+                        n_dedup)
 
         # 2) rankings: only the live snapshot
         counts["rankings"] = _copy_table(

@@ -608,6 +608,33 @@ class TennisDatabase:
             self.conn.execute("ANALYZE matches")
             self.conn.execute("PRAGMA user_version = 3")
             self.conn.commit()
+        if version < 4:
+            # Remove SCRAPED duplicate rows that exist alongside CSV rows
+            # for the same match (year + tourney_name + round + winner + loser).
+            # Caused by scraper using per-match dates vs CSV using tourney-start date.
+            logger.info("Removing SCRAPED duplicate rows shadowing CSV data (version 4)...")
+            try:
+                self.conn.execute("""
+                    DELETE FROM matches
+                    WHERE tourney_id = 'SCRAPED'
+                      AND rowid IN (
+                        SELECT scraped.rowid
+                        FROM matches scraped
+                        JOIN matches csv
+                          ON SUBSTR(csv.tourney_date, 1, 4) = SUBSTR(scraped.tourney_date, 1, 4)
+                         AND LOWER(csv.tourney_name) = LOWER(scraped.tourney_name)
+                         AND csv.round = scraped.round
+                         AND csv.winner_name = scraped.winner_name
+                         AND csv.loser_name  = scraped.loser_name
+                         AND csv.tourney_id != 'SCRAPED'
+                        WHERE scraped.tourney_id = 'SCRAPED'
+                      )
+                """)
+                self.conn.execute("PRAGMA user_version = 4")
+                self.conn.commit()
+                logger.info("Duplicate cleanup complete.")
+            except Exception as exc:
+                logger.warning("Duplicate cleanup failed: %s", exc)
 
     def has_data(self, tour="atp"):
         """Return True if this tour already has matches imported."""
@@ -666,6 +693,28 @@ class TennisDatabase:
             matches.to_sql("matches", self.conn, if_exists="append", index=False,
                            method="multi", chunksize=_chunk)
             logger.info("Imported %d matches", len(matches))
+            # Remove any SCRAPED rows that now duplicate the freshly-imported CSV
+            # rows (same year + tourney_name + round + winner + loser).  This keeps
+            # the DB clean after every CSV refresh without a one-time migration.
+            deleted = self.conn.execute("""
+                DELETE FROM matches
+                WHERE tourney_id = 'SCRAPED' AND tour = ?
+                  AND rowid IN (
+                    SELECT scraped.rowid
+                    FROM matches scraped
+                    JOIN matches csv
+                      ON SUBSTR(csv.tourney_date, 1, 4) = SUBSTR(scraped.tourney_date, 1, 4)
+                     AND LOWER(csv.tourney_name) = LOWER(scraped.tourney_name)
+                     AND csv.round = scraped.round
+                     AND csv.winner_name = scraped.winner_name
+                     AND csv.loser_name  = scraped.loser_name
+                     AND csv.tourney_id != 'SCRAPED' AND csv.tour = ?
+                    WHERE scraped.tourney_id = 'SCRAPED' AND scraped.tour = ?
+                  )
+            """, (tour, tour, tour))
+            n_deleted = self.conn.execute("SELECT changes()").fetchone()[0]
+            if n_deleted:
+                logger.info("Removed %d SCRAPED rows duplicating CSV data", n_deleted)
 
         if progress_callback:
             progress_callback(2, 4, "Loading doubles...")
@@ -2306,7 +2355,7 @@ class TennisDatabase:
                     SELECT s.rowid
                     FROM {staging_name} s
                     JOIN matches m
-                      ON m.tourney_date = s.tourney_date
+                      ON SUBSTR(m.tourney_date, 1, 4) = SUBSTR(s.tourney_date, 1, 4)
                      AND m.winner_name = s.winner_name
                      AND m.loser_name = s.loser_name
                      AND LOWER(m.tourney_name) = LOWER(s.tourney_name)
