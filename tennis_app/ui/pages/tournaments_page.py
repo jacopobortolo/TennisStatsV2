@@ -224,6 +224,7 @@ class TournamentsPage(QWidget):
                 self.year_combo.setCurrentIndex(idx)
             self.year_combo.blockSignals(False)
             self.search_bar.set_text(tourney_name)
+            self._auto_select = True
             self._search(tourney_name)
         else:
             self.year_combo.blockSignals(False)
@@ -281,6 +282,10 @@ class TournamentsPage(QWidget):
                     t.get("tourney_level", ""), t.get("tourney_level", "")),
             ])
         self.tourney_table.populate(rows)
+
+        if getattr(self, "_auto_select", False) and rows:
+            self._auto_select = False
+            self._on_tourney_select(0, 0)
 
     def _on_tourney_select(self, row, col):
         tourney_name = self._tourney_cache.get(row)
