@@ -26,6 +26,7 @@ jobs:
     timeout-minutes: 350
 
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
       TURSO_AUTH_TOKEN:   ${{ secrets.TURSO_AUTH_TOKEN }}
       TURSO_LOCAL_PATH:   ${{ github.workspace }}/replica.db

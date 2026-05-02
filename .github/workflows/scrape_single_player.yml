@@ -34,6 +34,7 @@ jobs:
     timeout-minutes: 30
 
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
       TURSO_AUTH_TOKEN:   ${{ secrets.TURSO_AUTH_TOKEN }}
 
