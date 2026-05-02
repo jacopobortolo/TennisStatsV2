@@ -249,6 +249,17 @@ class MainWindow(QMainWindow):
         page = cls(self.db)
         self._pages[key] = page
         self.stack.addWidget(page)
+        if key == "matches" and hasattr(page, "navigate_to_tournament"):
+            page.navigate_to_tournament.connect(self._on_navigate_to_tournament)
+
+    def _on_navigate_to_tournament(self, tourney_name: str, year_str: str,
+                                   tour: str):
+        """Called when user double-clicks a tournament in the Matches page."""
+        self._ensure_page("tournaments")
+        tourney_page = self._pages.get("tournaments")
+        if tourney_page and hasattr(tourney_page, "navigate_to"):
+            tourney_page.navigate_to(tourney_name, year_str, tour)
+        self._switch_page("tournaments")
 
     def _switch_page(self, key):
         self._ensure_page(key)

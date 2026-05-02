@@ -104,6 +104,7 @@ class TournamentsPage(QWidget):
         self._years_worker = None
         self._first_show = True
         self._pending_query = None  # query string to apply after list loads
+        self._pending_nav = None    # (tourney_name, year_str) set by navigate_to()
         self._build_ui()
 
     def showEvent(self, event):
@@ -190,7 +191,13 @@ class TournamentsPage(QWidget):
 
         layout.addWidget(splitter, 1)
 
-    def _on_tour_change(self, _=None):
+    def navigate_to(self, tourney_name: str, year_str: str, tour: str):
+        """Switch to this tour+year and search for tourney_name."""
+        self._first_show = False  # prevent showEvent from triggering a second load
+        tour_label = "ATP" if tour.lower() == "atp" else "WTA"
+        self.tour_pills.set_value(tour_label)  # silent — no changed signal
+        self._pending_nav = (tourney_name, year_str)
+        self._on_tour_change()  # loads years, then applies _pending_nav
         tour = self.tour_pills.value().lower()
         if self._years_worker and self._years_worker.isRunning():
             self._years_worker.quit()
@@ -206,8 +213,18 @@ class TournamentsPage(QWidget):
         self.year_combo.clear()
         self.year_combo.addItem("All")
         self.year_combo.addItems([str(y) for y in years_sorted])
-        self.year_combo.blockSignals(False)
-        self._search()
+        if self._pending_nav:
+            tourney_name, year_str = self._pending_nav
+            self._pending_nav = None
+            idx = self.year_combo.findText(year_str)
+            if idx >= 0:
+                self.year_combo.setCurrentIndex(idx)
+            self.year_combo.blockSignals(False)
+            self.search_bar.set_text(tourney_name)
+            self._search(tourney_name)
+        else:
+            self.year_combo.blockSignals(False)
+            self._search()
 
     def _search(self, query: str = ""):
         year_text = self.year_combo.currentText()

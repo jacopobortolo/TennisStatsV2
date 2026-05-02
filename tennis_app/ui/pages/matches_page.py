@@ -67,6 +67,10 @@ class _MatchesWorker(QThread):
 class MatchesPage(QWidget):
     """Page for browsing match history with filters and pagination."""
 
+    # Emitted when the user double-clicks a tournament cell;
+    # carries (tourney_name, year_str, tour)
+    navigate_to_tournament = Signal(str, str, str)
+
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
@@ -156,6 +160,9 @@ class MatchesPage(QWidget):
         self.rank_pills = PillButtonGroup(
             ["All", "Top 5", "Top 10", "Top 20", "Top 50", "Top 100"])
         rank_row.addWidget(self.rank_pills)
+        self.wl_label = QLabel("")
+        self.wl_label.setObjectName("dimLabel")
+        rank_row.addWidget(self.wl_label)
         rank_row.addStretch()
         layout.addLayout(rank_row)
 
@@ -340,6 +347,27 @@ class MatchesPage(QWidget):
 
     def _display_page(self):
         filtered = self._get_filtered_matches()
+
+        # --- W-L record label ---
+        _pid = str(self._current_player_id or "")
+        _pname = (self._current_player or "").replace("-", " ").strip().lower()
+        wins = losses = 0
+        for m in filtered:
+            wid = str(m.get("winner_id") or "")
+            if _pid and wid:
+                is_win = wid == _pid
+            else:
+                wname = (m.get("winner_name") or "").replace("-", " ").strip().lower()
+                is_win = wname == _pname
+            if is_win:
+                wins += 1
+            else:
+                losses += 1
+        if filtered:
+            self.wl_label.setText(f"  {wins}W – {losses}L")
+        else:
+            self.wl_label.setText("")
+
         if not filtered:
             self.table.setRowCount(0)
             self.status_label.setText("No matches found")
@@ -434,6 +462,14 @@ class MatchesPage(QWidget):
             abs_row = row
         if 0 <= abs_row < len(filtered):
             match = filtered[abs_row]
+            # Column 1 = Tournament → navigate to Tournaments tab
+            if index.column() == 1:
+                tourney_name = match.get("tourney_name", "")
+                date_str = str(match.get("tourney_date", ""))
+                year_str = date_str[:4] if len(date_str) >= 4 else ""
+                tour = match.get("tour", "")
+                self.navigate_to_tournament.emit(tourney_name, year_str, tour)
+                return
             dlg = MatchDetailDialog(self.db, match, parent=self)
             dlg.exec()
 
