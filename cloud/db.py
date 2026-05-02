@@ -31,6 +31,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -123,21 +124,39 @@ class RemoteConnection:
         self.row_factory = None  # ignored; rows are tuples
 
     def execute(self, sql, params=()):
-        try:
-            if params:
-                result = self._client.execute(sql, list(params))
-            else:
-                result = self._client.execute(sql)
-        except KeyError:
-            # libsql-client 0.3.x has a bug where it raises KeyError('result')
-            # when the server responds with an error.  Re-raise as a generic
-            # sqlite3.OperationalError so existing try/except blocks in
-            # database.py (which catch sqlite3.OperationalError on duplicate
-            # ALTER TABLE columns, etc.) work as expected.
-            raise sqlite3.OperationalError("remote SQL failed (libsql client)")
-        except Exception as exc:
-            raise sqlite3.OperationalError(str(exc)) from exc
-        return _RemoteResultAdapter(result)
+        _RETRYABLE = ("server disconnected", "connection reset", "timed out",
+                      "connection refused", "temporarily unavailable")
+        last_exc = None
+        for attempt in range(4):
+            try:
+                if params:
+                    result = self._client.execute(sql, list(params))
+                else:
+                    result = self._client.execute(sql)
+                return _RemoteResultAdapter(result)
+            except KeyError:
+                raise sqlite3.OperationalError("remote SQL failed (libsql client)")
+            except Exception as exc:
+                msg = str(exc).lower()
+                if any(k in msg for k in _RETRYABLE):
+                    last_exc = exc
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(
+                        "Turso transient error (attempt %d/4): %s — retrying in %ds",
+                        attempt + 1, exc, wait,
+                    )
+                    time.sleep(wait)
+                    # Re-create the client so the broken TCP session is discarded
+                    try:
+                        self._client.close()
+                    except Exception:
+                        pass
+                    import libsql_client
+                    self._client = libsql_client.create_client_sync(
+                        url=_http_url(), auth_token=_auth_token())
+                else:
+                    raise sqlite3.OperationalError(str(exc)) from exc
+        raise sqlite3.OperationalError(str(last_exc)) from last_exc
 
     def cursor(self):
         # TennisDatabase code calls conn.cursor().executescript(...) etc.
