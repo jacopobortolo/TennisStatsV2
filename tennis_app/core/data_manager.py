@@ -330,7 +330,7 @@ def scrape_player_matches(player_name, min_year=None, tour="atp",
     scraper = _get_scraper()
     raw = scraper.fetch_player_matches(player_name, tour=tour)
     if raw is None:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), None, None
 
     # Extract last match date from raw data BEFORE filtering
     last_match_date = None
@@ -834,18 +834,32 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                     non_empty
                     and (changed_matches or not needs_confirmed_activity)
                 )
+                # Player not found on tennisabstract at all: both
+                # last_match_date and match_signature are None (set by the
+                # early-return path in scrape_player_matches when raw is None).
+                # Store the fingerprint unconditionally so we don't retry the
+                # same player on every run (negative-cache marker).
+                ta_not_found = (
+                    not non_empty and exc is None
+                    and match_signature is None and last_match_date is None
+                )
                 fp_to_store = (fingerprints.get(name)
-                               if confirmed or not had_cache
+                               if confirmed or not had_cache or ta_not_found
                                else None)
                 if db is not None:
-                    db.update_scrape_cache(
-                        name,
-                        len(df) if df is not None else 0,
-                        last_match_date=last_match_date,
-                        match_signature=(match_signature
-                                         if fp_to_store is not None else None),
-                        activity_fingerprint=fp_to_store,
-                    )
+                    try:
+                        db.update_scrape_cache(
+                            name,
+                            len(df) if df is not None else 0,
+                            last_match_date=last_match_date,
+                            match_signature=(match_signature
+                                             if fp_to_store is not None else None),
+                            activity_fingerprint=fp_to_store,
+                        )
+                    except Exception as cache_exc:
+                        logger.warning(
+                            "Could not update scrape cache for %s: %s "
+                            "(will retry next run)", name, cache_exc)
                 if confirmed:
                     all_frames.append(df)
                     scraped_names.append(name)
@@ -855,6 +869,10 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                         "Scraped %d matches for %s, but completed matches "
                         "did not change (fingerprint preserved for retry)",
                         len(df), name)
+                elif ta_not_found:
+                    logger.info(
+                        "Player %s not found on tennisabstract "
+                        "(fingerprint cached to suppress future retries)", name)
                 else:
                     if had_cache:
                         logger.info(
@@ -868,7 +886,10 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
 
     # Commit any fingerprint updates for skipped players
     if db is not None:
-        db.conn.commit()
+        try:
+            db.conn.commit()
+        except Exception as commit_exc:
+            logger.warning("Could not commit fingerprint updates: %s", commit_exc)
 
     combined = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
     return combined, rankings, scraped_names
