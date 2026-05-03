@@ -862,7 +862,10 @@ class TennisDatabase:
                     WHEN 'R64' THEN 6
                     WHEN 'R128' THEN 7
                     WHEN 'RR' THEN 8
-                    ELSE 9
+                    WHEN 'Q3' THEN 9
+                    WHEN 'Q2' THEN 10
+                    WHEN 'Q1' THEN 11
+                    ELSE 12
                 END,
                 match_num DESC
         """
