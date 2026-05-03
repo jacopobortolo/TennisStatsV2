@@ -63,6 +63,15 @@ MATCH_COLUMNS = {
     38: "o_bp_faced",
 }
 
+# Sackmann CSV name → TennisAbstract URL name overrides.
+# Used when the transliteration/spelling on TA differs from the Sackmann name.
+# Key: exact Sackmann full name (as it appears in the players CSV).
+# Value: TennisAbstract URL slug (CamelCase, no spaces).
+TA_NAME_OVERRIDES = {
+    # Sackmann uses "Ludmilla", TA uses "Liudmila"
+    "Ludmilla Samsonova": "LiudmilaSamsonova",
+}
+
 # Map tennisabstract tourney level codes to Sackmann-style codes
 LEVEL_MAP = {
     "G": "G",       # Grand Slam
@@ -172,21 +181,28 @@ class TennisAbstractScraper:
         player_url_name = "".join(
             w.capitalize() for w in player_name.split() if w
         )
-        # Build alternative URL forms.  When the original name contained
-        # hyphens (e.g. "Han-na Chang"), TA may store the player without
-        # any space between the two parts ("HannaChang") rather than
-        # with a capital after the hyphen ("HanNaChang").  Generate
-        # every adjacent-pair-collapsed variant so we can probe both.
-        url_variants = [player_url_name]
-        if "-" in original_name:
-            words = [w for w in player_name.split() if w]
-            for i in range(len(words) - 1):
-                merged = (words[:i]
-                          + [(words[i] + words[i + 1]).capitalize()]
-                          + words[i + 2:])
-                variant = "".join(w.capitalize() for w in merged)
-                if variant and variant not in url_variants:
-                    url_variants.append(variant)
+
+        # Manual overrides: known transliteration mismatches between
+        # Sackmann CSV names and TennisAbstract URL slugs.
+        if original_name in TA_NAME_OVERRIDES:
+            player_url_name = TA_NAME_OVERRIDES[original_name]
+            url_variants = [player_url_name]
+        else:
+            # Build alternative URL forms.  When the original name contained
+            # hyphens (e.g. "Han-na Chang"), TA may store the player without
+            # any space between the two parts ("HannaChang") rather than
+            # with a capital after the hyphen ("HanNaChang").  Generate
+            # every adjacent-pair-collapsed variant so we can probe both.
+            url_variants = [player_url_name]
+            if "-" in original_name:
+                words = [w for w in player_name.split() if w]
+                for i in range(len(words) - 1):
+                    merged = (words[:i]
+                              + [(words[i] + words[i + 1]).capitalize()]
+                              + words[i + 2:])
+                    variant = "".join(w.capitalize() for w in merged)
+                    if variant and variant not in url_variants:
+                        url_variants.append(variant)
 
         all_matches = []
 
