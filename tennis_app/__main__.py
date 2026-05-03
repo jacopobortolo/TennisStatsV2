@@ -22,7 +22,13 @@ def _configure_webengine():
     """Set WebEngine options before QApplication is created."""
     os.environ.setdefault("QT_OPENGL", "software")
     os.environ.setdefault("QT_QUICK_BACKEND", "software")
+    os.environ.setdefault(
+        "QT_LOGGING_RULES",
+        "qt.webenginecontext.debug=false;qt.webenginecontext.warning=false",
+    )
     chromium_flags = [
+        "--disable-logging",
+        "--log-level=3",
         "--disable-gpu",
         "--disable-gpu-compositing",
         "--disable-gpu-rasterization",
@@ -46,7 +52,7 @@ def _ensure_db_initialized():
         from .core.database import TennisDatabase
         db = TennisDatabase()
         db.conn.close()
-        logger.info("Local DB schema ready: %s", db.db_path)
+        logger.debug("Local DB schema ready: %s", db.db_path)
     except Exception as exc:
         logger.warning("Could not pre-initialize local DB: %s", exc)
 
@@ -97,7 +103,7 @@ def _warm_up_webengine(app):
         html = spider_chart(["A", "B", "C"], [10, 20, 30], height=120)
         view.setHtml(html, get_chart_base_url())
         app.processEvents()
-        logger.info("QWebEngine warm-up started")
+        logger.debug("QWebEngine warm-up started")
         return view
     except Exception as exc:
         logger.debug("Could not warm up QWebEngine: %s", exc)

@@ -3129,7 +3129,7 @@ class TennisDatabase:
 
         if rename_pairs or deleted:
             self.conn.commit()
-            logger.info(
+            logger.debug(
                 "Normalized %d matches.player_name spellings; "
                 "deleted %d duplicate match rows",
                 len(rename_pairs), deleted)

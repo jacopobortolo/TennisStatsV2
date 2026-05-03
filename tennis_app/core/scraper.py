@@ -530,18 +530,23 @@ class TennisAbstractScraper:
                 next_tourn = ""
 
                 if source == "OFFICIAL":
-                    # After points (points_idx) there is a rank_diff cell,
-                    # then current_tournament, then previous_tournament.
-                    # Locate the first non-numeric text cell after points.
-                    base = points_idx + 1  # skip rank_diff cell
-                    # Skip any signed-number cells (rank diff etc.)
-                    while base < len(tds) and re.fullmatch(
-                            r"[+\-]?\d+", tds[base].get_text(strip=True) or "x"):
-                        base += 1
-                    if base < len(tds):
-                        current_tourn = tds[base].get_text(strip=True)
-                    if base + 1 < len(tds):
-                        previous_tourn = tds[base + 1].get_text(strip=True)
+                    # OFFICIAL rows contain several empty/sign/numeric cells
+                    # after points before the tournament text.  Skip those
+                    # separators; otherwise top players such as Sinner can get
+                    # an empty fingerprint even when the row says "Madrid W".
+                    tournament_cells = []
+                    for td in tds[points_idx + 1:]:
+                        txt = td.get_text(" ", strip=True)
+                        txt = re.sub(r"\s+", " ", txt).strip()
+                        if not txt:
+                            continue
+                        if re.fullmatch(r"[+\-]?\d+", txt):
+                            continue
+                        tournament_cells.append(txt)
+                    if tournament_cells:
+                        current_tourn = tournament_cells[0]
+                    if len(tournament_cells) > 1:
+                        previous_tourn = tournament_cells[1]
                     next_tourn = current_tourn or previous_tourn
                 else:
                     # LIVE pages: first non-numeric trailing text
