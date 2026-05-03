@@ -60,6 +60,7 @@ NAV_ITEMS = [
     ("⚔️  H2H",          "h2h"),
     ("🏆  Tournaments",  "tournaments"),
     ("📈  Stats",        "stats"),
+    ("🌐  Global",       "global_stats"),
     ("🌍  Nations",      "nations"),
 ]
 
@@ -216,6 +217,7 @@ class MainWindow(QMainWindow):
         from .pages.tournaments_page import TournamentsPage
         from .pages.stats_page import StatsPage
         from .pages.insights_page import InsightsPage
+        from .pages.global_stats_page import GlobalStatsPage
 
         self._page_cls = {
             "player": PlayerPage,
@@ -224,6 +226,7 @@ class MainWindow(QMainWindow):
             "h2h": H2HPage,
             "tournaments": TournamentsPage,
             "stats": StatsPage,
+            "global_stats": GlobalStatsPage,
             "nations": InsightsPage,
         }
 

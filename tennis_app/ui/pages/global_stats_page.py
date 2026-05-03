@@ -1,0 +1,698 @@
+﻿"""
+Global Tennis Stats page.
+
+Catalog-style workspace for global records, tournament-type records,
+milestones, and quirky tennis statistics.  The page exposes the statistic
+registry first; individual rows can later be wired to concrete SQL queries.
+"""
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSpinBox,
+    QListWidget, QListWidgetItem, QSplitter, QFrame, QPushButton,
+    QSizePolicy,
+)
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+
+from ..widgets import DataTable, SearchBar, Separator, PillButtonGroup
+from ..theme import COLORS, FONTS
+from ...core.global_stats_engine import GlobalStatsEngine
+
+
+class _GlobalStatWorker(QThread):
+    """Compute one global-stat leaderboard off the UI thread."""
+
+    data_ready = Signal(str, dict)
+    error = Signal(str, str)
+
+    def __init__(self, db, stat_id, filters, parent=None):
+        super().__init__(parent)
+        self._db = db
+        self._stat_id = stat_id
+        self._filters = dict(filters)
+
+    def run(self):
+        try:
+            result = GlobalStatsEngine(self._db).compute(
+                self._stat_id, self._filters, limit=50)
+            self.data_ready.emit(self._stat_id, result)
+        except Exception as exc:
+            self.error.emit(self._stat_id, str(exc))
+
+
+SECTIONS = [
+    {
+        "title": "Global Records",
+        "description": "Records book for titles, finals, streaks, rounds, ages, rankings, and opponent strength.",
+        "filters": "surface, tournament_level, round, era, min_matches, tour",
+    },
+    {
+        "title": "Tournament Type Stats",
+        "description": "Focused records for Grand Slams, Masters 1000, ATP Finals, Olympics, ATP 500/250, and Challengers.",
+        "filters": "tournament_level, tournament, surface, season, era, round",
+    },
+    {
+        "title": "Player Milestones",
+        "description": "Career paths, fastest-to-X records, longevity, consistency, and season-by-season milestones.",
+        "filters": "player, milestone, season, era, min_matches, tournament_level",
+    },
+    {
+        "title": "Fun Facts",
+        "description": "Reddit-style oddities: home slam splits, specialist indexes, points-vs-match conversion, and unusual streaks.",
+        "filters": "player, surface, tournament, tournament_level, era, min_matches",
+    },
+]
+
+
+def _stat(stat_id, name, category, scope, description, dimensions, formula):
+    return {
+        "stat_id": stat_id,
+        "name": name,
+        "category": category,
+        "scope": scope,
+        "description": description,
+        "dimensions": dimensions,
+        "formula_pseudocode": formula,
+    }
+
+
+STAT_CATALOG = [
+    _stat("most_titles_overall", "Most titles overall", "titles", "career",
+          "Classifica dei giocatori con piu titoli vinti in carriera.",
+          "player, tournament, tournament_level, surface, season, era",
+          "SELECT winner_name, COUNT(*) FROM matches WHERE round='F' GROUP BY winner_name ORDER BY COUNT(*) DESC"),
+    _stat("most_titles_by_level", "Most titles by level", "titles", "tournament_type",
+          "Titoli vinti per livello: GS, M1000, ATPF, 500, 250, Olympics.",
+          "player, tournament_level, tournament, surface, season, era",
+          "filter finals by tournament_level; count titles per winner_name, tournament_level"),
+    _stat("most_titles_by_surface", "Most titles by surface", "titles", "surface",
+          "Titoli vinti separati per superficie.",
+          "player, surface, tournament_level, season, era",
+          "filter round='F'; group by winner_name, surface"),
+    _stat("title_streak_overall", "Longest title streak", "titles", "all_time",
+          "Serie piu lunga di tornei consecutivi vinti dal giocatore tra quelli disputati.",
+          "player, tournament, tournament_level, surface, season, era",
+          "build player tournament results ordered by date; count consecutive champion results"),
+    _stat("title_streak_by_level", "Longest title streak by level", "titles", "tournament_type",
+          "Serie piu lunga di titoli consecutivi nello stesso livello di torneo.",
+          "player, tournament_level, season, era",
+          "build title_streak where tournament_level = selected_level"),
+    _stat("most_finals_overall", "Most finals reached", "titles", "career",
+          "Finali raggiunte in carriera, includendo finali vinte e perse.",
+          "player, tournament, tournament_level, surface, season, era",
+          "SELECT player, COUNT(*) FROM finalists(round='F') GROUP BY player"),
+    _stat("most_sf_qf_overall", "Most SF/QF reached", "rounds", "career",
+          "Presenze in semifinali o quarti, filtrabili per livello e superficie.",
+          "player, round, tournament_level, surface, season, era",
+          "count player tournaments where best_round_rank <= selected_round_rank"),
+    _stat("finals_win_pct", "Finals win percentage", "titles", "career",
+          "Percentuale di finali vinte con soglia minima di finali giocate.",
+          "player, tournament_level, surface, era, min_matches",
+          "titles / finals_reached where finals_reached >= min_matches"),
+    _stat("slam_boxset", "Career Grand Slam boxset", "titles", "tournament_type",
+          "Giocatori che hanno vinto Australian Open, Roland Garros, Wimbledon e US Open.",
+          "player, tournament, tournament_level, era",
+          "find winners with COUNT(DISTINCT slam_name)=4"),
+    _stat("golden_masters", "Career Golden Masters", "titles", "tournament_type",
+          "Giocatori che hanno vinto tutti i Masters 1000 attivi nel set selezionato.",
+          "player, tournament, tournament_level, era",
+          "find winners where DISTINCT m1000_tournament_count = required_m1000_count"),
+    _stat("win_streak_overall", "Longest win streak", "streaks", "all_time",
+          "Striscia piu lunga di vittorie consecutive in partite ATP/WTA.",
+          "player, tournament_level, surface, season, era",
+          "order matches by date; increment streak on win, reset on loss"),
+    _stat("win_streak_by_level", "Longest win streak by level", "streaks", "tournament_type",
+          "Striscia di vittorie consecutive filtrata per GS, M1000, 500, 250 o Finals.",
+          "player, tournament_level, season, era",
+          "apply tournament_level filter before streak calculation"),
+    _stat("win_streak_by_surface", "Longest win streak by surface", "streaks", "surface",
+          "Serie piu lunga di vittorie consecutive su una superficie.",
+          "player, surface, tournament_level, season, era",
+          "apply surface filter before streak calculation"),
+    _stat("round_streak_slam_sf_f", "Consecutive Slam SF/F", "rounds", "round",
+          "Numero massimo di Slam consecutivi con almeno SF o finale raggiunta.",
+          "player, tournament_level, round, season, era",
+          "build slam appearances ordered by slam_date; count consecutive best_round <= SF/F"),
+    _stat("round_streak_m1000_sf_f", "Consecutive Masters SF/F", "rounds", "round",
+          "Serie di Masters 1000 consecutivi con almeno SF o finale.",
+          "player, tournament_level, round, season, era",
+          "same as round_streak_slam_sf_f where tournament_level='M'"),
+    _stat("deep_run_streak", "Consecutive deep runs", "rounds", "career",
+          "Tornei consecutivi con almeno QF/SF raggiunta.",
+          "player, round, tournament_level, surface, season, era",
+          "order player tournament results; count consecutive best_round <= threshold_round"),
+    _stat("most_entries_by_level", "Most entries by level", "participation", "tournament_type",
+          "Partecipazioni totali in un livello di torneo.",
+          "player, tournament_level, season, era",
+          "COUNT(DISTINCT tourney_id, year) per player filtered by tournament_level"),
+    _stat("most_matches_won_by_level", "Most wins by level", "wins", "tournament_type",
+          "Partite vinte in un livello specifico, per esempio Grand Slam o Masters 1000.",
+          "player, tournament_level, surface, season, era",
+          "COUNT(*) where winner_name=player and tournament_level=selected_level"),
+    _stat("best_win_pct_by_level", "Best win percentage by level", "wins", "tournament_type",
+          "Miglior win% per livello con soglia minima di match.",
+          "player, tournament_level, surface, era, min_matches",
+          "wins / matches where matches >= min_matches grouped by player"),
+    _stat("longest_gap_between_titles", "Longest gap between titles", "titles", "career",
+          "Intervallo piu lungo tra due titoli dello stesso giocatore.",
+          "player, tournament_level, surface, season, era",
+          "sort title dates per player; compute max(date_n - date_n_minus_1)"),
+    _stat("seasons_with_title", "Seasons with a title", "titles", "season",
+          "Numero di stagioni diverse con almeno un titolo.",
+          "player, season, tournament_level, surface, era",
+          "COUNT(DISTINCT season) from finals won grouped by winner_name"),
+    _stat("consecutive_seasons_with_title", "Consecutive title seasons", "titles", "season",
+          "Serie piu lunga di stagioni consecutive con almeno un titolo.",
+          "player, season, tournament_level, surface, era",
+          "build seasons_with_title per player; count consecutive years"),
+    _stat("youngest_title_winner", "Youngest title winner", "age", "tournament_type",
+          "Vincitore piu giovane di un titolo, filtrabile per livello.",
+          "player, tournament_level, tournament, surface, season, era",
+          "join players dob; age_on(final_date); MIN(age) among finals winners"),
+    _stat("oldest_title_winner", "Oldest title winner", "age", "tournament_type",
+          "Vincitore piu anziano di un titolo, filtrabile per livello.",
+          "player, tournament_level, tournament, surface, season, era",
+          "join players dob; age_on(final_date); MAX(age) among finals winners"),
+    _stat("youngest_main_draw_player", "Youngest main draw player", "age", "all_time",
+          "Giocatore piu giovane apparso nel main draw.",
+          "player, tournament_level, tournament, surface, season, era",
+          "age_on(first_main_draw_match_date); exclude qualifying rounds"),
+    _stat("oldest_main_draw_player", "Oldest main draw player", "age", "all_time",
+          "Giocatore piu anziano apparso nel main draw.",
+          "player, tournament_level, tournament, surface, season, era",
+          "age_on(last_main_draw_match_date); exclude qualifying rounds"),
+    _stat("career_length", "Career length", "age", "career",
+          "Durata tra primo e ultimo match registrato.",
+          "player, tournament_level, surface, era",
+          "MAX(match_date) - MIN(match_date) grouped by player"),
+    _stat("wins_vs_top10", "Wins vs Top 10", "opponent", "career",
+          "Vittorie contro avversari classificati top 10 al momento del match.",
+          "player, opponent_rank, tournament_level, surface, season, era",
+          "COUNT(*) where winner=player and loser_rank <= 10"),
+    _stat("win_pct_vs_top10", "Win percentage vs Top 10", "opponent", "career",
+          "Win% contro top 10 con soglia minima di match.",
+          "player, opponent_rank, tournament_level, surface, era, min_matches",
+          "wins_vs_top10 / matches_vs_top10 where matches_vs_top10 >= min_matches"),
+    _stat("wins_vs_top5", "Wins vs Top 5", "opponent", "career",
+          "Vittorie contro top 5.",
+          "player, opponent_rank, tournament_level, surface, season, era",
+          "COUNT(*) where winner=player and loser_rank <= 5"),
+    _stat("wins_vs_top3", "Wins vs Top 3", "opponent", "career",
+          "Vittorie contro top 3.",
+          "player, opponent_rank, tournament_level, surface, season, era",
+          "COUNT(*) where winner=player and loser_rank <= 3"),
+    _stat("best_win_pct_vs_top10", "Best win percentage vs Top 10", "opponent", "career",
+          "Miglior percentuale vittorie contro top 10 con soglia minima.",
+          "player, opponent_rank, tournament_level, surface, era, min_matches",
+          "rank win_pct_vs_top10 where matches_vs_top10 >= min_matches"),
+    _stat("best_record_as_top1", "Best record as No. 1", "ranking", "career",
+          "Record W-L e win% quando il giocatore era numero 1.",
+          "player, player_rank, tournament_level, surface, season, era",
+          "matches where player_rank=1; compute wins, losses, win_pct"),
+    _stat("streak_weeks_at_no1", "Consecutive weeks at No. 1", "ranking", "all_time",
+          "Serie piu lunga di settimane consecutive al numero 1.",
+          "player, ranking_date, season, era",
+          "order ranking weeks; count consecutive rows where rank=1"),
+    _stat("streak_weeks_top10", "Consecutive weeks in Top 10", "ranking", "all_time",
+          "Serie piu lunga di settimane consecutive in top 10.",
+          "player, ranking_date, season, era",
+          "order ranking weeks; count consecutive rows where rank <= 10"),
+    _stat("career_win_pct_overall", "Career match win percentage", "wins", "career",
+          "Percentuale vittorie match in carriera.",
+          "player, tournament_level, surface, season, era, min_matches",
+          "wins / total_matches grouped by player where total_matches >= min_matches"),
+    _stat("career_points_pct_big3_style", "Career points won percentage", "performance", "career",
+          "Percentuale punti vinti in carriera quando i dati punto/serve sono disponibili.",
+          "player, tournament_level, surface, season, era, min_matches",
+          "SUM(points_won) / SUM(total_points) from extended_stats grouped by player"),
+    _stat("surface_specialist_index", "Surface specialist index", "performance", "surface",
+          "Differenza tra win% su una superficie e win% complessiva del giocatore.",
+          "player, surface, tournament_level, era, min_matches",
+          "surface_win_pct - overall_win_pct where surface_matches >= min_matches"),
+    _stat("slam_dominance_index", "Slam dominance index", "performance", "tournament_type",
+          "Indice di dominanza in uno Slam specifico: titoli, finali, win%, set dominance.",
+          "player, tournament, tournament_level, surface, era, min_matches",
+          "weighted_score(titles, finals, win_pct, straight_set_win_pct) per slam"),
+    _stat("fastest_to_100_wins", "Fastest to 100 wins", "milestone", "career",
+          "Giocatori che raggiungono 100 vittorie nel minor numero di match giocati.",
+          "player, milestone, tournament_level, surface, era",
+          "order matches per player; find match_index where cumulative_wins = 100"),
+    _stat("fastest_to_50_wins", "Fastest to 50 wins", "milestone", "career",
+          "Versione 50 vittorie, utile per confrontare inizi carriera.",
+          "player, milestone, tournament_level, surface, era",
+          "find match_index where cumulative_wins = 50"),
+    _stat("fastest_to_150_wins", "Fastest to 150 wins", "milestone", "career",
+          "Versione 150 vittorie, piu stabile per confronti storici.",
+          "player, milestone, tournament_level, surface, era",
+          "find match_index where cumulative_wins = 150"),
+    _stat("most_wins_after_n_matches", "Most wins after N matches", "milestone", "career",
+          "Numero massimo di vittorie dopo N match di carriera.",
+          "player, milestone, tournament_level, surface, era",
+          "take first N matches per player; count wins"),
+    _stat("home_slam_performance", "Home Slam performance", "fun", "tournament_type",
+          "Rendimento nello Slam di casa rispetto agli altri Slam.",
+          "player, tournament, tournament_level, country, era, min_matches",
+          "map player_ioc to home_slam; compare home_slam_win_pct vs other_slam_win_pct"),
+    _stat("aces_milestones", "Aces milestones", "milestone", "career",
+          "Giocatori che raggiungono soglie di ace come 1000, 5000 o 10000.",
+          "player, milestone, tournament_level, surface, season, era",
+          "cumulative SUM(aces) by match; find first date crossing milestone"),
+    _stat("most_bagels_given", "Most bagels given", "fun", "career",
+          "Giocatori con piu set vinti 6-0.",
+          "player, tournament_level, surface, season, era",
+          "parse score; count sets where player_games=6 and opponent_games=0"),
+    _stat("most_bagels_received", "Most bagels received", "fun", "career",
+          "Giocatori con piu set persi 0-6.",
+          "player, tournament_level, surface, season, era",
+          "parse score; count sets where player_games=0 and opponent_games=6"),
+    _stat("five_set_win_pct", "Five-set win percentage", "performance", "round",
+          "Miglior win% nei match al quinto set con soglia minima.",
+          "player, tournament_level, round, surface, era, min_matches",
+          "filter total_sets=5; wins / matches grouped by player"),
+    _stat("deciding_set_win_pct", "Deciding-set win percentage", "performance", "round",
+          "Miglior win% nei match arrivati al set decisivo.",
+          "player, tournament_level, round, surface, era, min_matches",
+          "filter deciding_set=true; wins / matches grouped by player"),
+    _stat("tie_break_win_pct", "Tiebreak win percentage", "performance", "career",
+          "Percentuale tiebreak vinti con soglia minima di tiebreak giocati.",
+          "player, tournament_level, surface, season, era, min_matches",
+          "parse score; tiebreaks_won / tiebreaks_played grouped by player"),
+    _stat("qualifying_to_title_runs", "Qualifying to title runs", "fun", "tournament_type",
+          "Titoli vinti partendo dalle qualificazioni.",
+          "player, tournament, tournament_level, surface, season, era",
+          "find champions with same event qualifying wins before main draw"),
+    _stat("lucky_loser_deep_runs", "Lucky loser deep runs", "fun", "tournament_type",
+          "Migliori risultati ottenuti da lucky loser, se il dato e disponibile.",
+          "player, tournament, tournament_level, round, season, era",
+          "filter entry='LL'; rank by best_round"),
+    _stat("same_tournament_title_streak", "Same tournament title streak", "titles", "tournament_type",
+          "Titoli consecutivi nello stesso torneo.",
+          "player, tournament, tournament_level, surface, season, era",
+          "group titles by player,tournament; count consecutive seasons"),
+    _stat("most_wins_at_single_tournament", "Most wins at one tournament", "wins", "tournament_type",
+          "Numero massimo di vittorie in un singolo torneo.",
+          "player, tournament, tournament_level, surface, era",
+          "COUNT(wins) grouped by player,tournament"),
+    _stat("best_single_season_win_pct", "Best single-season win percentage", "season", "season",
+          "Miglior win% in una stagione con soglia minima di match.",
+          "player, season, tournament_level, surface, era, min_matches",
+          "wins / matches grouped by player,season where matches >= min_matches"),
+    _stat("most_titles_single_season", "Most titles in a season", "titles", "season",
+          "Numero massimo di titoli vinti in una singola stagione.",
+          "player, season, tournament_level, surface, era",
+          "COUNT(final wins) grouped by player,season"),
+    _stat("most_finals_single_season", "Most finals in a season", "titles", "season",
+          "Numero massimo di finali raggiunte in una stagione.",
+          "player, season, tournament_level, surface, era",
+          "COUNT(final appearances) grouped by player,season"),
+    _stat("top10_wins_single_season", "Top 10 wins in a season", "opponent", "season",
+          "Vittorie contro top 10 in una singola stagione.",
+          "player, opponent_rank, season, tournament_level, surface, era",
+          "COUNT(*) where winner=player and loser_rank <= 10 grouped by player,season"),
+    _stat("upset_wins_by_rank_gap", "Biggest upset wins by rank gap", "ranking", "all_time",
+          "Vittorie con maggiore differenza ranking tra vincitore e sconfitto.",
+          "player, opponent_rank, player_rank, tournament_level, surface, era",
+          "rank_gap = winner_rank - loser_rank; keep winner_rank > loser_rank; order DESC"),
+    _stat("losses_from_match_points", "Losses from match points", "fun", "career",
+          "Sconfitte dopo match point avuti, se i dati punto-per-punto sono disponibili.",
+          "player, tournament_level, surface, season, era",
+          "from point_by_point; detect player had match_point before losing match"),
+    _stat("straight_set_title_runs", "Straight-set title runs", "performance", "tournament_type",
+          "Titoli vinti senza perdere set nel torneo.",
+          "player, tournament, tournament_level, surface, season, era",
+          "for champion tournament run, verify sets_lost=0 across all matches"),
+    _stat("no_tiebreak_title_runs", "No-tiebreak title runs", "fun", "tournament_type",
+          "Titoli vinti senza giocare tiebreak nel torneo.",
+          "player, tournament, tournament_level, surface, season, era",
+          "for champion tournament run, verify tiebreaks_played=0"),
+]
+
+
+CATEGORY_GROUPS = {
+    "All": None,
+    "Titles": {"titles"},
+    "Wins": {"wins", "performance"},
+    "Streaks": {"streaks", "rounds"},
+    "Rankings": {"ranking", "opponent"},
+    "Ages": {"age"},
+    "Milestones": {"milestone", "participation", "season"},
+    "Fun": {"fun"},
+}
+
+
+class GlobalStatsPage(QWidget):
+    """Simple records browser for global tennis leaderboards."""
+
+    _RESULT_COLUMNS = [
+        ("Rank", 64),
+        ("Player", 220),
+        ("Value", 120),
+        ("Detail", 420),
+    ]
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self._category = "All"
+        self._filtered_stats = []
+        self._current_stat = None
+        self._worker = None
+        self._compute_timer = QTimer(self)
+        self._compute_timer.setSingleShot(True)
+        self._compute_timer.setInterval(180)
+        self._compute_timer.timeout.connect(self._load_current_stat)
+        self._build_ui()
+        self._apply_filters()
+
+    def _build_ui(self):
+        self.setStyleSheet(self._page_stylesheet())
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 18, 22, 20)
+        root.setSpacing(12)
+
+        header = QFrame()
+        header.setObjectName("globalHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(18, 16, 18, 16)
+        header_layout.setSpacing(16)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(4)
+        header_title = QLabel("Global Tennis Stats")
+        header_title.setObjectName("titleLabel")
+        title_box.addWidget(header_title)
+
+        subtitle = QLabel("Records, rankings and milestones in one clean leaderboard view")
+        subtitle.setObjectName("dimLabel")
+        title_box.addWidget(subtitle)
+        header_layout.addLayout(title_box, 1)
+
+        self.summary_label = QLabel()
+        self.summary_label.setObjectName("globalSummary")
+        self.summary_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        header_layout.addWidget(self.summary_label)
+        root.addWidget(header)
+
+        category_row = QHBoxLayout()
+        category_row.setSpacing(10)
+        category_row.addWidget(self._label("Category"))
+        self.category_pills = PillButtonGroup(list(CATEGORY_GROUPS.keys()), "All")
+        self.category_pills.changed.connect(self._on_category_changed)
+        category_row.addWidget(self.category_pills, 1)
+        root.addLayout(category_row)
+
+        filters = QFrame()
+        filters.setObjectName("globalFilters")
+        filters_layout = QHBoxLayout(filters)
+        filters_layout.setContentsMargins(12, 10, 12, 10)
+        filters_layout.setSpacing(8)
+
+        self.search_bar = SearchBar("Search records...")
+        self.search_bar.searched.connect(lambda _: self._apply_filters())
+        self.search_bar.line_edit.textChanged.connect(lambda _: self._apply_filters())
+        filters_layout.addWidget(self.search_bar, 2)
+
+        self.tour_combo = self._combo(["All", "ATP", "WTA"])
+        self.level_combo = self._combo(["All", "Grand Slam", "Masters 1000", "ATP Finals",
+                                        "Olympics", "ATP 500", "ATP 250", "Challenger"])
+        self.surface_combo = self._combo(["All", "Hard", "Clay", "Grass", "Carpet"])
+        self.era_combo = self._combo(["All-time", "Open Era", "2000s", "2010s", "2020s"])
+        self.round_combo = self._combo(["All", "F", "SF", "QF", "R16", "R32", "R64", "R128", "RR", "Q3", "Q2", "Q1"])
+
+        for label, combo in [
+                ("Tour", self.tour_combo),
+                ("Level", self.level_combo),
+                ("Surface", self.surface_combo),
+                ("Era", self.era_combo),
+                ("Round", self.round_combo)]:
+            filters_layout.addWidget(self._label(label))
+            filters_layout.addWidget(combo)
+
+        filters_layout.addWidget(self._label("Min"))
+        self.min_matches = QSpinBox()
+        self.min_matches.setRange(0, 500)
+        self.min_matches.setSingleStep(5)
+        self.min_matches.setValue(20)
+        self.min_matches.valueChanged.connect(lambda _: self._on_filter_changed())
+        filters_layout.addWidget(self.min_matches)
+
+        self.load_btn = QPushButton("Refresh")
+        self.load_btn.setObjectName("accentBtn")
+        self.load_btn.clicked.connect(self._load_current_stat)
+        filters_layout.addWidget(self.load_btn)
+        root.addWidget(filters)
+
+        root.addWidget(Separator())
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        root.addWidget(splitter, 1)
+
+        list_panel = QFrame()
+        list_panel.setObjectName("recordListPanel")
+        list_layout = QVBoxLayout(list_panel)
+        list_layout.setContentsMargins(12, 12, 12, 12)
+        list_layout.setSpacing(8)
+
+        records_label = QLabel("Records")
+        records_label.setObjectName("sectionLabel")
+        list_layout.addWidget(records_label)
+
+        self.stat_count_label = QLabel()
+        self.stat_count_label.setObjectName("dimLabel")
+        list_layout.addWidget(self.stat_count_label)
+
+        self.stat_list = QListWidget()
+        self.stat_list.setObjectName("globalStatList")
+        self.stat_list.currentRowChanged.connect(self._on_stat_selected)
+        list_layout.addWidget(self.stat_list, 1)
+        splitter.addWidget(list_panel)
+
+        leaderboard = QWidget()
+        leaderboard_layout = QVBoxLayout(leaderboard)
+        leaderboard_layout.setContentsMargins(14, 0, 0, 0)
+        leaderboard_layout.setSpacing(10)
+
+        info_panel = QFrame()
+        info_panel.setObjectName("leaderInfoPanel")
+        info_layout = QVBoxLayout(info_panel)
+        info_layout.setContentsMargins(16, 13, 16, 13)
+        info_layout.setSpacing(6)
+
+        self.detail_title = QLabel("Select a record")
+        self.detail_title.setObjectName("recordTitle")
+        self.detail_title.setWordWrap(True)
+        info_layout.addWidget(self.detail_title)
+
+        self.detail_description = QLabel("")
+        self.detail_description.setObjectName("dimLabel")
+        self.detail_description.setWordWrap(True)
+        info_layout.addWidget(self.detail_description)
+
+        self.detail_meta = QLabel("")
+        self.detail_meta.setObjectName("recordMeta")
+        self.detail_meta.setWordWrap(True)
+        info_layout.addWidget(self.detail_meta)
+        leaderboard_layout.addWidget(info_panel)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        result_label = QLabel("Leaderboard")
+        result_label.setObjectName("sectionLabel")
+        status_row.addWidget(result_label)
+        status_row.addStretch()
+        self.result_status = QLabel("")
+        self.result_status.setObjectName("dimLabel")
+        self.result_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        status_row.addWidget(self.result_status)
+        leaderboard_layout.addLayout(status_row)
+
+        self.result_table = DataTable(self._RESULT_COLUMNS)
+        self.result_table.setObjectName("globalLeaderboard")
+        self.result_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.result_table.horizontalHeader().setStretchLastSection(True)
+        self.result_table.verticalHeader().setDefaultSectionSize(34)
+        leaderboard_layout.addWidget(self.result_table, 1)
+        splitter.addWidget(leaderboard)
+        splitter.setSizes([340, 920])
+
+    def _page_stylesheet(self):
+        return f"""
+        QFrame#globalHeader, QFrame#globalFilters, QFrame#recordListPanel,
+        QFrame#leaderInfoPanel {{
+            background-color: {COLORS['bg_secondary']};
+            border: 1px solid {COLORS['border']};
+            border-radius: 8px;
+        }}
+        QLabel#globalSummary {{
+            color: {COLORS['accent']};
+            font-size: {FONTS['size_lg']}pt;
+            font-weight: 800;
+            background: transparent;
+        }}
+        QLabel#recordTitle {{
+            color: {COLORS['text']};
+            font-size: {FONTS['size_xl']}pt;
+            font-weight: 800;
+            background: transparent;
+        }}
+        QLabel#recordMeta {{
+            color: {COLORS['accent']};
+            font-size: {FONTS['size_sm']}pt;
+            font-weight: 700;
+            background: transparent;
+        }}
+        QListWidget#globalStatList {{
+            background-color: transparent;
+            border: none;
+            outline: none;
+        }}
+        QListWidget#globalStatList::item {{
+            color: {COLORS['text_dim']};
+            padding: 10px 10px;
+            border-bottom: 1px solid {COLORS['border']};
+        }}
+        QListWidget#globalStatList::item:hover {{
+            background-color: {COLORS['bg_hover']};
+            color: {COLORS['text']};
+        }}
+        QListWidget#globalStatList::item:selected {{
+            background-color: {COLORS['accent_dim']};
+            color: {COLORS['accent']};
+            border-left: 3px solid {COLORS['accent']};
+        }}
+        QTableWidget#globalLeaderboard {{
+            border: 1px solid {COLORS['border']};
+            border-radius: 8px;
+        }}
+        """
+
+    def _combo(self, values):
+        combo = QComboBox()
+        combo.addItems(values)
+        combo.currentIndexChanged.connect(lambda _: self._on_filter_changed())
+        return combo
+
+    def _label(self, text):
+        label = QLabel(text + ":")
+        label.setObjectName("dimLabel")
+        return label
+
+    def _on_category_changed(self, category):
+        self._category = category
+        self._apply_filters()
+
+    def _on_filter_changed(self):
+        self._schedule_compute()
+
+    def _apply_filters(self):
+        query = self.search_bar.text().lower() if hasattr(self, "search_bar") else ""
+        active_categories = CATEGORY_GROUPS.get(self._category)
+        current_id = self._current_stat["stat_id"] if self._current_stat else None
+
+        self._filtered_stats = []
+        self.stat_list.blockSignals(True)
+        self.stat_list.clear()
+        target_row = -1
+        for stat in STAT_CATALOG:
+            haystack = " ".join(str(value) for value in stat.values()).lower()
+            if query and query not in haystack:
+                continue
+            if active_categories and stat["category"] not in active_categories:
+                continue
+            row = len(self._filtered_stats)
+            self._filtered_stats.append(stat)
+            item = QListWidgetItem(stat["name"])
+            item.setData(Qt.UserRole, stat)
+            item.setToolTip(stat["description"])
+            self.stat_list.addItem(item)
+            if stat["stat_id"] == current_id:
+                target_row = row
+        if target_row < 0 and self._filtered_stats:
+            target_row = 0
+        if target_row >= 0:
+            self.stat_list.setCurrentRow(target_row)
+        self.stat_list.blockSignals(False)
+
+        count = len(self._filtered_stats)
+        self.stat_count_label.setText(f"{count} records")
+        self.summary_label.setText(f"{count} records - top 50")
+        if target_row >= 0:
+            self._show_stat(self._filtered_stats[target_row])
+        else:
+            self._show_stat(None)
+
+    def _on_stat_selected(self, row):
+        if 0 <= row < len(self._filtered_stats):
+            self._show_stat(self._filtered_stats[row])
+
+    def _show_stat(self, stat):
+        if not stat:
+            self._current_stat = None
+            self.detail_title.setText("No records found")
+            self.detail_description.setText("Try another category or search term.")
+            self.detail_meta.setText("")
+            self.result_table.populate([])
+            self.result_status.setText("")
+            return
+        self._current_stat = stat
+        self.detail_title.setText(stat["name"])
+        self.detail_description.setText(stat["description"])
+        self.detail_meta.setText(
+            f"{stat['category']} - {stat['scope']} - {stat['stat_id']}")
+        self.result_table.populate([])
+        self._schedule_compute()
+
+    def _current_filters(self):
+        return {
+            "category": self._category,
+            "level": self.level_combo.currentText(),
+            "surface": self.surface_combo.currentText(),
+            "era": self.era_combo.currentText(),
+            "tour": self.tour_combo.currentText(),
+            "round": self.round_combo.currentText(),
+            "min_matches": self.min_matches.value(),
+            "milestone": 150,
+        }
+
+    def _schedule_compute(self):
+        if self._current_stat is None:
+            return
+        self.result_status.setText("Loading...")
+        self._compute_timer.start()
+
+    def _load_current_stat(self):
+        if not self._current_stat:
+            return
+        if self._worker and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(500)
+        stat_id = self._current_stat["stat_id"]
+        self.load_btn.setEnabled(False)
+        self.result_status.setText("Computing...")
+        worker = _GlobalStatWorker(
+            self.db, stat_id, self._current_filters(), parent=self)
+        worker.data_ready.connect(self._on_result_ready)
+        worker.error.connect(self._on_result_error)
+        self._worker = worker
+        worker.start()
+
+    def _on_result_ready(self, stat_id, result):
+        if not self._current_stat or stat_id != self._current_stat["stat_id"]:
+            return
+        self.load_btn.setEnabled(True)
+        rows = result.get("rows") or []
+        self.result_table.populate(rows)
+        note = result.get("note") or ""
+        if note:
+            self.result_status.setText(note)
+        elif rows:
+            self.result_status.setText(f"{len(rows)} rows")
+        else:
+            self.result_status.setText("No results")
+
+    def _on_result_error(self, stat_id, message):
+        if self._current_stat and stat_id == self._current_stat["stat_id"]:
+            self.load_btn.setEnabled(True)
+            self.result_table.populate([])
+            self.result_status.setText(f"Error: {message}")
