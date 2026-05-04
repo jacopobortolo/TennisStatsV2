@@ -12,6 +12,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -311,6 +312,30 @@ def _download_web_snapshot(dest: Path) -> Path:
             tmp.unlink()
 
 
+class WebSnapshotDatabase:
+    def __init__(self, path: Path):
+        from tennis_app.core.database import TennisDatabase
+
+        self._impl = object.__new__(TennisDatabase)
+        self._impl.db_path = path
+        self._impl.conn = sqlite3.connect(str(path), check_same_thread=False)
+        self._impl.conn.row_factory = sqlite3.Row
+        self._impl._write_lock = threading.RLock()
+        self._impl._career_stats_cache = {}
+        self._impl._ranking_history_cache = {}
+        self._impl.conn.execute("PRAGMA synchronous=NORMAL")
+        self._impl.conn.execute("PRAGMA cache_size=-64000")
+        self._impl.conn.execute("PRAGMA temp_store=MEMORY")
+        self._impl.conn.execute("PRAGMA mmap_size=268435456")
+        self._impl.conn.execute("PRAGMA busy_timeout=10000")
+
+    def __getattr__(self, item):
+        return getattr(self._impl, item)
+
+    def close(self) -> None:
+        self._impl.close()
+
+
 def _validate_snapshot(db) -> dict[str, int]:
     counts = _snapshot_counts(db)
     empty_tables = [table for table, count in counts.items() if count <= 0]
@@ -366,15 +391,15 @@ def show_connection_error(exc: Exception) -> None:
         )
     elif "remote turso counts" in message and ("=0" in message or "missing" in message):
         st.info(
-            "The Turso connection works, but the database reached by Streamlit Cloud appears empty or missing the expected tables. "
-            "Check that TURSO_DATABASE_URL is the same database populated by your GitHub Actions scrape job, then reboot and rebuild the snapshot."
+            "The Turso preflight ran. If the remote counts shown above are non-zero, Turso is fine and the local snapshot copy/open failed. "
+            "Deploy the latest web_app/app.py, reboot, then use Rebuild snapshot. If the remote counts are zero or missing, check TURSO_DATABASE_URL."
         )
 
 
 @st.cache_resource(ttl=SNAPSHOT_TTL_SECONDS, show_spinner="Refreshing local data snapshot...")
 def get_db(refresh_token: int = 0, snapshot_action: str = "auto"):
     _apply_streamlit_secrets()
-    from cloud.db import SnapshotTennisDatabase, get_local_replica_path
+    from cloud.db import get_local_replica_path
 
     if snapshot_action == "rebuild":
         _remove_local_snapshot()
@@ -384,7 +409,7 @@ def get_db(refresh_token: int = 0, snapshot_action: str = "auto"):
     if refresh_on_open:
         _download_web_snapshot(path)
 
-    db = SnapshotTennisDatabase(refresh_on_open=False)
+    db = WebSnapshotDatabase(path)
     try:
         _validate_snapshot(db)
     except Exception:
@@ -394,7 +419,7 @@ def get_db(refresh_token: int = 0, snapshot_action: str = "auto"):
             pass
         _remove_local_snapshot()
         _download_web_snapshot(path)
-        db = SnapshotTennisDatabase(refresh_on_open=False)
+        db = WebSnapshotDatabase(path)
         try:
             _validate_snapshot(db)
         except Exception as exc:
