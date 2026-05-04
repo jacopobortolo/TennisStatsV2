@@ -871,17 +871,18 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                     cache_row[1] if cache_row else None, fp)
                 report["activity_statuses"][status] = (
                     report["activity_statuses"].get(status, 0) + 1)
-                if not has_due_upcoming and not activity_changed:
+                if not activity_changed:
                     fingerprints[name] = fp
                     logger.debug("Skipping %s (%s)", name, status)
                     continue
 
-                # Fingerprint indicates a played result OR an upcoming match
-                # is now due.  Confirmation is still handled after the HTTP
-                # scrape by comparing completed-match signatures.
+                # OFFICIAL indicates a played result.  Confirmation is still
+                # handled after the HTTP scrape by comparing completed-match
+                # signatures.  A due upcoming placeholder alone is not enough
+                # here: OFFICIAL current-only text is usually just a scheduled
+                # first round, not a played match.
                 stale.add(name)
-                stale_reasons[name] = (
-                    "due_upcoming" if has_due_upcoming else status)
+                stale_reasons[name] = status
                 fingerprints[name] = fp
         else:
             # Player not found in OFFICIAL: fall back to time-based cache
