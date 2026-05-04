@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .stats_engine import parse_score
 
@@ -188,9 +188,11 @@ class GlobalStatsEngine:
     @staticmethod
     def _event_key(row):
         tourney_id = row.get("tourney_id") or ""
-        if tourney_id:
-            return tourney_id
-        return f"{row.get('tourney_name') or ''}|{row.get('tourney_date') or ''}"
+        return "|".join((
+            tourney_id,
+            row.get("tourney_name") or "",
+            str(row.get("tourney_date") or ""),
+        ))
 
     def _ordered_match_rows(self, filters, include_round=False, forced_level=None):
         local_filters = dict(filters)
@@ -798,51 +800,97 @@ class GlobalStatsEngine:
         return self._ranking_streak(filters, limit, 10)
 
     def _ranking_streak(self, filters, limit, rank_limit):
-        conditions = ["r.rank <= ?"]
-        params = [rank_limit]
+        base_conditions = ["r.ranking_date GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'"]
+        base_params = []
         tour = filters.get("tour")
         if tour and tour != "All":
-            conditions.append("r.tour = ?")
-            params.append(tour.lower())
+            base_conditions.append("r.tour = ?")
+            base_params.append(tour.lower())
         y1, y2 = self._era_years(filters.get("era"))
         if y1:
-            conditions.append("SUBSTR(r.ranking_date,1,4) >= ?")
-            params.append(str(y1))
+            base_conditions.append("SUBSTR(r.ranking_date,1,4) >= ?")
+            base_params.append(str(y1))
         if y2:
-            conditions.append("SUBSTR(r.ranking_date,1,4) <= ?")
-            params.append(str(y2))
+            base_conditions.append("SUBSTR(r.ranking_date,1,4) <= ?")
+            base_params.append(str(y2))
+        base_where = " AND ".join(base_conditions)
+
+        snapshot_rows = self._query(f"""
+            SELECT DISTINCT r.tour, r.ranking_date
+            FROM rankings r
+            WHERE {base_where}
+            ORDER BY r.tour, r.ranking_date
+        """, base_params)
+        dates_by_tour = defaultdict(list)
+        for row in snapshot_rows:
+            try:
+                date = datetime.strptime(str(row["ranking_date"]), "%Y%m%d")
+            except ValueError:
+                continue
+            dates_by_tour[row["tour"]].append(date)
+        date_index = {
+            tour_name: {date: index for index, date in enumerate(dates)}
+            for tour_name, dates in dates_by_tour.items()
+        }
+        next_date = {
+            tour_name: {
+                date: (dates[index + 1] if index + 1 < len(dates) else date + timedelta(days=7))
+                for index, date in enumerate(dates)
+            }
+            for tour_name, dates in dates_by_tour.items()
+        }
+
         rows = self._query(f"""
             SELECT COALESCE(p.name_first || ' ' || p.name_last, r.player_id) AS player,
-                   r.ranking_date
+                   r.player_id, r.tour, r.ranking_date
             FROM rankings r
             LEFT JOIN players p ON p.player_id = r.player_id AND p.tour = r.tour
-            WHERE {' AND '.join(conditions)}
-            ORDER BY player, r.ranking_date
-        """, params)
+            WHERE {base_where} AND r.rank <= ?
+            ORDER BY r.tour, r.player_id, r.ranking_date
+        """, base_params + [rank_limit])
         dates_by_player = defaultdict(list)
+        names_by_key = {}
         for row in rows:
             try:
                 date = datetime.strptime(str(row["ranking_date"]), "%Y%m%d")
             except ValueError:
                 continue
-            dates_by_player[row["player"]].append(date)
+            key = (row["tour"], row["player_id"] or row["player"])
+            names_by_key[key] = row["player"]
+            dates_by_player[key].append(date)
+
         results = []
-        for player, dates in dates_by_player.items():
-            best = cur = 0
-            best_start = start = prev = None
+        for key, dates in dates_by_player.items():
+            tour_name = key[0]
+            indexes = date_index.get(tour_name, {})
+            next_dates = next_date.get(tour_name, {})
+            best_weeks = current_weeks = 0
+            best_start = best_end = start = current_end = prev = None
             for date in dates:
-                if prev is None or (date - prev).days > 10:
-                    cur = 1
+                current_index = indexes.get(date)
+                previous_index = indexes.get(prev) if prev is not None else None
+                if prev is None or current_index is None or previous_index is None or current_index != previous_index + 1:
+                    if current_weeks > best_weeks:
+                        best_weeks = current_weeks
+                        best_start = start
+                        best_end = current_end
+                    current_weeks = 0
                     start = date
-                else:
-                    cur += 1
-                if cur > best:
-                    best = cur
-                    best_start = start
+
+                coverage_end = next_dates.get(date, date + timedelta(days=7))
+                span_weeks = max(1, round((coverage_end - date).days / 7))
+                current_weeks += span_weeks
+                current_end = coverage_end - timedelta(days=1)
                 prev = date
-            if best:
-                end = best_start.strftime("%Y-%m-%d") if best_start else ""
-                results.append((player, best, f"weeks from {end}"))
+
+            if current_weeks > best_weeks:
+                best_weeks = current_weeks
+                best_start = start
+                best_end = current_end
+            if best_weeks:
+                start_text = best_start.strftime("%Y-%m-%d") if best_start else ""
+                end_text = best_end.strftime("%Y-%m-%d") if best_end else ""
+                results.append((names_by_key.get(key, key[1]), best_weeks, f"{start_text} to {end_text}"))
         return sorted(results, key=lambda r: (-r[1], r[0]))[:limit]
 
     # ------------------------------------------------------------------
