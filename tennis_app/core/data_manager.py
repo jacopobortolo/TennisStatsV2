@@ -585,7 +585,8 @@ def _build_ranking_name_map(ranking_names, db, tour="atp"):
 
 def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                                db=None, cache_expire_hours=6, min_year=None,
-                               max_matches_per_player=20):
+                               max_matches_per_player=20,
+                               max_workers=8, return_report=False):
     """
     Scrape matches for the top N ranked players.
 
@@ -601,8 +602,32 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
     per player are kept (default 20). Reduces import work since older
     scraped matches are already in the DB. Set to None for full history.
 
-    Returns (combined_DataFrame, rankings_list, scraped_names_list).
+    Returns (combined_DataFrame, rankings_list, scraped_names_list).  If
+    *return_report* is true, appends a fourth value with scrape counters.
     """
+    report = {
+        "tour": tour,
+        "top_n": top_n,
+        "rankings": 0,
+        "source": None,
+        "stale": 0,
+        "stale_reasons": {},
+        "skipped": 0,
+        "attempted": 0,
+        "confirmed": 0,
+        "ta_lag": 0,
+        "not_found": 0,
+        "empty": 0,
+        "errors": 0,
+        "rows": 0,
+        "confirmed_players": [],
+    }
+
+    def _finish(result):
+        if return_report:
+            return (*result, report)
+        return result
+
     # Use OFFICIAL rankings as primary source (stable ordering by official rank)
     # Fall back to LIVE only if OFFICIAL fails.
     used_official = False
@@ -615,13 +640,15 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
         rankings = scrape_current_rankings(tour)
     if not rankings:
         logger.warning("Could not fetch rankings for scraping")
-        return pd.DataFrame(), [], []
+        return _finish((pd.DataFrame(), [], []))
 
     # Sort by rank to ensure correct top-N selection, then hard-filter
     # by rank value to handle cases where the rank field doesn't match
     # list position (e.g. LIVE ranking projections).
     rankings.sort(key=lambda e: e.get("rank", 9999))
     rankings = [e for e in rankings if e.get("rank", 9999) <= top_n]
+    report["rankings"] = len(rankings)
+    report["source"] = "OFFICIAL" if used_official else "LIVE"
 
     # Resolve ranking display names to full DB names
     name_map = _build_ranking_name_map(
@@ -732,6 +759,10 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
 
     logger.info("Event-driven check: %d/%d players (top %d) need refresh",
                 len(stale), len(player_names), top_n)
+    report["stale"] = len(stale)
+    for reason in stale_reasons.values():
+        report["stale_reasons"][reason] = (
+            report["stale_reasons"].get(reason, 0) + 1)
 
     all_frames = []
     scraped_names = []  # only the players we actually re-scraped
@@ -747,6 +778,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
             if db is not None and fp is not None:
                 skipped_updates.append((fp, name))
             logger.info("Skipping %s (cache still valid)", name)
+            report["skipped"] += 1
             continue
         actual_targets.append((idx, entry))
 
@@ -765,7 +797,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
     # cloudscraper sessions are thread-safe for concurrent GETs; we keep
     # the worker count modest to avoid hammering tennisabstract.com.
     total_to_scrape = len(actual_targets)
-    max_workers = min(8, max(1, total_to_scrape))
+    worker_count = min(max(1, max_workers), max(1, total_to_scrape))
 
     def _fetch_one(entry):
         name = entry["name"]
@@ -778,7 +810,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
             return name, None, None, None, exc
 
     if total_to_scrape > 0:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = {pool.submit(_fetch_one, entry): entry
                        for _, entry in actual_targets}
             for future in as_completed(futures):
@@ -792,7 +824,9 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
 
                 if exc is not None:
                     logger.warning("Failed to scrape %s: %s", name, exc)
+                    report["errors"] += 1
                     continue
+                report["attempted"] += 1
 
                 # Decide whether to persist the new fingerprint.
                 #
@@ -863,17 +897,23 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                 if confirmed:
                     all_frames.append(df)
                     scraped_names.append(name)
+                    report["confirmed"] += 1
+                    report["rows"] += len(df)
+                    report["confirmed_players"].append(name)
                     logger.info("Scraped %d matches for %s", len(df), name)
                 elif non_empty:
+                    report["ta_lag"] += 1
                     logger.info(
                         "Scraped %d matches for %s, but completed matches "
                         "did not change (fingerprint preserved for retry)",
                         len(df), name)
                 elif ta_not_found:
+                    report["not_found"] += 1
                     logger.info(
                         "Player %s not found on tennisabstract "
                         "(fingerprint cached to suppress future retries)", name)
                 else:
+                    report["empty"] += 1
                     if had_cache:
                         logger.info(
                             "No new matches for %s "
@@ -892,7 +932,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
             logger.warning("Could not commit fingerprint updates: %s", commit_exc)
 
     combined = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
-    return combined, rankings, scraped_names
+    return _finish((combined, rankings, scraped_names))
 
 
 # ---------------------------------------------------------------------------
@@ -901,7 +941,10 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
 
 def scrape_top_players_extended_stats(top_n=150, tour="atp",
                                       progress_callback=None, db=None,
-                                      stop_event=None):
+                                      stop_event=None, rankings=None,
+                                      priority_players=None, budget=None,
+                                      inactive_budget=None,
+                                      return_report=False):
     """
     Scrape extended stats for the top N ranked players, using the same
     activity-fingerprint logic as match scraping to skip unchanged players.
@@ -919,17 +962,39 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
     stop_event : threading.Event, optional
         If set, the loop will abort early (for graceful shutdown).
 
-    Returns list of player names that were actually scraped.
+    Returns list of player names that were actually scraped.  If
+    *return_report* is true, appends a second value with scrape counters.
     """
-    rankings = scrape_current_rankings(tour, discipline="singles",
-                                       source="OFFICIAL")
+    report = {
+        "tour": tour,
+        "top_n": top_n,
+        "rankings": 0,
+        "candidates": 0,
+        "selected": 0,
+        "skipped_budget": 0,
+        "reasons": {},
+        "scraped": 0,
+        "empty": 0,
+        "errors": 0,
+        "rows": 0,
+    }
+
+    def _finish(result):
+        if return_report:
+            return result, report
+        return result
+
+    if rankings is None:
+        rankings = scrape_current_rankings(tour, discipline="singles",
+                                           source="OFFICIAL")
+        if not rankings:
+            rankings = scrape_current_rankings(tour)
     if not rankings:
-        rankings = scrape_current_rankings(tour)
-    if not rankings:
-        return []
+        return _finish([])
 
     rankings.sort(key=lambda e: e.get("rank", 9999))
     rankings = [e for e in rankings if e.get("rank", 9999) <= top_n]
+    report["rankings"] = len(rankings)
 
     # Resolve ranking display names to full DB names
     name_map = _build_ranking_name_map(
@@ -949,6 +1014,7 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
     # Determine which players need scraping
     stale = []
     fingerprints = {}
+    priority_norms = {_normalize_name(n) for n in (priority_players or [])}
 
     # Bulk-load extended_stats_cache in ONE round-trip (avoids 1000+
     # remote calls for top-1000 against Turso).
@@ -960,34 +1026,71 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
         storage_name = clean_player_name(name) or name
         norm = _normalize_name(name)
         fp = activity_map.get(norm)
+        rank = entry.get("rank", 9999)
+        reason = None
 
         if db is None:
-            stale.append(name)
+            reason = "no_db"
             fingerprints[name] = fp
-            continue
-
-        cache_row = cache_snapshot.get(storage_name) or cache_snapshot.get(name)
-
-        if fp is not None:
-            cur_t, prev_t = fp.split("|", 1)
-            if not cur_t and not prev_t:
-                # Inactive: use time-based cache (1 week)
-                if not _cache_row_is_fresh(cache_row, 168):
-                    stale.append(name)
-                    fingerprints[name] = fp
-            elif _activity_changed(cache_row[1] if cache_row else None, fp):
-                stale.append(name)
-                fingerprints[name] = fp
-            else:
-                # Fingerprint unchanged — cache hit under the same normalized
-                # name used by scrape_player_extended_stats when writing.
-                fingerprints[name] = fp
+        elif norm in priority_norms:
+            reason = "match_confirmed"
+            fingerprints[name] = fp
         else:
-            if not _cache_row_is_fresh(cache_row, 168):
-                stale.append(name)
+            cache_row = cache_snapshot.get(storage_name) or cache_snapshot.get(name)
+
+            if fp is not None:
+                cur_t, prev_t = fp.split("|", 1)
+                if not cur_t and not prev_t:
+                    # Inactive: use time-based cache (1 week)
+                    if not _cache_row_is_fresh(cache_row, 168):
+                        reason = "inactive_time"
+                        fingerprints[name] = fp
+                elif _activity_changed(cache_row[1] if cache_row else None, fp):
+                    reason = "activity"
+                    fingerprints[name] = fp
+                else:
+                    # Fingerprint unchanged — cache hit under the same normalized
+                    # name used by scrape_player_extended_stats when writing.
+                    fingerprints[name] = fp
+            else:
+                if not _cache_row_is_fresh(cache_row, 168):
+                    reason = "time"
+
+        if reason:
+            stale.append({"name": name, "rank": rank, "reason": reason})
+            report["reasons"][reason] = report["reasons"].get(reason, 0) + 1
+
+    report["candidates"] = len(stale)
+
+    if budget is not None or inactive_budget is not None:
+        selected = []
+        inactive_selected = 0
+        total_limit = budget if budget is not None else len(stale)
+        inactive_limit = inactive_budget if inactive_budget is not None else len(stale)
+        reason_order = {
+            "match_confirmed": 0,
+            "activity": 1,
+            "no_db": 2,
+            "time": 3,
+            "inactive_time": 4,
+        }
+        for item in sorted(stale, key=lambda x: (
+                reason_order.get(x["reason"], 99), x["rank"])):
+            if len(selected) >= total_limit:
+                break
+            if item["reason"] == "inactive_time":
+                if inactive_selected >= inactive_limit:
+                    continue
+                inactive_selected += 1
+            selected.append(item)
+        report["skipped_budget"] = len(stale) - len(selected)
+        stale = selected
+
+    report["selected"] = len(stale)
 
     scraped_names = []
-    for idx, name in enumerate(stale):
+    for idx, item in enumerate(stale):
+        name = item["name"]
         if stop_event and stop_event.is_set():
             logger.info("Extended stats background scrape stopped early")
             break
@@ -997,17 +1100,24 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
                               f"Extended stats: {name} "
                               f"({idx + 1}/{len(stale)})...")
         try:
-            scrape_player_extended_stats(
+            result = scrape_player_extended_stats(
                 name, db=db, tour=tour, force=True,
                 activity_fingerprint=fingerprints.get(name),
             )
             scraped_names.append(name)
+            rows = sum(result.values()) if result else 0
+            report["rows"] += rows
+            if rows:
+                report["scraped"] += 1
+            else:
+                report["empty"] += 1
         except Exception as exc:
             logger.warning("Failed extended stats for %s: %s", name, exc)
+            report["errors"] += 1
 
     logger.info("Extended stats scrape done: %d/%d players scraped",
                 len(scraped_names), len(stale))
-    return scraped_names
+    return _finish(scraped_names)
 
 def scrape_player_extended_stats(player_name, db=None, tables=None,
                                  tour="atp", progress_callback=None,

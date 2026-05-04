@@ -30,6 +30,52 @@ PLAYERS_URLS = {
 }
 
 
+def _format_counts(counts):
+    if not counts:
+        return "none"
+    return ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+
+
+def _log_tour_report(tour, match_report, extended_report=None):
+    """Emit a compact end-of-tour scrape summary for GitHub Actions logs."""
+    logger.info("--- %s scrape summary ---", tour.upper())
+    logger.info(
+        "rankings=%s source=%s stale=%s skipped=%s reasons=[%s]",
+        match_report.get("rankings", 0),
+        match_report.get("source") or "?",
+        match_report.get("stale", 0),
+        match_report.get("skipped", 0),
+        _format_counts(match_report.get("stale_reasons", {})),
+    )
+    logger.info(
+        "matches attempted=%s confirmed=%s ta_lag=%s not_found=%s "
+        "empty=%s errors=%s fetched_rows=%s imported_rows=%s",
+        match_report.get("attempted", 0),
+        match_report.get("confirmed", 0),
+        match_report.get("ta_lag", 0),
+        match_report.get("not_found", 0),
+        match_report.get("empty", 0),
+        match_report.get("errors", 0),
+        match_report.get("rows", 0),
+        match_report.get("imported_rows", 0),
+    )
+    if extended_report is None:
+        logger.info("extended skipped")
+        return
+    logger.info(
+        "extended candidates=%s selected=%s skipped_budget=%s "
+        "reasons=[%s] with_rows=%s empty=%s errors=%s rows=%s",
+        extended_report.get("candidates", 0),
+        extended_report.get("selected", 0),
+        extended_report.get("skipped_budget", 0),
+        _format_counts(extended_report.get("reasons", {})),
+        extended_report.get("scraped", 0),
+        extended_report.get("empty", 0),
+        extended_report.get("errors", 0),
+        extended_report.get("rows", 0),
+    )
+
+
 def _seed_players_if_empty(db):
     """Populate Turso ``players`` table on first run.
 
@@ -74,6 +120,12 @@ def main(argv=None) -> int:
     parser.add_argument("--top", type=int, default=1000,
                         help="Top-N players to refresh per tour (default 1000)")
     parser.add_argument("--no-extended", action="store_true")
+    parser.add_argument("--extended-budget", type=int, default=120,
+                        help="Max extended-stat players per tour/run")
+    parser.add_argument("--inactive-extended-budget", type=int, default=20,
+                        help="Max inactive time-based extended refreshes per tour/run")
+    parser.add_argument("--max-workers", type=int, default=8,
+                        help="Max parallel TennisAbstract match fetches")
     parser.add_argument("--min-year", type=int, default=2025)
     parser.add_argument("--monday-boost", action="store_true",
                         help="(legacy, no-op — top is already full)")
@@ -93,7 +145,12 @@ def main(argv=None) -> int:
     )
 
     top_n = args.top
-    logger.info("Cloud scrape: top_n=%d per tour", top_n)
+    logger.info(
+        "Cloud scrape: top_n=%d per tour, extended_budget=%d, "
+        "inactive_extended_budget=%d, max_workers=%d",
+        top_n, args.extended_budget, args.inactive_extended_budget,
+        args.max_workers,
+    )
 
     db = RemoteTennisDatabase()
 
@@ -106,33 +163,59 @@ def main(argv=None) -> int:
         # Cloud mode is "live-only": we don't import the 1.7M-row Sackmann
         # historical CSVs into Turso (would take hours via HTTP).  Use local
         # mode for full archive queries; cloud mode = always-fresh top-N.
+        tour_payloads = {}
         for tour in ("atp", "wta"):
             logger.info("=== %s: scraping top %d ===", tour.upper(), top_n)
-            matches_df, rankings, scraped_names = scrape_top_players_matches(
+            scrape_result = scrape_top_players_matches(
                 top_n=top_n, tour=tour,
                 progress_callback=lambda c, t, m: logger.info(
                     "  [%d/%d] %s", c, t, m),
                 db=db,
                 cache_expire_hours=24,
                 min_year=args.min_year,
+                max_workers=args.max_workers,
+                return_report=True,
             )
+            matches_df, rankings, scraped_names, match_report = scrape_result
+            imported = 0
             if not matches_df.empty:
-                db.import_scraped_matches(
+                imported = db.import_scraped_matches(
                     matches_df, scraped_player_names=scraped_names,
                     replace_existing=False)
+            match_report["imported_rows"] = imported
             if rankings:
                 db.import_scraped_rankings(rankings)
+            tour_payloads[tour] = {
+                "rankings": rankings,
+                "scraped_names": scraped_names,
+                "match_report": match_report,
+            }
 
         if not args.no_extended:
             for tour in ("atp", "wta"):
                 logger.info("=== %s: extended stats (top %d) ===",
                             tour.upper(), top_n)
-                scrape_top_players_extended_stats(
+                payload = tour_payloads.get(tour, {})
+                _, extended_report = scrape_top_players_extended_stats(
                     top_n=top_n, tour=tour,
                     progress_callback=lambda c, t, m: logger.info(
                         "  [%d/%d] %s", c, t, m),
                     db=db,
+                    rankings=payload.get("rankings"),
+                    priority_players=payload.get("scraped_names"),
+                    budget=args.extended_budget,
+                    inactive_budget=args.inactive_extended_budget,
+                    return_report=True,
                 )
+                payload["extended_report"] = extended_report
+
+        for tour in ("atp", "wta"):
+            payload = tour_payloads.get(tour, {})
+            _log_tour_report(
+                tour,
+                payload.get("match_report", {}),
+                payload.get("extended_report"),
+            )
 
         # Final commit (no-op for remote — every call already round-trips)
         logger.info("Cloud scrape complete")

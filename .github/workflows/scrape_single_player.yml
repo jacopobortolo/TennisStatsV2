@@ -23,6 +23,18 @@ on:
         description: 'Re-scrape extended stats even if cache is fresh'
         required: false
         default: 'true'
+      no_matches:
+        description: 'Skip match scrape'
+        required: false
+        default: 'false'
+      no_extended:
+        description: 'Skip extended-stats scrape'
+        required: false
+        default: 'false'
+      min_year:
+        description: 'Drop scraped matches before this year (blank = full)'
+        required: false
+        default: ''
 
 concurrency:
   group: tennis-single-${{ github.event.inputs.player_name }}
@@ -65,6 +77,15 @@ jobs:
           EXTRA=""
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
             EXTRA="--force"
+          fi
+          if [ "${{ github.event.inputs.no_matches }}" = "true" ]; then
+            EXTRA="$EXTRA --no-matches"
+          fi
+          if [ "${{ github.event.inputs.no_extended }}" = "true" ]; then
+            EXTRA="$EXTRA --no-extended"
+          fi
+          if [ -n "${{ github.event.inputs.min_year }}" ]; then
+            EXTRA="$EXTRA --min-year ${{ github.event.inputs.min_year }}"
           fi
           python -m tennis_app.scripts.scrape_single_player \
             --cloud \
