@@ -131,16 +131,60 @@ def _snapshot_counts(db) -> dict[str, int]:
     return counts
 
 
+def _format_counts(counts: dict[str, int]) -> str:
+    parts = []
+    for table in SNAPSHOT_REQUIRED_TABLES:
+        count = counts.get(table, -1)
+        value = "missing" if count < 0 else f"{count:,}"
+        parts.append(f"{table}={value}")
+    return ", ".join(parts)
+
+
+def _remote_snapshot_counts() -> dict[str, int]:
+    _apply_streamlit_secrets()
+    import libsql_client
+    from cloud.db import _auth_token, _http_url
+
+    client = libsql_client.create_client_sync(url=_http_url(), auth_token=_auth_token())
+    try:
+        counts = {}
+        for table in SNAPSHOT_REQUIRED_TABLES:
+            try:
+                result = client.execute(f"SELECT COUNT(*) FROM {table}")
+                counts[table] = int(result.rows[0][0]) if result.rows else 0
+            except Exception as exc:
+                if "no such table" in str(exc).lower():
+                    counts[table] = -1
+                    continue
+                raise
+        return counts
+    finally:
+        client.close()
+
+
 def _validate_snapshot(db) -> dict[str, int]:
     counts = _snapshot_counts(db)
     empty_tables = [table for table, count in counts.items() if count <= 0]
     if empty_tables:
-        details = ", ".join(f"{table}={counts[table]}" for table in SNAPSHOT_REQUIRED_TABLES)
         raise RuntimeError(
             "Local snapshot contains no usable tennis data "
-            f"({details}). Rebuild the snapshot after checking Turso secrets."
+            f"({_format_counts(counts)}). Rebuild the snapshot after checking Turso secrets."
         )
     return counts
+
+
+def _empty_snapshot_error(exc: Exception) -> RuntimeError:
+    try:
+        remote_counts = _remote_snapshot_counts()
+    except Exception as remote_exc:
+        return RuntimeError(
+            f"{exc}\nRemote Turso preflight also failed: {remote_exc}"
+        )
+
+    return RuntimeError(
+        f"{exc}\nRemote Turso counts: {_format_counts(remote_counts)}. "
+        "If these counts are zero or missing, Streamlit Cloud is connected to an empty/wrong Turso database."
+    )
 
 
 def _snapshot_is_stale(path: Path) -> bool:
@@ -171,6 +215,11 @@ def show_connection_error(exc: Exception) -> None:
             "Regenerate a database token for the same Turso database used in TURSO_DATABASE_URL, "
             "paste only the raw token value in Streamlit secrets, then reboot the Streamlit app."
         )
+    elif "remote turso counts" in message and ("=0" in message or "missing" in message):
+        st.info(
+            "The Turso connection works, but the database reached by Streamlit Cloud appears empty or missing the expected tables. "
+            "Check that TURSO_DATABASE_URL is the same database populated by your GitHub Actions scrape job, then reboot and rebuild the snapshot."
+        )
 
 
 @st.cache_resource(ttl=SNAPSHOT_TTL_SECONDS, show_spinner="Refreshing local data snapshot...")
@@ -194,7 +243,10 @@ def get_db(refresh_token: int = 0, snapshot_action: str = "auto"):
             pass
         _remove_local_snapshot()
         db = SnapshotTennisDatabase(refresh_on_open=True)
-        _validate_snapshot(db)
+        try:
+            _validate_snapshot(db)
+        except Exception as exc:
+            raise _empty_snapshot_error(exc) from exc
     return db
 
 
