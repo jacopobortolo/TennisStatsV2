@@ -9,6 +9,7 @@ query.
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -26,6 +27,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 SNAPSHOT_TTL_SECONDS = int(os.environ.get("TENNIS_WEB_SNAPSHOT_TTL", "14400"))
+WEB_SNAPSHOT_PAGE_SIZE = int(os.environ.get("TENNIS_WEB_SNAPSHOT_PAGE_SIZE", "1000"))
 ENV_KEYS = ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "TURSO_LOCAL_PATH")
 SNAPSHOT_REQUIRED_TABLES = ("players", "matches")
 
@@ -162,6 +164,114 @@ def _remote_snapshot_counts() -> dict[str, int]:
         client.close()
 
 
+def _quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _sqlite_counts(path: Path) -> dict[str, int]:
+    conn = sqlite3.connect(path)
+    try:
+        counts = {}
+        for table in SNAPSHOT_REQUIRED_TABLES:
+            try:
+                row = conn.execute(f"SELECT COUNT(*) FROM {_quote_identifier(table)}").fetchone()
+                counts[table] = int(row[0] if row else 0)
+            except sqlite3.DatabaseError:
+                counts[table] = -1
+        return counts
+    finally:
+        conn.close()
+
+
+def _download_web_snapshot(dest: Path) -> Path:
+    _apply_streamlit_secrets()
+    import libsql_client
+    from cloud.db import SNAPSHOT_TABLES, _auth_token, _http_url
+
+    remote_counts = _remote_snapshot_counts()
+    if any(remote_counts.get(table, 0) <= 0 for table in SNAPSHOT_REQUIRED_TABLES):
+        raise RuntimeError(
+            "Remote Turso does not contain usable tennis data "
+            f"({_format_counts(remote_counts)}). Check TURSO_DATABASE_URL."
+        )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".tmp.db")
+    if tmp.exists():
+        tmp.unlink()
+
+    client = libsql_client.create_client_sync(url=_http_url(), auth_token=_auth_token())
+    local = None
+    success = False
+    try:
+        local = sqlite3.connect(str(tmp))
+        local.execute("PRAGMA journal_mode=OFF")
+        local.execute("PRAGMA synchronous=OFF")
+
+        result = client.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+        remote_tables = {str(row[0]): str(row[1]) for row in result.rows}
+        missing_required = [table for table in SNAPSHOT_REQUIRED_TABLES if table not in remote_tables]
+        if missing_required:
+            raise RuntimeError("Remote Turso is missing required tables: " + ", ".join(missing_required))
+
+        wanted = [table for table in SNAPSHOT_TABLES if table in remote_tables]
+        for table in wanted:
+            local.execute(remote_tables[table])
+            quoted_table = _quote_identifier(table)
+            offset = 0
+            copied = 0
+            while True:
+                result = client.execute(
+                    f"SELECT * FROM {quoted_table} LIMIT {WEB_SNAPSHOT_PAGE_SIZE} OFFSET {offset}"
+                )
+                rows = list(result.rows or [])
+                if not rows:
+                    break
+                columns = list(result.columns or [])
+                if not columns:
+                    raise RuntimeError(f"Remote query for {table} returned rows but no column metadata")
+                column_list = ", ".join(_quote_identifier(column) for column in columns)
+                placeholders = ", ".join("?" for _ in columns)
+                local.executemany(
+                    f"INSERT INTO {quoted_table} ({column_list}) VALUES ({placeholders})",
+                    [tuple(row) for row in rows],
+                )
+                copied += len(rows)
+                offset += len(rows)
+                if len(rows) < WEB_SNAPSHOT_PAGE_SIZE:
+                    break
+            if table in SNAPSHOT_REQUIRED_TABLES and copied <= 0:
+                raise RuntimeError(
+                    f"Copied 0 rows for required table {table}; remote counts were {_format_counts(remote_counts)}"
+                )
+
+        local.commit()
+        local.close()
+        local = None
+
+        copied_counts = _sqlite_counts(tmp)
+        if any(copied_counts.get(table, 0) <= 0 for table in SNAPSHOT_REQUIRED_TABLES):
+            raise RuntimeError(
+                "Downloaded snapshot is empty after copy "
+                f"({_format_counts(copied_counts)}); remote counts were {_format_counts(remote_counts)}."
+            )
+
+        if dest.exists():
+            dest.unlink()
+        tmp.replace(dest)
+        success = True
+        return dest
+    finally:
+        if local is not None:
+            local.close()
+        client.close()
+        if not success and tmp.exists():
+            tmp.unlink()
+
+
 def _validate_snapshot(db) -> dict[str, int]:
     counts = _snapshot_counts(db)
     empty_tables = [table for table, count in counts.items() if count <= 0]
@@ -232,8 +342,10 @@ def get_db(refresh_token: int = 0, snapshot_action: str = "auto"):
 
     path = get_local_replica_path()
     refresh_on_open = snapshot_action in {"refresh", "rebuild"} or _snapshot_is_stale(path)
+    if refresh_on_open:
+        _download_web_snapshot(path)
 
-    db = SnapshotTennisDatabase(refresh_on_open=refresh_on_open)
+    db = SnapshotTennisDatabase(refresh_on_open=False)
     try:
         _validate_snapshot(db)
     except Exception:
@@ -242,7 +354,8 @@ def get_db(refresh_token: int = 0, snapshot_action: str = "auto"):
         except Exception:
             pass
         _remove_local_snapshot()
-        db = SnapshotTennisDatabase(refresh_on_open=True)
+        _download_web_snapshot(path)
+        db = SnapshotTennisDatabase(refresh_on_open=False)
         try:
             _validate_snapshot(db)
         except Exception as exc:
