@@ -393,6 +393,13 @@ def _strip_draw_size(token):
     return re.sub(r"\s*\([^)]*\)\s*$", "", token).strip()
 
 
+def _make_activity_fingerprint(current_tournament, previous_tournament):
+    """Build the stored activity fingerprint from OFFICIAL ranking text."""
+    current = _strip_draw_size(current_tournament or "")
+    previous = _strip_draw_size(previous_tournament or "")
+    return f"{current}|{previous}"
+
+
 def _activity_changed(old_fp, new_fp):
     """Pure-in-memory equivalent of ``has_(extended_)new_activity``.
 
@@ -685,7 +692,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
         for entry in official_entries:
             cur_t = entry.get("current_tournament", "")
             prev_t = entry.get("previous_tournament", "")
-            fp = f"{cur_t}|{prev_t}"
+            fp = _make_activity_fingerprint(cur_t, prev_t)
             norm = _normalize_name(entry["name"])
             activity_map[norm] = fp
         logger.info("Built activity map for %d players", len(activity_map))
@@ -1007,7 +1014,7 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
     for entry in rankings:
         cur_t = entry.get("current_tournament", "")
         prev_t = entry.get("previous_tournament", "")
-        fp = f"{cur_t}|{prev_t}"
+        fp = _make_activity_fingerprint(cur_t, prev_t)
         norm = _normalize_name(entry["name"])
         activity_map[norm] = fp
 
