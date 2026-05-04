@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ if str(ROOT) not in sys.path:
 
 SNAPSHOT_TTL_SECONDS = int(os.environ.get("TENNIS_WEB_SNAPSHOT_TTL", "14400"))
 ENV_KEYS = ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "TURSO_LOCAL_PATH")
+SNAPSHOT_REQUIRED_TABLES = ("players", "matches")
 
 LEVEL_LABELS = {
     "G": "Grand Slam",
@@ -68,9 +70,16 @@ def _load_env_file(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        clean_value = value.strip().strip('"').strip("'")
+        clean_value = _clean_secret_value(key.strip(), value)
         if clean_value:
             os.environ.setdefault(key.strip(), clean_value)
+
+
+def _clean_secret_value(key: str, value: Any) -> str:
+    clean_value = str(value).strip().strip('"').strip("'").strip()
+    if key == "TURSO_AUTH_TOKEN" and clean_value.lower().startswith("bearer "):
+        clean_value = clean_value[7:].strip()
+    return clean_value
 
 
 def _apply_streamlit_secrets() -> None:
@@ -80,13 +89,17 @@ def _apply_streamlit_secrets() -> None:
 
     for key in ENV_KEYS:
         if os.environ.get(key):
+            os.environ[key] = _clean_secret_value(key, os.environ[key])
+
+    for key in ENV_KEYS:
+        if os.environ.get(key):
             continue
         try:
             value = st.secrets.get(key)
         except Exception:
             value = None
         if value:
-            os.environ[key] = str(value)
+            os.environ[key] = _clean_secret_value(key, value)
 
     if not os.environ.get("TURSO_LOCAL_PATH"):
         cache_dir = Path(tempfile.gettempdir()) / "tennisstatsv2-web"
@@ -94,9 +107,53 @@ def _apply_streamlit_secrets() -> None:
         os.environ["TURSO_LOCAL_PATH"] = str(cache_dir / "tennis.db")
 
 
+def _remove_local_snapshot() -> None:
+    _apply_streamlit_secrets()
+    from cloud.db import get_local_replica_path
+
+    configured_path = get_local_replica_path()
+    paths = {
+        configured_path,
+        configured_path.with_suffix(".tmp.db"),
+        configured_path.parent / "tennis.db",
+        configured_path.parent / "tennis.tmp.db",
+    }
+    for path in paths:
+        if path.exists():
+            path.unlink()
+
+
+def _snapshot_counts(db) -> dict[str, int]:
+    counts = {}
+    for table in SNAPSHOT_REQUIRED_TABLES:
+        row = db.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        counts[table] = int(row[0] if row else 0)
+    return counts
+
+
+def _validate_snapshot(db) -> dict[str, int]:
+    counts = _snapshot_counts(db)
+    empty_tables = [table for table, count in counts.items() if count <= 0]
+    if empty_tables:
+        details = ", ".join(f"{table}={counts[table]}" for table in SNAPSHOT_REQUIRED_TABLES)
+        raise RuntimeError(
+            "Local snapshot contains no usable tennis data "
+            f"({details}). Rebuild the snapshot after checking Turso secrets."
+        )
+    return counts
+
+
+def _snapshot_is_stale(path: Path) -> bool:
+    if not path.exists():
+        return True
+    age_seconds = time.time() - path.stat().st_mtime
+    return age_seconds >= SNAPSHOT_TTL_SECONDS
+
+
 def show_connection_error(exc: Exception) -> None:
     st.error("Turso connection is not configured or the snapshot could not be loaded.")
     st.code(str(exc))
+    message = str(exc).lower()
     missing = [key for key in ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN") if not os.environ.get(key)]
     if missing:
         st.info(
@@ -108,14 +165,37 @@ def show_connection_error(exc: Exception) -> None:
             'TURSO_DATABASE_URL = "libsql://..."\nTURSO_AUTH_TOKEN = "..."',
             language="toml",
         )
+    elif "401" in message or "unauthorized" in message:
+        st.info(
+            "Turso returned 401, so the URL is reachable but the auth token was rejected. "
+            "Regenerate a database token for the same Turso database used in TURSO_DATABASE_URL, "
+            "paste only the raw token value in Streamlit secrets, then reboot the Streamlit app."
+        )
 
 
 @st.cache_resource(ttl=SNAPSHOT_TTL_SECONDS, show_spinner="Refreshing local data snapshot...")
-def get_db(_refresh_token: int = 0):
+def get_db(refresh_token: int = 0, snapshot_action: str = "auto"):
     _apply_streamlit_secrets()
-    from cloud.db import SnapshotTennisDatabase
+    from cloud.db import SnapshotTennisDatabase, get_local_replica_path
 
-    return SnapshotTennisDatabase(refresh_on_open=True)
+    if snapshot_action == "rebuild":
+        _remove_local_snapshot()
+
+    path = get_local_replica_path()
+    refresh_on_open = snapshot_action in {"refresh", "rebuild"} or _snapshot_is_stale(path)
+
+    db = SnapshotTennisDatabase(refresh_on_open=refresh_on_open)
+    try:
+        _validate_snapshot(db)
+    except Exception:
+        try:
+            db.close()
+        except Exception:
+            pass
+        _remove_local_snapshot()
+        db = SnapshotTennisDatabase(refresh_on_open=True)
+        _validate_snapshot(db)
+    return db
 
 
 def run_query(db, sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
@@ -199,6 +279,26 @@ def display_matches(df: pd.DataFrame, limit: int | None = None) -> None:
     st.dataframe(show, hide_index=True, width="stretch")
 
 
+def render_snapshot_status(db) -> None:
+    try:
+        from cloud.db import get_local_replica_path
+
+        path = get_local_replica_path()
+        size_mb = path.stat().st_size / (1024 * 1024) if path.exists() else 0
+        counts = _snapshot_counts(db)
+    except Exception as exc:
+        with st.expander("Snapshot status"):
+            st.warning(f"Snapshot status unavailable: {exc}")
+        return
+
+    with st.expander("Snapshot status"):
+        cols = st.columns(3)
+        cols[0].metric("Snapshot file", f"{size_mb:.1f} MB")
+        cols[1].metric("Players", f"{counts.get('players', 0):,}")
+        cols[2].metric("Matches", f"{counts.get('matches', 0):,}")
+        st.caption(f"Local snapshot path: {path}")
+
+
 def render_header() -> None:
     st.set_page_config(page_title="TennisStatsV2 Web", layout="wide")
     st.markdown(
@@ -219,12 +319,19 @@ def render_header() -> None:
         """,
         unsafe_allow_html=True,
     )
-    left, right = st.columns([0.72, 0.28], vertical_alignment="center")
+    left, right = st.columns([0.64, 0.36], vertical_alignment="center")
     with left:
         st.title("TennisStatsV2")
     with right:
-        if st.button("Refresh snapshot", width="stretch"):
+        refresh_col, rebuild_col = st.columns(2)
+        if refresh_col.button("Refresh snapshot", width="stretch"):
             get_db.clear()
+            st.session_state["snapshot_action"] = "refresh"
+            st.session_state["refresh_token"] = st.session_state.get("refresh_token", 0) + 1
+            st.rerun()
+        if rebuild_col.button("Rebuild snapshot", width="stretch"):
+            get_db.clear()
+            st.session_state["snapshot_action"] = "rebuild"
             st.session_state["refresh_token"] = st.session_state.get("refresh_token", 0) + 1
             st.rerun()
 
@@ -511,11 +618,14 @@ def page_global(db) -> None:
 def main() -> None:
     render_header()
     refresh_token = st.session_state.get("refresh_token", 0)
+    snapshot_action = st.session_state.pop("snapshot_action", "auto")
     try:
-        db = get_db(refresh_token)
+        db = get_db(refresh_token, snapshot_action)
     except Exception as exc:
         show_connection_error(exc)
         st.stop()
+
+    render_snapshot_status(db)
 
     page = st.segmented_control(
         "View",
