@@ -183,6 +183,40 @@ def _sqlite_counts(path: Path) -> dict[str, int]:
         conn.close()
 
 
+def _local_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _infer_sqlite_type(values: list[Any]) -> str:
+    non_null_values = [value for value in values if value is not None]
+    if not non_null_values:
+        return "TEXT"
+    if all(isinstance(value, bool | int) and not isinstance(value, bool) for value in non_null_values):
+        return "INTEGER"
+    if all(isinstance(value, bool | int | float) and not isinstance(value, bool) for value in non_null_values):
+        return "REAL"
+    return "TEXT"
+
+
+def _create_local_table_from_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: list[str],
+    rows: list[Any],
+) -> None:
+    definitions = []
+    for index, column in enumerate(columns):
+        sample_values = [row[index] for row in rows]
+        definitions.append(f"{_quote_identifier(column)} {_infer_sqlite_type(sample_values)}")
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {_quote_identifier(table)} ({', '.join(definitions)})"
+    )
+
+
 def _download_web_snapshot(dest: Path) -> Path:
     _apply_streamlit_secrets()
     import libsql_client
@@ -219,8 +253,11 @@ def _download_web_snapshot(dest: Path) -> Path:
 
         wanted = [table for table in SNAPSHOT_TABLES if table in remote_tables]
         for table in wanted:
-            local.execute(remote_tables[table])
             quoted_table = _quote_identifier(table)
+            try:
+                local.execute(remote_tables[table])
+            except sqlite3.DatabaseError:
+                pass
             offset = 0
             copied = 0
             while True:
@@ -233,6 +270,8 @@ def _download_web_snapshot(dest: Path) -> Path:
                 columns = list(result.columns or [])
                 if not columns:
                     raise RuntimeError(f"Remote query for {table} returned rows but no column metadata")
+                if not _local_table_exists(local, table):
+                    _create_local_table_from_rows(local, table, columns, rows)
                 column_list = ", ".join(_quote_identifier(column) for column in columns)
                 placeholders = ", ".join("?" for _ in columns)
                 local.executemany(
