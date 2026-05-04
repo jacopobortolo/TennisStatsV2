@@ -48,6 +48,10 @@ def _log_tour_report(tour, match_report, extended_report=None):
         _format_counts(match_report.get("stale_reasons", {})),
     )
     logger.info(
+        "activity statuses=[%s]",
+        _format_counts(match_report.get("activity_statuses", {})),
+    )
+    logger.info(
         "matches attempted=%s confirmed=%s ta_lag=%s not_found=%s "
         "empty=%s errors=%s fetched_rows=%s imported_rows=%s",
         match_report.get("attempted", 0),
@@ -64,11 +68,13 @@ def _log_tour_report(tour, match_report, extended_report=None):
         return
     logger.info(
         "extended candidates=%s selected=%s skipped_budget=%s "
-        "reasons=[%s] with_rows=%s empty=%s errors=%s rows=%s",
+        "reasons=[%s] activity_statuses=[%s] with_rows=%s empty=%s "
+        "errors=%s rows=%s",
         extended_report.get("candidates", 0),
         extended_report.get("selected", 0),
         extended_report.get("skipped_budget", 0),
         _format_counts(extended_report.get("reasons", {})),
+        _format_counts(extended_report.get("activity_statuses", {})),
         extended_report.get("scraped", 0),
         extended_report.get("empty", 0),
         extended_report.get("errors", 0),

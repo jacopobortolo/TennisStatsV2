@@ -400,6 +400,126 @@ def _make_activity_fingerprint(current_tournament, previous_tournament):
     return f"{current}|{previous}"
 
 
+_ROUND_ORDER = {
+    "R128": 1,
+    "R64": 2,
+    "R32": 3,
+    "R16": 4,
+    "QF": 5,
+    "SF": 6,
+    "F": 7,
+}
+
+_CONFIRMED_ACTIVITY_REASONS = {
+    "due_upcoming",
+    "previous_result_with_new_current",
+    "round_advanced",
+    "loss_result",
+    "title_result",
+}
+
+
+def _split_activity_fingerprint(fp):
+    if not fp:
+        return "", ""
+    current, previous = (str(fp).split("|", 1) + [""])[:2]
+    return _strip_draw_size(current), _strip_draw_size(previous)
+
+
+def _parse_official_activity_token(token):
+    """Parse live-tennis OFFICIAL activity text into semantic pieces."""
+    clean = _strip_draw_size(token or "")
+    parsed = {
+        "raw": clean,
+        "tournament": "",
+        "round": "",
+        "is_empty": not bool(clean),
+        "is_loss": False,
+        "is_title": False,
+    }
+    if not clean:
+        return parsed
+
+    body = clean
+    if re.match(r"(?i)^lost\s+in\s+", body):
+        parsed["is_loss"] = True
+        body = re.sub(r"(?i)^lost\s+in\s+", "", body).strip()
+
+    parts = body.rsplit(" ", 1)
+    if len(parts) == 2:
+        tournament, tail = parts[0].strip(), parts[1].strip().upper()
+        if tail == "W":
+            parsed["tournament"] = tournament
+            parsed["round"] = "W"
+            parsed["is_title"] = True
+            return parsed
+        if tail in _ROUND_ORDER or re.fullmatch(r"R\d+", tail or ""):
+            parsed["tournament"] = tournament
+            parsed["round"] = tail
+            return parsed
+
+    parsed["tournament"] = body
+    return parsed
+
+
+def _same_tournament(left, right):
+    return bool(left and right and _normalize_name(left) == _normalize_name(right))
+
+
+def _round_advanced(old_round, new_round):
+    old_pos = _ROUND_ORDER.get((old_round or "").upper())
+    new_pos = _ROUND_ORDER.get((new_round or "").upper())
+    if old_pos is None or new_pos is None:
+        return bool(old_round and new_round and old_round != new_round)
+    return new_pos > old_pos
+
+
+def _official_activity_status(old_fp, new_fp):
+    """Decide whether an OFFICIAL fingerprint transition means played tennis.
+
+    A new tournament in ``current`` alone is a scheduled first match, so it
+    should be saved as a baseline but should not trigger TennisAbstract.
+    Results in ``previous`` and same-event round advances do trigger scraping.
+    """
+    old_cur, old_prev = _split_activity_fingerprint(old_fp)
+    new_cur, new_prev = _split_activity_fingerprint(new_fp)
+    old_norm = f"{old_cur}|{old_prev}"
+    new_norm = f"{new_cur}|{new_prev}"
+    if old_norm == new_norm:
+        return False, "unchanged"
+
+    old_cur_info = _parse_official_activity_token(old_cur)
+    old_prev_info = _parse_official_activity_token(old_prev)
+    new_cur_info = _parse_official_activity_token(new_cur)
+    new_prev_info = _parse_official_activity_token(new_prev)
+    old_labels = {label for label in (old_cur, old_prev) if label}
+
+    previous_result_is_new = (
+        bool(new_prev)
+        and (new_prev_info["is_loss"] or new_prev_info["is_title"])
+        and new_prev not in old_labels
+    )
+    if previous_result_is_new:
+        if new_cur and not _same_tournament(
+                new_cur_info["tournament"], new_prev_info["tournament"]):
+            return True, "previous_result_with_new_current"
+        if new_prev_info["is_title"]:
+            return True, "title_result"
+        return True, "loss_result"
+
+    if (_same_tournament(old_cur_info["tournament"],
+                         new_cur_info["tournament"])
+            and _round_advanced(old_cur_info["round"],
+                                new_cur_info["round"])):
+        return True, "round_advanced"
+
+    if new_cur and not _same_tournament(
+            old_cur_info["tournament"], new_cur_info["tournament"]):
+        return False, "scheduled_new_tournament"
+
+    return False, "unchanged"
+
+
 def _activity_changed(old_fp, new_fp):
     """Pure-in-memory equivalent of ``has_(extended_)new_activity``.
 
@@ -619,6 +739,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
         "source": None,
         "stale": 0,
         "stale_reasons": {},
+        "activity_statuses": {},
         "skipped": 0,
         "attempted": 0,
         "confirmed": 0,
@@ -745,19 +866,23 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                     stale_reasons[name] = (
                         "due_upcoming" if has_due_upcoming else "time")
                     fingerprints[name] = fp
-            elif has_due_upcoming or _activity_changed(
-                    cache_row[1] if cache_row else None, fp):
-                # Fingerprint changed OR an upcoming match is now due
-                # (and cooldown elapsed): scrape to capture the new result.
+            else:
+                activity_changed, status = _official_activity_status(
+                    cache_row[1] if cache_row else None, fp)
+                report["activity_statuses"][status] = (
+                    report["activity_statuses"].get(status, 0) + 1)
+                if not has_due_upcoming and not activity_changed:
+                    fingerprints[name] = fp
+                    logger.debug("Skipping %s (%s)", name, status)
+                    continue
+
+                # Fingerprint indicates a played result OR an upcoming match
+                # is now due.  Confirmation is still handled after the HTTP
+                # scrape by comparing completed-match signatures.
                 stale.add(name)
                 stale_reasons[name] = (
-                    "due_upcoming" if has_due_upcoming else "activity")
+                    "due_upcoming" if has_due_upcoming else status)
                 fingerprints[name] = fp
-            else:
-                # Fingerprint unchanged and no due upcoming: keep stored
-                # fingerprint in sync (update without re-scraping)
-                fingerprints[name] = fp
-                logger.debug("Skipping %s (activity unchanged)", name)
         else:
             # Player not found in OFFICIAL: fall back to time-based cache
             if not _cache_row_is_fresh(cache_row, cache_expire_hours):
@@ -790,14 +915,16 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
         actual_targets.append((idx, entry))
 
     if db is not None and skipped_updates:
-        # Filter to players that already exist in the cache (UPDATE only)
-        existing = {row[0] for row in db.conn.execute(
-            "SELECT player_name FROM scrape_cache").fetchall()}
+        now_iso = datetime.datetime.now().isoformat()
         with db._write_lock:
             db.conn.executemany(
-                "UPDATE scrape_cache SET activity_fingerprint = ? "
-                "WHERE player_name = ?",
-                [(fp, n) for fp, n in skipped_updates if n in existing])
+                "INSERT INTO scrape_cache "
+                "(player_name, last_scraped, match_count, "
+                "activity_fingerprint) "
+                "VALUES (?, ?, 0, ?) "
+                "ON CONFLICT(player_name) DO UPDATE SET "
+                "activity_fingerprint = excluded.activity_fingerprint",
+                [(n, now_iso, fp) for fp, n in skipped_updates])
             db.conn.commit()
 
     # ---- Parallel HTTP fetches for stale players ----
@@ -858,7 +985,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                 had_cache = name in cache_snapshot
                 cache_row = cache_snapshot.get(name)
                 needs_confirmed_activity = (
-                    stale_reasons.get(name) in {"activity", "due_upcoming"})
+                    stale_reasons.get(name) in _CONFIRMED_ACTIVITY_REASONS)
                 baseline_signature = None
                 if (needs_confirmed_activity and had_cache
                         and (not cache_row or len(cache_row) < 4
@@ -980,6 +1107,7 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
         "selected": 0,
         "skipped_budget": 0,
         "reasons": {},
+        "activity_statuses": {},
         "scraped": 0,
         "empty": 0,
         "errors": 0,
@@ -1021,6 +1149,7 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
     # Determine which players need scraping
     stale = []
     fingerprints = {}
+    skipped_updates = []
     priority_norms = {_normalize_name(n) for n in (priority_players or [])}
 
     # Bulk-load extended_stats_cache in ONE round-trip (avoids 1000+
@@ -1052,13 +1181,16 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
                     if not _cache_row_is_fresh(cache_row, 168):
                         reason = "inactive_time"
                         fingerprints[name] = fp
-                elif _activity_changed(cache_row[1] if cache_row else None, fp):
-                    reason = "activity"
-                    fingerprints[name] = fp
                 else:
-                    # Fingerprint unchanged — cache hit under the same normalized
-                    # name used by scrape_player_extended_stats when writing.
+                    activity_changed, status = _official_activity_status(
+                        cache_row[1] if cache_row else None, fp)
+                    report["activity_statuses"][status] = (
+                        report["activity_statuses"].get(status, 0) + 1)
                     fingerprints[name] = fp
+                    if activity_changed:
+                        reason = status
+                    else:
+                        skipped_updates.append((storage_name, fp))
             else:
                 if not _cache_row_is_fresh(cache_row, 168):
                     reason = "time"
@@ -1068,6 +1200,19 @@ def scrape_top_players_extended_stats(top_n=150, tour="atp",
             report["reasons"][reason] = report["reasons"].get(reason, 0) + 1
 
     report["candidates"] = len(stale)
+
+    if db is not None and skipped_updates:
+        now_iso = datetime.datetime.now().isoformat()
+        with db._write_lock:
+            db.conn.executemany(
+                "INSERT INTO extended_stats_cache "
+                "(player_name, last_scraped, tables_scraped, "
+                "activity_fingerprint) "
+                "VALUES (?, ?, '', ?) "
+                "ON CONFLICT(player_name) DO UPDATE SET "
+                "activity_fingerprint = excluded.activity_fingerprint",
+                [(name, now_iso, fp) for name, fp in skipped_updates])
+            db.conn.commit()
 
     if budget is not None or inactive_budget is not None:
         selected = []
