@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 SNAPSHOT_TTL_SECONDS = int(os.environ.get("TENNIS_WEB_SNAPSHOT_TTL", "14400"))
+ENV_KEYS = ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "TURSO_LOCAL_PATH")
 
 LEVEL_LABELS = {
     "G": "Grand Slam",
@@ -59,10 +60,26 @@ EXTENDED_TABLES = {
 }
 
 
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        clean_value = value.strip().strip('"').strip("'")
+        if clean_value:
+            os.environ.setdefault(key.strip(), clean_value)
+
+
 def _apply_streamlit_secrets() -> None:
-    """Expose Streamlit secrets as env vars consumed by cloud.db."""
-    for key in ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "TURSO_LOCAL_PATH"):
-        if key in os.environ:
+    """Expose local env files and Streamlit secrets as env vars consumed by cloud.db."""
+    _load_env_file(ROOT / "web_app" / ".env")
+    _load_env_file(ROOT / "cloud" / ".env")
+
+    for key in ENV_KEYS:
+        if os.environ.get(key):
             continue
         try:
             value = st.secrets.get(key)
@@ -71,10 +88,26 @@ def _apply_streamlit_secrets() -> None:
         if value:
             os.environ[key] = str(value)
 
-    if "TURSO_LOCAL_PATH" not in os.environ:
+    if not os.environ.get("TURSO_LOCAL_PATH"):
         cache_dir = Path(tempfile.gettempdir()) / "tennisstatsv2-web"
         cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["TURSO_LOCAL_PATH"] = str(cache_dir / "tennis.db")
+
+
+def show_connection_error(exc: Exception) -> None:
+    st.error("Turso connection is not configured or the snapshot could not be loaded.")
+    st.code(str(exc))
+    missing = [key for key in ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN") if not os.environ.get(key)]
+    if missing:
+        st.info(
+            "Missing configuration: "
+            + ", ".join(missing)
+            + ". Locally, add them to cloud/.env or web_app/.env. On Streamlit Cloud, add them in App settings > Secrets."
+        )
+        st.code(
+            'TURSO_DATABASE_URL = "libsql://..."\nTURSO_AUTH_TOKEN = "..."',
+            language="toml",
+        )
 
 
 @st.cache_resource(ttl=SNAPSHOT_TTL_SECONDS, show_spinner="Refreshing local data snapshot...")
@@ -481,8 +514,7 @@ def main() -> None:
     try:
         db = get_db(refresh_token)
     except Exception as exc:
-        st.error("Turso connection is not configured or the snapshot could not be loaded.")
-        st.code(str(exc))
+        show_connection_error(exc)
         st.stop()
 
     page = st.segmented_control(
