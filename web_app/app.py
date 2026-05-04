@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 
 SNAPSHOT_TTL_SECONDS = int(os.environ.get("TENNIS_WEB_SNAPSHOT_TTL", "14400"))
 WEB_SNAPSHOT_PAGE_SIZE = int(os.environ.get("TENNIS_WEB_SNAPSHOT_PAGE_SIZE", "1000"))
+SNAPSHOT_ENGINE_VERSION = "web-snapshot-no-ddl-v3"
 ENV_KEYS = ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "TURSO_LOCAL_PATH")
 SNAPSHOT_REQUIRED_TABLES = ("players", "matches")
 
@@ -255,24 +256,24 @@ def _download_web_snapshot(dest: Path) -> Path:
         wanted = [table for table in SNAPSHOT_TABLES if table in remote_tables]
         for table in wanted:
             quoted_table = _quote_identifier(table)
-            try:
-                local.execute(remote_tables[table])
-            except sqlite3.DatabaseError:
-                pass
             offset = 0
             copied = 0
+            created = False
             while True:
                 result = client.execute(
                     f"SELECT * FROM {quoted_table} LIMIT {WEB_SNAPSHOT_PAGE_SIZE} OFFSET {offset}"
                 )
                 rows = list(result.rows or [])
+                columns = [str(column) for column in list(result.columns or [])]
+                if not columns:
+                    if rows:
+                        raise RuntimeError(f"Remote query for {table} returned rows but no column metadata")
+                    break
+                if not created:
+                    _create_local_table_from_rows(local, table, columns, rows)
+                    created = True
                 if not rows:
                     break
-                columns = list(result.columns or [])
-                if not columns:
-                    raise RuntimeError(f"Remote query for {table} returned rows but no column metadata")
-                if not _local_table_exists(local, table):
-                    _create_local_table_from_rows(local, table, columns, rows)
                 column_list = ", ".join(_quote_identifier(column) for column in columns)
                 placeholders = ", ".join("?" for _ in columns)
                 local.executemany(
@@ -285,7 +286,7 @@ def _download_web_snapshot(dest: Path) -> Path:
                     break
             if table in SNAPSHOT_REQUIRED_TABLES and copied <= 0:
                 raise RuntimeError(
-                    f"Copied 0 rows for required table {table}; remote counts were {_format_counts(remote_counts)}"
+                    f"Copied 0 rows for required table {table}; created={created}; remote counts were {_format_counts(remote_counts)}"
                 )
 
         local.commit()
@@ -295,7 +296,7 @@ def _download_web_snapshot(dest: Path) -> Path:
         copied_counts = _sqlite_counts(tmp)
         if any(copied_counts.get(table, 0) <= 0 for table in SNAPSHOT_REQUIRED_TABLES):
             raise RuntimeError(
-                "Downloaded snapshot is empty after copy "
+                f"{SNAPSHOT_ENGINE_VERSION}: downloaded snapshot is empty after copy "
                 f"({_format_counts(copied_counts)}); remote counts were {_format_counts(remote_counts)}."
             )
 
@@ -370,6 +371,7 @@ def _snapshot_is_stale(path: Path) -> bool:
 
 def show_connection_error(exc: Exception) -> None:
     st.error("Turso connection is not configured or the snapshot could not be loaded.")
+    st.caption(f"Snapshot engine: {SNAPSHOT_ENGINE_VERSION}")
     st.code(str(exc))
     message = str(exc).lower()
     missing = [key for key in ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN") if not os.environ.get(key)]
@@ -526,6 +528,7 @@ def render_snapshot_status(db) -> None:
         cols[1].metric("Players", f"{counts.get('players', 0):,}")
         cols[2].metric("Matches", f"{counts.get('matches', 0):,}")
         st.caption(f"Local snapshot path: {path}")
+        st.caption(f"Snapshot engine: {SNAPSHOT_ENGINE_VERSION}")
 
 
 def render_header() -> None:
