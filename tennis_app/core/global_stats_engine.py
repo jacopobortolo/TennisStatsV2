@@ -432,10 +432,10 @@ class GlobalStatsEngine:
         where, params = self._where(filters, include_round=False)
         rows = self._query(f"""
             WITH appearances AS (
-                SELECT winner_name AS player, tourney_id, tourney_date FROM matches m
+                SELECT winner_name AS player, tourney_id, tourney_name, tourney_date FROM matches m
                 WHERE {where} AND round IN ('QF','SF') AND winner_name != ''
                 UNION
-                SELECT loser_name AS player, tourney_id, tourney_date FROM matches m
+                SELECT loser_name AS player, tourney_id, tourney_name, tourney_date FROM matches m
                 WHERE {where} AND round IN ('QF','SF') AND loser_name != ''
             )
             SELECT player, COUNT(*) AS value
