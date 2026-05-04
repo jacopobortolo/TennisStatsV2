@@ -560,6 +560,50 @@ def _cache_row_is_fresh(cache_row, expire_hours):
             < datetime.timedelta(hours=expire_hours))
 
 
+def _cache_retry_count(cache_row):
+    if not cache_row or len(cache_row) < 5:
+        return 0
+    try:
+        return int(cache_row[4] or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cache_next_scrape_after(cache_row):
+    if not cache_row or len(cache_row) < 6 or not cache_row[5]:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(cache_row[5])
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_cooldown_active(cache_row, rank):
+    """Return True when a rank>200 preserved retry must wait longer."""
+    try:
+        rank_num = int(rank or 9999)
+    except (TypeError, ValueError):
+        rank_num = 9999
+    if rank_num <= 200:
+        return False
+    next_after = _cache_next_scrape_after(cache_row)
+    return bool(next_after and datetime.datetime.now() < next_after)
+
+
+def _next_retry_state(cache_row, rank):
+    """Return (retry_count, next_after_iso) for an unconfirmed scrape."""
+    try:
+        rank_num = int(rank or 9999)
+    except (TypeError, ValueError):
+        rank_num = 9999
+    if rank_num <= 200:
+        return 0, None
+    retry_count = _cache_retry_count(cache_row) + 1
+    delay_hours = 24 if retry_count == 1 else 168
+    next_after = datetime.datetime.now() + datetime.timedelta(hours=delay_hours)
+    return retry_count, next_after.isoformat()
+
+
 def _matches_changed(cache_row, match_signature):
     """Return True if the completed-match digest changed."""
     if not match_signature:
@@ -740,6 +784,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
         "stale": 0,
         "stale_reasons": {},
         "activity_statuses": {},
+        "retry_cooldown": 0,
         "skipped": 0,
         "attempted": 0,
         "confirmed": 0,
@@ -875,6 +920,12 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                     fingerprints[name] = fp
                     logger.debug("Skipping %s (%s)", name, status)
                     continue
+                if _retry_cooldown_active(cache_row, entry.get("rank")):
+                    report["retry_cooldown"] += 1
+                    logger.info(
+                        "Skipping %s (retry cooldown until %s)",
+                        name, cache_row[5])
+                    continue
 
                 # OFFICIAL indicates a played result.  Confirmation is still
                 # handled after the HTTP scrape by comparing completed-match
@@ -924,7 +975,9 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                 "activity_fingerprint) "
                 "VALUES (?, ?, 0, ?) "
                 "ON CONFLICT(player_name) DO UPDATE SET "
-                "activity_fingerprint = excluded.activity_fingerprint",
+                "activity_fingerprint = excluded.activity_fingerprint, "
+                "scrape_retry_count = 0, "
+                "next_scrape_after = NULL",
                 [(n, now_iso, fp) for fp, n in skipped_updates])
             db.conn.commit()
 
@@ -1015,6 +1068,12 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                 fp_to_store = (fingerprints.get(name)
                                if confirmed or not had_cache or ta_not_found
                                else None)
+                retry_count = None
+                next_scrape_after = None
+                if (fp_to_store is None and needs_confirmed_activity
+                        and had_cache and not ta_not_found):
+                    retry_count, next_scrape_after = _next_retry_state(
+                        cache_row, futures[future].get("rank"))
                 if db is not None:
                     try:
                         db.update_scrape_cache(
@@ -1024,6 +1083,8 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                             match_signature=(match_signature
                                              if fp_to_store is not None else None),
                             activity_fingerprint=fp_to_store,
+                            scrape_retry_count=retry_count,
+                            next_scrape_after=next_scrape_after,
                         )
                     except Exception as cache_exc:
                         logger.warning(

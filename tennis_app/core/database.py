@@ -222,7 +222,9 @@ class TennisDatabase:
                 match_count INTEGER DEFAULT 0,
                 last_match_date TEXT,
                 activity_fingerprint TEXT,
-                match_signature TEXT
+                match_signature TEXT,
+                scrape_retry_count INTEGER DEFAULT 0,
+                next_scrape_after TEXT
             );
 
             CREATE TABLE IF NOT EXISTS doubles_matches (
@@ -482,6 +484,13 @@ class TennisDatabase:
             cur.execute("ALTER TABLE scrape_cache ADD COLUMN match_signature TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
+        # Migrate scrape_cache: add retry cooldown columns.
+        for col, typ in [("scrape_retry_count", "INTEGER DEFAULT 0"),
+                         ("next_scrape_after", "TEXT")]:
+            try:
+                cur.execute(f"ALTER TABLE scrape_cache ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         # Migrate extended_stats_cache: add activity_fingerprint column.
         try:
             cur.execute("ALTER TABLE extended_stats_cache ADD COLUMN activity_fingerprint TEXT")
@@ -2784,7 +2793,9 @@ class TennisDatabase:
     def update_scrape_cache(self, player_name, match_count,
                             last_match_date=None,
                             match_signature=None,
-                            activity_fingerprint=None):
+                            activity_fingerprint=None,
+                            scrape_retry_count=None,
+                            next_scrape_after=None):
         """Record that a player was just scraped.
 
         If *activity_fingerprint* is None, the existing stored
@@ -2809,16 +2820,29 @@ class TennisDatabase:
                 "last_match_date = COALESCE(excluded.last_match_date, "
                 "                          scrape_cache.last_match_date), "
                 "match_signature = COALESCE(excluded.match_signature, "
-                "                           scrape_cache.match_signature)",
+                "                           scrape_cache.match_signature), "
+                "scrape_retry_count = COALESCE(?, "
+                "                              scrape_cache.scrape_retry_count), "
+                "next_scrape_after = COALESCE(?, "
+                "                             scrape_cache.next_scrape_after)",
                 (player_name, now_iso, match_count, last_match_date,
-                 match_signature)
+                 match_signature, scrape_retry_count, next_scrape_after)
             )
         else:
             self.conn.execute(
-                "INSERT OR REPLACE INTO scrape_cache "
+                "INSERT INTO scrape_cache "
                 "(player_name, last_scraped, match_count, last_match_date, "
-                "activity_fingerprint, match_signature) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "activity_fingerprint, match_signature, scrape_retry_count, "
+                "next_scrape_after) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, NULL) "
+                "ON CONFLICT(player_name) DO UPDATE SET "
+                "last_scraped = excluded.last_scraped, "
+                "match_count = excluded.match_count, "
+                "last_match_date = excluded.last_match_date, "
+                "activity_fingerprint = excluded.activity_fingerprint, "
+                "match_signature = excluded.match_signature, "
+                "scrape_retry_count = 0, "
+                "next_scrape_after = NULL",
                 (player_name, now_iso, match_count,
                  last_match_date, activity_fingerprint, match_signature)
             )
@@ -2839,16 +2863,18 @@ class TennisDatabase:
 
         Returns a dict
         ``{player_name: (last_scraped_iso, fingerprint, last_match_date,
-        match_signature)}``.
+        match_signature, retry_count, next_scrape_after)}``.
         Used to avoid 1000+ sequential round-trips when checking activity
         for top-N rankings against a remote (Turso) database.
         """
         rows = self.conn.execute(
             "SELECT player_name, last_scraped, activity_fingerprint, "
-            "last_match_date, match_signature "
+            "last_match_date, match_signature, scrape_retry_count, "
+            "next_scrape_after "
             "FROM scrape_cache"
         ).fetchall()
-        return {r[0]: (r[1], r[2], r[3], r[4]) for r in rows}
+        return {r[0]: (r[1], r[2], r[3], r[4], r[5] or 0, r[6])
+                for r in rows}
 
     def get_players_with_due_upcoming(self, today_yyyymmdd: str | None = None):
         """Return the set of player names that have at least one match

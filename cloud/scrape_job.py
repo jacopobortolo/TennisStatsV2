@@ -40,11 +40,13 @@ def _log_tour_report(tour, match_report, extended_report=None):
     """Emit a compact end-of-tour scrape summary for GitHub Actions logs."""
     logger.info("--- %s scrape summary ---", tour.upper())
     logger.info(
-        "rankings=%s source=%s stale=%s skipped=%s reasons=[%s]",
+        "rankings=%s source=%s stale=%s skipped=%s retry_cooldown=%s "
+        "reasons=[%s]",
         match_report.get("rankings", 0),
         match_report.get("source") or "?",
         match_report.get("stale", 0),
         match_report.get("skipped", 0),
+        match_report.get("retry_cooldown", 0),
         _format_counts(match_report.get("stale_reasons", {})),
     )
     logger.info(
