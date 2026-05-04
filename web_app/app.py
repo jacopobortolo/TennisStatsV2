@@ -29,9 +29,16 @@ if str(ROOT) not in sys.path:
 
 SNAPSHOT_TTL_SECONDS = int(os.environ.get("TENNIS_WEB_SNAPSHOT_TTL", "14400"))
 WEB_SNAPSHOT_PAGE_SIZE = int(os.environ.get("TENNIS_WEB_SNAPSHOT_PAGE_SIZE", "1000"))
-SNAPSHOT_ENGINE_VERSION = "web-snapshot-no-ddl-v3"
+SNAPSHOT_ENGINE_VERSION = "web-snapshot-no-ddl-v4"
 ENV_KEYS = ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "TURSO_LOCAL_PATH")
 SNAPSHOT_REQUIRED_TABLES = ("players", "matches")
+WEB_SNAPSHOT_TABLES = (
+    "players", "matches", "rankings", "doubles_matches",
+    "scrape_cache", "extended_stats_cache",
+    "match_winners_errors", "match_serve_speed", "match_pbp_stats",
+    "match_mcp_serve", "match_mcp_return", "match_mcp_rally",
+    "match_mcp_tactics",
+)
 
 LEVEL_LABELS = {
     "G": "Grand Slam",
@@ -144,6 +151,10 @@ def _format_counts(counts: dict[str, int]) -> str:
     return ", ".join(parts)
 
 
+def _format_table_counts(counts: dict[str, int], tables: tuple[str, ...] = SNAPSHOT_REQUIRED_TABLES) -> str:
+    return ", ".join(f"{table}={counts.get(table, 0):,}" for table in tables)
+
+
 def _remote_snapshot_counts() -> dict[str, int]:
     _apply_streamlit_secrets()
     import libsql_client
@@ -222,7 +233,7 @@ def _create_local_table_from_rows(
 def _download_web_snapshot(dest: Path) -> Path:
     _apply_streamlit_secrets()
     import libsql_client
-    from cloud.db import SNAPSHOT_TABLES, _auth_token, _http_url
+    from cloud.db import _auth_token, _http_url
 
     remote_counts = _remote_snapshot_counts()
     if any(remote_counts.get(table, 0) <= 0 for table in SNAPSHOT_REQUIRED_TABLES):
@@ -253,7 +264,8 @@ def _download_web_snapshot(dest: Path) -> Path:
         if missing_required:
             raise RuntimeError("Remote Turso is missing required tables: " + ", ".join(missing_required))
 
-        wanted = [table for table in SNAPSHOT_TABLES if table in remote_tables]
+        wanted = [table for table in WEB_SNAPSHOT_TABLES if table in remote_tables]
+        copied_by_table = {}
         for table in wanted:
             quoted_table = _quote_identifier(table)
             offset = 0
@@ -288,6 +300,7 @@ def _download_web_snapshot(dest: Path) -> Path:
                 raise RuntimeError(
                     f"Copied 0 rows for required table {table}; created={created}; remote counts were {_format_counts(remote_counts)}"
                 )
+            copied_by_table[table] = copied
 
         local.commit()
         local.close()
@@ -297,7 +310,8 @@ def _download_web_snapshot(dest: Path) -> Path:
         if any(copied_counts.get(table, 0) <= 0 for table in SNAPSHOT_REQUIRED_TABLES):
             raise RuntimeError(
                 f"{SNAPSHOT_ENGINE_VERSION}: downloaded snapshot is empty after copy "
-                f"({_format_counts(copied_counts)}); remote counts were {_format_counts(remote_counts)}."
+                f"({_format_counts(copied_counts)}); copied rows were "
+                f"{_format_table_counts(copied_by_table)}; remote counts were {_format_counts(remote_counts)}."
             )
 
         if dest.exists():
