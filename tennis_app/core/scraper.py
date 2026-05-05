@@ -206,8 +206,8 @@ class TennisAbstractScraper:
 
         all_matches = []
 
-        # WTA uses wplayer-classic.cgi, ATP uses player-classic.cgi
-        cgi = "wplayer-classic.cgi" if tour == "wta" else "player-classic.cgi"
+        # WTA uses wplayer.cgi, ATP uses player-classic.cgi
+        cgi = "wplayer.cgi" if tour == "wta" else "player-classic.cgi"
 
         # Try HTML page first (has embedded JS data), then JS fallback,
         # for each URL variant.  Stop at the first one that yields data.
