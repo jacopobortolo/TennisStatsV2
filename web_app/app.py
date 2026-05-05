@@ -27,9 +27,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-SNAPSHOT_TTL_SECONDS = int(os.environ.get("TENNIS_WEB_SNAPSHOT_TTL", "14400"))
-WEB_SNAPSHOT_PAGE_SIZE = int(os.environ.get("TENNIS_WEB_SNAPSHOT_PAGE_SIZE", "1000"))
-SNAPSHOT_ENGINE_VERSION = "web-snapshot-no-ddl-v4"
+SNAPSHOT_TTL_SECONDS = int(os.environ.get("TENNIS_WEB_SNAPSHOT_TTL", "604800"))
+WEB_SNAPSHOT_PAGE_SIZE = int(os.environ.get("TENNIS_WEB_SNAPSHOT_PAGE_SIZE", "5000"))
+WEB_AUTO_REFRESH = os.environ.get("TENNIS_WEB_AUTO_REFRESH", "0").strip().lower() in {"1", "true", "yes"}
+WEB_REMOTE_DIAGNOSTICS = os.environ.get("TENNIS_WEB_REMOTE_DIAGNOSTICS", "0").strip().lower() in {"1", "true", "yes"}
+SNAPSHOT_ENGINE_VERSION = "web-snapshot-keyset-v5"
 ENV_KEYS = ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "TURSO_LOCAL_PATH")
 SNAPSHOT_REQUIRED_TABLES = ("players", "matches")
 WEB_SNAPSHOT_TABLES = (
@@ -60,6 +62,15 @@ GLOBAL_STATS = {
     "Weeks at No. 1 streak": "streak_weeks_at_no1",
     "Most bagels given": "most_bagels_given",
     "Deciding-set win percentage": "deciding_set_win_pct",
+}
+
+GLOBAL_LEVEL_OPTIONS = {
+    "All": None,
+    "Grand Slam": "Grand Slam",
+    "Masters 1000": "Masters 1000",
+    "Tour-level": "ATP 250",
+    "ATP Finals": "ATP Finals",
+    "Challenger": "Challenger",
 }
 
 EXTENDED_TABLES = {
@@ -235,13 +246,6 @@ def _download_web_snapshot(dest: Path) -> Path:
     import libsql_client
     from cloud.db import _auth_token, _http_url
 
-    remote_counts = _remote_snapshot_counts()
-    if any(remote_counts.get(table, 0) <= 0 for table in SNAPSHOT_REQUIRED_TABLES):
-        raise RuntimeError(
-            "Remote Turso does not contain usable tennis data "
-            f"({_format_counts(remote_counts)}). Check TURSO_DATABASE_URL."
-        )
-
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".tmp.db")
     if tmp.exists():
@@ -255,34 +259,33 @@ def _download_web_snapshot(dest: Path) -> Path:
         local.execute("PRAGMA journal_mode=OFF")
         local.execute("PRAGMA synchronous=OFF")
 
-        result = client.execute(
-            "SELECT name, sql FROM sqlite_master "
-            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        )
-        remote_tables = {str(row[0]): str(row[1]) for row in result.rows}
-        missing_required = [table for table in SNAPSHOT_REQUIRED_TABLES if table not in remote_tables]
-        if missing_required:
-            raise RuntimeError("Remote Turso is missing required tables: " + ", ".join(missing_required))
-
-        wanted = [table for table in WEB_SNAPSHOT_TABLES if table in remote_tables]
         copied_by_table = {}
-        for table in wanted:
+        for table in WEB_SNAPSHOT_TABLES:
             quoted_table = _quote_identifier(table)
-            offset = 0
+            last_rowid = 0
             copied = 0
             created = False
             while True:
-                result = client.execute(
-                    f"SELECT * FROM {quoted_table} LIMIT {WEB_SNAPSHOT_PAGE_SIZE} OFFSET {offset}"
-                )
+                try:
+                    result = client.execute(
+                        f"SELECT rowid AS __snapshot_rowid, * FROM {quoted_table} "
+                        f"WHERE rowid > {last_rowid} ORDER BY rowid LIMIT {WEB_SNAPSHOT_PAGE_SIZE}"
+                    )
+                except Exception as exc:
+                    message = str(exc).lower()
+                    if "no such table" in message and table not in SNAPSHOT_REQUIRED_TABLES:
+                        copied_by_table[table] = 0
+                        break
+                    raise RuntimeError(f"Turso query failed while copying table {table}: {exc}") from exc
                 rows = list(result.rows or [])
-                columns = [str(column) for column in list(result.columns or [])]
-                if not columns:
+                raw_columns = [str(column) for column in list(result.columns or [])]
+                if not raw_columns:
                     if rows:
                         raise RuntimeError(f"Remote query for {table} returned rows but no column metadata")
                     break
+                columns = raw_columns[1:]
                 if not created:
-                    _create_local_table_from_rows(local, table, columns, rows)
+                    _create_local_table_from_rows(local, table, columns, [row[1:] for row in rows])
                     created = True
                 if not rows:
                     break
@@ -290,15 +293,15 @@ def _download_web_snapshot(dest: Path) -> Path:
                 placeholders = ", ".join("?" for _ in columns)
                 local.executemany(
                     f"INSERT INTO {quoted_table} ({column_list}) VALUES ({placeholders})",
-                    [tuple(row) for row in rows],
+                    [tuple(row[1:]) for row in rows],
                 )
                 copied += len(rows)
-                offset += len(rows)
+                last_rowid = int(rows[-1][0])
                 if len(rows) < WEB_SNAPSHOT_PAGE_SIZE:
                     break
             if table in SNAPSHOT_REQUIRED_TABLES and copied <= 0:
                 raise RuntimeError(
-                    f"Copied 0 rows for required table {table}; created={created}; remote counts were {_format_counts(remote_counts)}"
+                    f"Copied 0 rows for required table {table}; created={created}."
                 )
             copied_by_table[table] = copied
 
@@ -311,7 +314,7 @@ def _download_web_snapshot(dest: Path) -> Path:
             raise RuntimeError(
                 f"{SNAPSHOT_ENGINE_VERSION}: downloaded snapshot is empty after copy "
                 f"({_format_counts(copied_counts)}); copied rows were "
-                f"{_format_table_counts(copied_by_table)}; remote counts were {_format_counts(remote_counts)}."
+                f"{_format_table_counts(copied_by_table)}."
             )
 
         if dest.exists():
@@ -363,6 +366,10 @@ def _validate_snapshot(db) -> dict[str, int]:
 
 
 def _empty_snapshot_error(exc: Exception) -> RuntimeError:
+    if not WEB_REMOTE_DIAGNOSTICS:
+        return RuntimeError(
+            f"{exc}\nRemote row-count diagnostics are disabled to avoid extra Turso reads."
+        )
     try:
         remote_counts = _remote_snapshot_counts()
     except Exception as remote_exc:
@@ -379,6 +386,8 @@ def _empty_snapshot_error(exc: Exception) -> RuntimeError:
 def _snapshot_is_stale(path: Path) -> bool:
     if not path.exists():
         return True
+    if not WEB_AUTO_REFRESH:
+        return False
     age_seconds = time.time() - path.stat().st_mtime
     return age_seconds >= SNAPSHOT_TTL_SECONDS
 
@@ -545,6 +554,39 @@ def render_snapshot_status(db) -> None:
         st.caption(f"Snapshot engine: {SNAPSHOT_ENGINE_VERSION}")
 
 
+def render_global_dataset_coverage(db) -> None:
+    coverage = run_query(
+        db,
+        """
+        SELECT
+          COUNT(*) AS total_matches,
+          SUM(CASE WHEN tourney_id = 'SCRAPED' THEN 1 ELSE 0 END) AS scraped_matches,
+          SUM(CASE WHEN tourney_id != 'SCRAPED' THEN 1 ELSE 0 END) AS historical_matches,
+          MIN(SUBSTR(tourney_date, 1, 4)) AS first_year,
+          MAX(SUBSTR(tourney_date, 1, 4)) AS last_year
+        FROM matches
+        WHERE is_upcoming = 0 OR is_upcoming IS NULL
+        """,
+    )
+    if coverage.empty:
+        return
+    row = coverage.iloc[0]
+    total = int(row.total_matches or 0)
+    scraped = int(row.scraped_matches or 0)
+    historical = int(row.historical_matches or 0)
+    years = f"{row.first_year or '-'}-{row.last_year or '-'}"
+    if total and historical == 0:
+        st.warning(
+            "Global leaderboards are currently based on the live scraped cloud dataset only "
+            f"({scraped:,} matches, {years}). Historical CSV matches have not been imported into Turso yet, "
+            "so all-time records may be incomplete."
+        )
+    else:
+        st.caption(
+            f"Dataset coverage: {total:,} matches ({historical:,} historical CSV, {scraped:,} scraped), {years}."
+        )
+
+
 def render_header() -> None:
     st.set_page_config(page_title="TennisStatsV2 Web", layout="wide")
     st.markdown(
@@ -569,13 +611,14 @@ def render_header() -> None:
     with left:
         st.title("TennisStatsV2")
     with right:
+        allow_download = st.checkbox("Allow Turso download", value=False)
         refresh_col, rebuild_col = st.columns(2)
-        if refresh_col.button("Refresh snapshot", width="stretch"):
+        if refresh_col.button("Reload local", width="stretch"):
             get_db.clear()
-            st.session_state["snapshot_action"] = "refresh"
+            st.session_state["snapshot_action"] = "auto"
             st.session_state["refresh_token"] = st.session_state.get("refresh_token", 0) + 1
             st.rerun()
-        if rebuild_col.button("Rebuild snapshot", width="stretch"):
+        if rebuild_col.button("Rebuild from Turso", width="stretch", disabled=not allow_download):
             get_db.clear()
             st.session_state["snapshot_action"] = "rebuild"
             st.session_state["refresh_token"] = st.session_state.get("refresh_token", 0) + 1
@@ -828,10 +871,12 @@ def page_global(db) -> None:
     stat_name = controls[0].selectbox("Leaderboard", list(GLOBAL_STATS))
     tour = controls[1].segmented_control("Tour", ["atp", "wta"], default="atp", format_func=str.upper, key="global_tour")
     surface = controls[2].selectbox("Surface", [None, "Hard", "Clay", "Grass", "Carpet"], format_func=lambda x: "All" if x is None else x, key="global_surface")
-    level = controls[3].selectbox("Level", [None] + list(LEVEL_LABELS), format_func=lambda x: "All" if x is None else LEVEL_LABELS.get(x, x), key="global_level")
+    level_label = controls[3].selectbox("Level", list(GLOBAL_LEVEL_OPTIONS), key="global_level")
     limit = controls[4].number_input("Limit", min_value=10, max_value=100, value=50, step=10)
 
-    filters = {"tour": tour, "surface": surface, "tourney_level": level, "min_matches": 10}
+    render_global_dataset_coverage(db)
+
+    filters = {"tour": tour, "surface": surface, "level": GLOBAL_LEVEL_OPTIONS[level_label], "min_matches": 10}
     result = GlobalStatsEngine(db).compute(GLOBAL_STATS[stat_name], filters, limit=int(limit))
     rows = result.get("rows") or []
     if rows and isinstance(rows[0], dict):
