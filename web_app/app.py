@@ -874,9 +874,14 @@ def page_global(db) -> None:
     level_label = controls[3].selectbox("Level", list(GLOBAL_LEVEL_OPTIONS), key="global_level")
     limit = controls[4].number_input("Limit", min_value=10, max_value=100, value=50, step=10)
 
+    current_year = datetime.now().year
+    year_range = st.slider("Year range", 1990, current_year, (1990, current_year), key="global_year_range")
+    min_year = year_range[0] if year_range != (1990, current_year) else None
+    max_year = year_range[1] if year_range != (1990, current_year) else None
+
     render_global_dataset_coverage(db)
 
-    filters = {"tour": tour, "surface": surface, "level": GLOBAL_LEVEL_OPTIONS[level_label], "min_matches": 10}
+    filters = {"tour": tour, "surface": surface, "level": GLOBAL_LEVEL_OPTIONS[level_label], "min_matches": 10, "min_year": min_year, "max_year": max_year}
     result = GlobalStatsEngine(db).compute(GLOBAL_STATS[stat_name], filters, limit=int(limit))
     rows = result.get("rows") or []
     if rows and isinstance(rows[0], dict):

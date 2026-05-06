@@ -86,13 +86,18 @@ class GlobalStatsEngine:
             if level:
                 conditions.append(f"{alias}.tourney_level = ?")
                 params.append(level)
-        year_from, year_to = self._era_years(filters.get("era"))
-        if year_from:
+        min_year = filters.get("min_year")
+        max_year = filters.get("max_year")
+        if not min_year and not max_year:
+            year_from, year_to = self._era_years(filters.get("era"))
+            min_year = year_from
+            max_year = year_to
+        if min_year:
             conditions.append(f"SUBSTR({alias}.tourney_date, 1, 4) >= ?")
-            params.append(str(year_from))
-        if year_to:
+            params.append(str(min_year))
+        if max_year:
             conditions.append(f"SUBSTR({alias}.tourney_date, 1, 4) <= ?")
-            params.append(str(year_to))
+            params.append(str(max_year))
         if include_round:
             round_ = filters.get("round")
             if round_ and round_ != "All":

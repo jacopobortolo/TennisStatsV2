@@ -428,6 +428,24 @@ class GlobalStatsPage(QWidget):
             filters_layout.addWidget(self._label(label))
             filters_layout.addWidget(combo)
 
+        filters_layout.addWidget(self._label("From"))
+        self.year_from = QSpinBox()
+        self.year_from.setRange(0, 2030)
+        self.year_from.setValue(0)
+        self.year_from.setSpecialValueText("—")
+        self.year_from.setFixedWidth(72)
+        self.year_from.valueChanged.connect(lambda _: self._on_filter_changed())
+        filters_layout.addWidget(self.year_from)
+
+        filters_layout.addWidget(self._label("To"))
+        self.year_to = QSpinBox()
+        self.year_to.setRange(0, 2030)
+        self.year_to.setValue(0)
+        self.year_to.setSpecialValueText("—")
+        self.year_to.setFixedWidth(72)
+        self.year_to.valueChanged.connect(lambda _: self._on_filter_changed())
+        filters_layout.addWidget(self.year_to)
+
         filters_layout.addWidget(self._label("Min"))
         self.min_matches = QSpinBox()
         self.min_matches.setRange(0, 500)
@@ -652,6 +670,8 @@ class GlobalStatsPage(QWidget):
             "tour": self.tour_combo.currentText(),
             "round": self.round_combo.currentText(),
             "min_matches": self.min_matches.value(),
+            "min_year": self.year_from.value() or None,
+            "max_year": self.year_to.value() or None,
             "milestone": 150,
         }
 
