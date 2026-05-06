@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QStandardItem, QStandardItemModel
 
 from ..widgets import DataTable, SearchBar, Separator, PillButtonGroup
 from ..theme import COLORS, FONTS
@@ -37,6 +38,77 @@ class _GlobalStatWorker(QThread):
             self.data_ready.emit(self._stat_id, result)
         except Exception as exc:
             self.error.emit(self._stat_id, str(exc))
+
+
+class CheckableComboBox(QComboBox):
+    """Combo box with checkbox items and a sticky All option."""
+
+    changed = Signal(list)
+
+    def __init__(self, values, parent=None):
+        super().__init__(parent)
+        self._all_label = values[0] if values else "All"
+        self._ignore_hide = False
+        self.setModel(QStandardItemModel(self))
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setCursor(Qt.ArrowCursor)
+        self.view().pressed.connect(self._on_item_pressed)
+
+        for index, value in enumerate(values):
+            item = QStandardItem(value)
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            item.setData(Qt.Checked if index == 0 else Qt.Unchecked,
+                         Qt.CheckStateRole)
+            self.model().appendRow(item)
+        self._update_text()
+
+    def hidePopup(self):
+        if self._ignore_hide:
+            self._ignore_hide = False
+            return
+        super().hidePopup()
+
+    def _on_item_pressed(self, index):
+        item = self.model().itemFromIndex(index)
+        if item is None:
+            return
+        checked = item.checkState() == Qt.Checked
+        item.setCheckState(Qt.Unchecked if checked else Qt.Checked)
+        if item.text() == self._all_label:
+            if item.checkState() == Qt.Checked:
+                self._set_others(Qt.Unchecked)
+            else:
+                item.setCheckState(Qt.Checked)
+        else:
+            self.model().item(0).setCheckState(Qt.Unchecked)
+            if not self.values():
+                self.model().item(0).setCheckState(Qt.Checked)
+        self._update_text()
+        self.changed.emit(self.values())
+        self._ignore_hide = True
+
+    def _set_others(self, state):
+        for row in range(1, self.model().rowCount()):
+            self.model().item(row).setCheckState(state)
+
+    def _update_text(self):
+        values = self.values()
+        if not values:
+            text = self._all_label
+        elif len(values) <= 2:
+            text = ", ".join(values)
+        else:
+            text = f"{values[0]}, {values[1]} +{len(values) - 2}"
+        self.lineEdit().setText(text)
+
+    def values(self):
+        selected = []
+        for row in range(1, self.model().rowCount()):
+            item = self.model().item(row)
+            if item.checkState() == Qt.Checked:
+                selected.append(item.text())
+        return selected
 
 
 SECTIONS = [
@@ -412,12 +484,16 @@ class GlobalStatsPage(QWidget):
         self.search_bar.line_edit.textChanged.connect(lambda _: self._apply_filters())
         filters_layout.addWidget(self.search_bar, 2)
 
-        self.tour_combo = self._combo(["All", "ATP", "WTA"])
-        self.level_combo = self._combo(["All", "Grand Slam", "Masters 1000", "ATP Finals",
-                                        "Olympics", "ATP 500", "ATP 250", "Challenger"])
-        self.surface_combo = self._combo(["All", "Hard", "Clay", "Grass", "Carpet"])
-        self.era_combo = self._combo(["All-time", "Open Era", "2000s", "2010s", "2020s"])
-        self.round_combo = self._combo(["All", "F", "SF", "QF", "R16", "R32", "R64", "R128", "RR", "Q3", "Q2", "Q1"])
+        self.tour_combo = self._multi_combo(["All", "ATP", "WTA"])
+        self.level_combo = self._multi_combo([
+            "All", "Grand Slam", "Masters 1000", "ATP Finals",
+            "Olympics", "ATP 500", "ATP 250", "Challenger",
+        ])
+        self.surface_combo = self._multi_combo(["All", "Hard", "Clay", "Grass", "Carpet"])
+        self.era_combo = self._multi_combo(["All-time", "Open Era", "2000s", "2010s", "2020s"])
+        self.round_combo = self._multi_combo([
+            "All", "F", "SF", "QF", "R16", "R32", "R64", "R128", "RR", "Q3", "Q2", "Q1",
+        ])
 
         for label, combo in [
                 ("Tour", self.tour_combo),
@@ -591,6 +667,12 @@ class GlobalStatsPage(QWidget):
         combo.currentIndexChanged.connect(lambda _: self._on_filter_changed())
         return combo
 
+    def _multi_combo(self, values):
+        combo = CheckableComboBox(values)
+        combo.changed.connect(lambda _: self._on_filter_changed())
+        combo.setMinimumWidth(96)
+        return combo
+
     def _label(self, text):
         label = QLabel(text + ":")
         label.setObjectName("dimLabel")
@@ -664,11 +746,11 @@ class GlobalStatsPage(QWidget):
     def _current_filters(self):
         return {
             "category": self._category,
-            "level": self.level_combo.currentText(),
-            "surface": self.surface_combo.currentText(),
-            "era": self.era_combo.currentText(),
-            "tour": self.tour_combo.currentText(),
-            "round": self.round_combo.currentText(),
+            "level": self.level_combo.values(),
+            "surface": self.surface_combo.values(),
+            "era": self.era_combo.values(),
+            "tour": self.tour_combo.values(),
+            "round": self.round_combo.values(),
             "min_matches": self.min_matches.value(),
             "min_year": self.year_from.value() or None,
             "max_year": self.year_to.value() or None,

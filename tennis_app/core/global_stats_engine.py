@@ -68,30 +68,70 @@ class GlobalStatsEngine:
     # Generic SQL helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _filter_values(value, all_labels=("All", "All-time", "Open Era")):
+        if value in (None, ""):
+            return []
+        if isinstance(value, (list, tuple, set)):
+            values = value
+        else:
+            values = [value]
+        return [str(item) for item in values
+                if item not in (None, "") and str(item) not in all_labels]
+
+    @staticmethod
+    def _add_in_filter(conditions, params, expression, values):
+        if not values:
+            return
+        placeholders = ", ".join("?" for _ in values)
+        conditions.append(f"{expression} IN ({placeholders})")
+        params.extend(values)
+
+    def _add_era_filter(self, conditions, params, alias, era_filter):
+        era_values = self._filter_values(era_filter)
+        if not era_values:
+            return
+        clauses = []
+        for era in era_values:
+            year_from, year_to = self._era_years(era)
+            era_conditions = []
+            if year_from:
+                era_conditions.append(f"SUBSTR({alias}.tourney_date, 1, 4) >= ?")
+                params.append(str(year_from))
+            if year_to:
+                era_conditions.append(f"SUBSTR({alias}.tourney_date, 1, 4) <= ?")
+                params.append(str(year_to))
+            if era_conditions:
+                clauses.append(" AND ".join(era_conditions))
+        if clauses:
+            conditions.append("(" + " OR ".join(f"({clause})" for clause in clauses) + ")")
+
+    def _round_threshold(self, value, default="QF"):
+        values = self._filter_values(value)
+        if not values:
+            return default
+        return min(values, key=lambda item: self._round_rank(item))
+
     def _where(self, filters, alias="m", include_level=True,
                include_surface=True, include_round=True):
         conditions = [f"({alias}.is_upcoming = 0 OR {alias}.is_upcoming IS NULL)"]
         params = []
-        tour = filters.get("tour")
-        if tour and tour != "All":
-            conditions.append(f"{alias}.tour = ?")
-            params.append(tour.lower())
+        tour_values = [tour.lower() for tour in self._filter_values(filters.get("tour"))]
+        self._add_in_filter(conditions, params, f"{alias}.tour", tour_values)
         if include_surface:
-            surface = filters.get("surface")
-            if surface and surface != "All":
-                conditions.append(f"{alias}.surface = ?")
-                params.append(surface)
+            surface_values = self._filter_values(filters.get("surface"))
+            self._add_in_filter(conditions, params, f"{alias}.surface", surface_values)
         if include_level:
-            level = LEVEL_FILTERS.get(filters.get("level"))
-            if level:
-                conditions.append(f"{alias}.tourney_level = ?")
-                params.append(level)
+            level_values = []
+            for level in self._filter_values(filters.get("level")):
+                level_code = LEVEL_FILTERS.get(level)
+                if level_code and level_code not in level_values:
+                    level_values.append(level_code)
+            self._add_in_filter(conditions, params, f"{alias}.tourney_level", level_values)
         min_year = filters.get("min_year")
         max_year = filters.get("max_year")
         if not min_year and not max_year:
-            year_from, year_to = self._era_years(filters.get("era"))
-            min_year = year_from
-            max_year = year_to
+            self._add_era_filter(conditions, params, alias, filters.get("era"))
         if min_year:
             conditions.append(f"SUBSTR({alias}.tourney_date, 1, 4) >= ?")
             params.append(str(min_year))
@@ -99,10 +139,8 @@ class GlobalStatsEngine:
             conditions.append(f"SUBSTR({alias}.tourney_date, 1, 4) <= ?")
             params.append(str(max_year))
         if include_round:
-            round_ = filters.get("round")
-            if round_ and round_ != "All":
-                conditions.append(f"{alias}.round = ?")
-                params.append(round_)
+            round_values = self._filter_values(filters.get("round"))
+            self._add_in_filter(conditions, params, f"{alias}.round", round_values)
         return " AND ".join(conditions), params
 
     def _player_match_cte(self, filters, extra_where=""):
@@ -807,17 +845,31 @@ class GlobalStatsEngine:
     def _ranking_streak(self, filters, limit, rank_limit):
         base_conditions = ["r.ranking_date GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'"]
         base_params = []
-        tour = filters.get("tour")
-        if tour and tour != "All":
-            base_conditions.append("r.tour = ?")
-            base_params.append(tour.lower())
-        y1, y2 = self._era_years(filters.get("era"))
-        if y1:
+        tour_values = [tour.lower() for tour in self._filter_values(filters.get("tour"))]
+        self._add_in_filter(base_conditions, base_params, "r.tour", tour_values)
+        min_year = filters.get("min_year")
+        max_year = filters.get("max_year")
+        if min_year:
             base_conditions.append("SUBSTR(r.ranking_date,1,4) >= ?")
-            base_params.append(str(y1))
-        if y2:
+            base_params.append(str(min_year))
+        if max_year:
             base_conditions.append("SUBSTR(r.ranking_date,1,4) <= ?")
-            base_params.append(str(y2))
+            base_params.append(str(max_year))
+        if not min_year and not max_year:
+            era_clauses = []
+            for era in self._filter_values(filters.get("era")):
+                y1, y2 = self._era_years(era)
+                parts = []
+                if y1:
+                    parts.append("SUBSTR(r.ranking_date,1,4) >= ?")
+                    base_params.append(str(y1))
+                if y2:
+                    parts.append("SUBSTR(r.ranking_date,1,4) <= ?")
+                    base_params.append(str(y2))
+                if parts:
+                    era_clauses.append(" AND ".join(parts))
+            if era_clauses:
+                base_conditions.append("(" + " OR ".join(f"({clause})" for clause in era_clauses) + ")")
         base_where = " AND ".join(base_conditions)
 
         snapshot_rows = self._query(f"""
@@ -1064,11 +1116,11 @@ class GlobalStatsEngine:
         return self._round_reached_streak(filters, limit, "Masters 1000", default_round="SF")
 
     def _stat_deep_run_streak(self, filters, limit):
-        selected_round = filters.get("round") if filters.get("round") != "All" else "QF"
+        selected_round = self._round_threshold(filters.get("round"), "QF")
         return self._round_reached_streak(filters, limit, None, default_round=selected_round)
 
     def _round_reached_streak(self, filters, limit, forced_level, default_round="SF"):
-        threshold = filters.get("round") if filters.get("round") != "All" else default_round
+        threshold = self._round_threshold(filters.get("round"), default_round)
         threshold_rank = self._round_rank(threshold)
         events = self._event_results(filters, forced_level=forced_level)
         results = self._streak_from_boolean_events(
@@ -1304,7 +1356,7 @@ class GlobalStatsEngine:
         return [(row["player"], row["value"], row["detail"] or "") for row in rows]
 
     def _stat_lucky_loser_deep_runs(self, filters, limit):
-        threshold = filters.get("round") if filters.get("round") != "All" else "QF"
+        threshold = self._round_threshold(filters.get("round"), "QF")
         threshold_rank = self._round_rank(threshold)
         counts = defaultdict(int)
         samples = defaultdict(list)
