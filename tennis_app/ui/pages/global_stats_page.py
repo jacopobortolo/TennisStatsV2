@@ -7,14 +7,13 @@ registry first; individual rows can later be wired to concrete SQL queries.
 """
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSpinBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
     QListWidget, QListWidgetItem, QSplitter, QFrame, QPushButton,
     QSizePolicy,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QStandardItem, QStandardItemModel
 
-from ..widgets import DataTable, SearchBar, Separator, PillButtonGroup
+from ..widgets import DataTable, SearchBar, Separator, PillButtonGroup, MultiPillButtonGroup
 from ..theme import COLORS, FONTS
 from ...core.global_stats_engine import GlobalStatsEngine
 
@@ -38,77 +37,6 @@ class _GlobalStatWorker(QThread):
             self.data_ready.emit(self._stat_id, result)
         except Exception as exc:
             self.error.emit(self._stat_id, str(exc))
-
-
-class CheckableComboBox(QComboBox):
-    """Combo box with checkbox items and a sticky All option."""
-
-    changed = Signal(list)
-
-    def __init__(self, values, parent=None):
-        super().__init__(parent)
-        self._all_label = values[0] if values else "All"
-        self._ignore_hide = False
-        self.setModel(QStandardItemModel(self))
-        self.setEditable(True)
-        self.lineEdit().setReadOnly(True)
-        self.lineEdit().setCursor(Qt.ArrowCursor)
-        self.view().pressed.connect(self._on_item_pressed)
-
-        for index, value in enumerate(values):
-            item = QStandardItem(value)
-            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-            item.setData(Qt.Checked if index == 0 else Qt.Unchecked,
-                         Qt.CheckStateRole)
-            self.model().appendRow(item)
-        self._update_text()
-
-    def hidePopup(self):
-        if self._ignore_hide:
-            self._ignore_hide = False
-            return
-        super().hidePopup()
-
-    def _on_item_pressed(self, index):
-        item = self.model().itemFromIndex(index)
-        if item is None:
-            return
-        checked = item.checkState() == Qt.Checked
-        item.setCheckState(Qt.Unchecked if checked else Qt.Checked)
-        if item.text() == self._all_label:
-            if item.checkState() == Qt.Checked:
-                self._set_others(Qt.Unchecked)
-            else:
-                item.setCheckState(Qt.Checked)
-        else:
-            self.model().item(0).setCheckState(Qt.Unchecked)
-            if not self.values():
-                self.model().item(0).setCheckState(Qt.Checked)
-        self._update_text()
-        self.changed.emit(self.values())
-        self._ignore_hide = True
-
-    def _set_others(self, state):
-        for row in range(1, self.model().rowCount()):
-            self.model().item(row).setCheckState(state)
-
-    def _update_text(self):
-        values = self.values()
-        if not values:
-            text = self._all_label
-        elif len(values) <= 2:
-            text = ", ".join(values)
-        else:
-            text = f"{values[0]}, {values[1]} +{len(values) - 2}"
-        self.lineEdit().setText(text)
-
-    def values(self):
-        selected = []
-        for row in range(1, self.model().rowCount()):
-            item = self.model().item(row)
-            if item.checkState() == Qt.Checked:
-                selected.append(item.text())
-        return selected
 
 
 SECTIONS = [
@@ -475,65 +403,73 @@ class GlobalStatsPage(QWidget):
 
         filters = QFrame()
         filters.setObjectName("globalFilters")
-        filters_layout = QHBoxLayout(filters)
+        filters_layout = QVBoxLayout(filters)
         filters_layout.setContentsMargins(12, 10, 12, 10)
         filters_layout.setSpacing(8)
 
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(8)
         self.search_bar = SearchBar("Search records...")
         self.search_bar.searched.connect(lambda _: self._apply_filters())
         self.search_bar.line_edit.textChanged.connect(lambda _: self._apply_filters())
-        filters_layout.addWidget(self.search_bar, 2)
+        search_row.addWidget(self.search_bar, 1)
+        filters_layout.addLayout(search_row)
 
-        self.tour_combo = self._multi_combo(["All", "ATP", "WTA"])
-        self.level_combo = self._multi_combo([
+        self.tour_pills = self._filter_pills(["All", "ATP", "WTA"])
+        self.level_pills = self._filter_pills([
             "All", "Grand Slam", "Masters 1000", "ATP Finals",
             "Olympics", "ATP 500", "ATP 250", "Challenger",
         ])
-        self.surface_combo = self._multi_combo(["All", "Hard", "Clay", "Grass", "Carpet"])
-        self.era_combo = self._multi_combo(["All-time", "Open Era", "2000s", "2010s", "2020s"])
-        self.round_combo = self._multi_combo([
+        self.surface_pills = self._filter_pills(["All", "Hard", "Clay", "Grass", "Carpet"])
+        self.era_pills = self._filter_pills(["All-time", "Open Era", "2000s", "2010s", "2020s"])
+        self.round_pills = self._filter_pills([
             "All", "F", "SF", "QF", "R16", "R32", "R64", "R128", "RR", "Q3", "Q2", "Q1",
         ])
 
-        for label, combo in [
-                ("Tour", self.tour_combo),
-                ("Level", self.level_combo),
-                ("Surface", self.surface_combo),
-                ("Era", self.era_combo),
-                ("Round", self.round_combo)]:
-            filters_layout.addWidget(self._label(label))
-            filters_layout.addWidget(combo)
+        for label, pills in [
+                ("Tour", self.tour_pills),
+                ("Level", self.level_pills),
+                ("Surface", self.surface_pills),
+                ("Era", self.era_pills),
+                ("Round", self.round_pills)]:
+            filters_layout.addLayout(self._filter_row(label, pills))
 
-        filters_layout.addWidget(self._label("From"))
+        numeric_row = QHBoxLayout()
+        numeric_row.setContentsMargins(0, 0, 0, 0)
+        numeric_row.setSpacing(8)
+        numeric_row.addWidget(self._label("From"))
         self.year_from = QSpinBox()
         self.year_from.setRange(0, 2030)
         self.year_from.setValue(0)
         self.year_from.setSpecialValueText("—")
         self.year_from.setFixedWidth(72)
         self.year_from.valueChanged.connect(lambda _: self._on_filter_changed())
-        filters_layout.addWidget(self.year_from)
+        numeric_row.addWidget(self.year_from)
 
-        filters_layout.addWidget(self._label("To"))
+        numeric_row.addWidget(self._label("To"))
         self.year_to = QSpinBox()
         self.year_to.setRange(0, 2030)
         self.year_to.setValue(0)
         self.year_to.setSpecialValueText("—")
         self.year_to.setFixedWidth(72)
         self.year_to.valueChanged.connect(lambda _: self._on_filter_changed())
-        filters_layout.addWidget(self.year_to)
+        numeric_row.addWidget(self.year_to)
 
-        filters_layout.addWidget(self._label("Min"))
+        numeric_row.addWidget(self._label("Min"))
         self.min_matches = QSpinBox()
         self.min_matches.setRange(0, 500)
         self.min_matches.setSingleStep(5)
         self.min_matches.setValue(20)
         self.min_matches.valueChanged.connect(lambda _: self._on_filter_changed())
-        filters_layout.addWidget(self.min_matches)
+        numeric_row.addWidget(self.min_matches)
+        numeric_row.addStretch()
 
         self.load_btn = QPushButton("Refresh")
         self.load_btn.setObjectName("accentBtn")
         self.load_btn.clicked.connect(self._load_current_stat)
-        filters_layout.addWidget(self.load_btn)
+        numeric_row.addWidget(self.load_btn)
+        filters_layout.addLayout(numeric_row)
         root.addWidget(filters)
 
         root.addWidget(Separator())
@@ -661,17 +597,20 @@ class GlobalStatsPage(QWidget):
         }}
         """
 
-    def _combo(self, values):
-        combo = QComboBox()
-        combo.addItems(values)
-        combo.currentIndexChanged.connect(lambda _: self._on_filter_changed())
-        return combo
+    def _filter_pills(self, values):
+        pills = MultiPillButtonGroup(values)
+        pills.changed.connect(lambda _: self._on_filter_changed())
+        return pills
 
-    def _multi_combo(self, values):
-        combo = CheckableComboBox(values)
-        combo.changed.connect(lambda _: self._on_filter_changed())
-        combo.setMinimumWidth(96)
-        return combo
+    def _filter_row(self, label, widget):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        label_widget = self._label(label)
+        label_widget.setFixedWidth(64)
+        row.addWidget(label_widget)
+        row.addWidget(widget, 1)
+        return row
 
     def _label(self, text):
         label = QLabel(text + ":")
@@ -746,11 +685,11 @@ class GlobalStatsPage(QWidget):
     def _current_filters(self):
         return {
             "category": self._category,
-            "level": self.level_combo.values(),
-            "surface": self.surface_combo.values(),
-            "era": self.era_combo.values(),
-            "tour": self.tour_combo.values(),
-            "round": self.round_combo.values(),
+            "level": self.level_pills.values(),
+            "surface": self.surface_pills.values(),
+            "era": self.era_pills.values(),
+            "tour": self.tour_pills.values(),
+            "round": self.round_pills.values(),
             "min_matches": self.min_matches.value(),
             "min_year": self.year_from.value() or None,
             "max_year": self.year_to.value() or None,

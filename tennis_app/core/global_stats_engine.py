@@ -361,25 +361,27 @@ class GlobalStatsEngine:
 
         results = []
         for (player, extra), matches in groups.items():
-            best = current = 0
-            best_start = best_end = current_start = None
+            current = 0
+            current_start = current_end = None
             for match in matches:
                 if match["won"]:
                     if current == 0:
                         current_start = match
                     current += 1
-                    if current > best:
-                        best = current
-                        best_start = current_start
-                        best_end = match
+                    current_end = match
                 else:
+                    if current > 0:
+                        first_year = self._date_year(current_start["tourney_date"] if current_start else "")
+                        last_year = self._date_year(current_end["tourney_date"] if current_end else "")
+                        detail = " - ".join(part for part in (extra, f"{first_year}-{last_year}") if part)
+                        results.append((player, current, detail))
                     current = 0
-                    current_start = None
-            if best:
-                first_year = self._date_year(best_start["tourney_date"] if best_start else "")
-                last_year = self._date_year(best_end["tourney_date"] if best_end else "")
+                    current_start = current_end = None
+            if current > 0:
+                first_year = self._date_year(current_start["tourney_date"] if current_start else "")
+                last_year = self._date_year(current_end["tourney_date"] if current_end else "")
                 detail = " - ".join(part for part in (extra, f"{first_year}-{last_year}") if part)
-                results.append((player, best, detail))
+                results.append((player, current, detail))
         return sorted(results, key=lambda row: (-row[1], row[0]))[:limit]
 
     def _score_match_rows(self, filters):
