@@ -206,16 +206,15 @@ class TennisAbstractScraper:
 
         all_matches = []
 
-        # WTA uses wplayer.cgi, ATP uses player-classic.cgi
-        cgi = "wplayer.cgi" if tour == "wta" else "player-classic.cgi"
+        # ATP inlines matchmx in player-classic.cgi. WTA classic pages load
+        # matchmx through a linked jsmatches script; still keep the same
+        # page-first flow and only fall back to direct JS if the page fails.
+        cgi = "wplayer-classic.cgi" if tour == "wta" else "player-classic.cgi"
 
-        # Try HTML page first (has embedded JS data), then JS fallback,
-        # for each URL variant.  Stop at the first one that yields data.
+        # Try HTML page first, then jsmatches/ JS fallback.
         def _try_one(url_name):
             url = f"{BASE_URL}/cgi-bin/{cgi}?p={url_name}"
             # Two HTML attempts before falling back to the static JS file.
-            # The JS endpoint often serves a stale career-only snapshot
-            # (months/years old), so we want to lean hard on the live HTML.
             for attempt in (1, 2):
                 try:
                     resp = self._make_request(url, raise_on_error=False)
@@ -235,6 +234,20 @@ class TennisAbstractScraper:
                                 "Found %d matches in HTML for %s",
                                 len(matches), url_name)
                             return matches
+
+                        matches, found_linked_js = self._fetch_matches_from_html_scripts(resp.text)
+                        if matches:
+                            logger.info(
+                                "Found %d matches from HTML-linked JS for %s",
+                                len(matches), url_name)
+                            return matches
+                        if found_linked_js:
+                            logger.warning(
+                                "HTML-linked JS for %s did not yield matches; "
+                                "skipping duplicate HTML retry",
+                                url_name)
+                            break
+
                         logger.warning(
                             "HTML response for %s parsed to 0 matches "
                             "(attempt %d/2, html_len=%d)",
@@ -243,8 +256,7 @@ class TennisAbstractScraper:
                     logger.warning("HTML fetch failed for %s (attempt %d/2): %s",
                                    url_name, attempt, exc)
                 if attempt == 1:
-                    # Short backoff between HTML retries (in addition to
-                    # the jitter applied by _make_request).
+                    # Short backoff between HTML retries.
                     time.sleep(random.uniform(2.0, 4.0))
             for js_url in (
                 f"{BASE_URL}/jsmatches/{url_name}.js",
@@ -255,24 +267,19 @@ class TennisAbstractScraper:
                     if resp and resp.status_code == 200:
                         matches = self._parse_matches_from_js(resp.text)
                         if matches:
-                            # Warn if the JS fallback looks stale: the file
-                            # is sometimes a career-only snapshot that lags
-                            # the live HTML by months.  This makes it visible
-                            # in production logs so we can distinguish a
-                            # legitimately empty post-min_year result from
-                            # a stale fallback masking new matches.
                             try:
                                 latest = max(
                                     int(m[0]) for m in matches
                                     if m and m[0] not in (None, "")
                                 )
                                 logger.info(
-                                    "Found %d matches from JS: %s "
+                                    "Found %d matches from JS fallback: %s "
                                     "(latest=%s)",
                                     len(matches), js_url, latest)
                             except (ValueError, TypeError):
-                                logger.info("Found %d matches from JS: %s",
-                                            len(matches), js_url)
+                                logger.info(
+                                    "Found %d matches from JS fallback: %s",
+                                    len(matches), js_url)
                             return matches
                 except Exception as exc:
                     logger.warning("Could not get JS matches from %s: %s",
@@ -360,6 +367,38 @@ class TennisAbstractScraper:
         except Exception as exc:
             logger.error("Error parsing HTML matches: %s", exc)
             return None
+
+    def _fetch_matches_from_html_scripts(self, html_content):
+        """Fetch matchmx data from jsmatches scripts linked by an HTML page."""
+        soup = BeautifulSoup(html_content, "html.parser")
+        seen = set()
+        found_linked_js = False
+        for script in soup.find_all("script", src=True):
+            src = script.get("src") or ""
+            if "jsmatches/" not in src:
+                continue
+            found_linked_js = True
+            if src.startswith("//"):
+                url = "https:" + src
+            elif src.startswith("http"):
+                url = src
+            elif src.startswith("/"):
+                url = BASE_URL + src
+            else:
+                url = f"{BASE_URL}/{src.lstrip('/')}"
+            if url in seen:
+                continue
+            seen.add(url)
+            try:
+                resp = self._make_request(url, raise_on_error=False)
+                if resp and resp.status_code == 200:
+                    matches = self._parse_matches_from_js(resp.text)
+                    if matches:
+                        return matches, True
+            except Exception as exc:
+                logger.warning("Could not get HTML-linked JS matches from %s: %s",
+                               url, exc)
+        return [], found_linked_js
 
     def _parse_matches_from_js(self, js_content):
         """Parse the matchmx array from a JS file."""
