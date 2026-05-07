@@ -1204,17 +1204,23 @@ class GlobalStatsEngine:
         return self._query(sql, bind)
 
     def _stat_round_streak_slam_sf_f(self, filters, limit):
-        return self._round_reached_streak(filters, limit, "Grand Slam", default_round="SF")
+        # Threshold is always SF — ignore the round pill so it can't accidentally
+        # lower the bar to R32/QF and produce nonsense streaks.
+        return self._round_reached_streak(filters, limit, "Grand Slam", fixed_threshold="SF")
 
     def _stat_round_streak_m1000_sf_f(self, filters, limit):
-        return self._round_reached_streak(filters, limit, "Masters 1000", default_round="SF")
+        return self._round_reached_streak(filters, limit, "Masters 1000", fixed_threshold="SF")
 
     def _stat_deep_run_streak(self, filters, limit):
         selected_round = self._round_threshold(filters.get("round"), "QF")
         return self._round_reached_streak(filters, limit, None, default_round=selected_round)
 
-    def _round_reached_streak(self, filters, limit, forced_level, default_round="SF"):
-        threshold = self._round_threshold(filters.get("round"), default_round)
+    def _round_reached_streak(self, filters, limit, forced_level,
+                               default_round="SF", fixed_threshold=None):
+        if fixed_threshold is not None:
+            threshold = fixed_threshold
+        else:
+            threshold = self._round_threshold(filters.get("round"), default_round)
         threshold_rank = self._round_rank(threshold)
         events = self._event_results(filters, forced_level=forced_level)
         results = self._streak_from_boolean_events(
