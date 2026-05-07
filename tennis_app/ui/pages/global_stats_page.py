@@ -9,9 +9,11 @@ registry first; individual rows can later be wired to concrete SQL queries.
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
     QListWidget, QListWidgetItem, QSplitter, QFrame, QPushButton,
-    QSizePolicy,
+    QSizePolicy, QDialog, QDialogButtonBox, QScrollArea,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QHeaderView
 
 from ..widgets import DataTable, SearchBar, Separator, PillButtonGroup, MultiPillButtonGroup
 from ..theme import COLORS, FONTS
@@ -21,22 +23,23 @@ from ...core.global_stats_engine import GlobalStatsEngine
 class _GlobalStatWorker(QThread):
     """Compute one global-stat leaderboard off the UI thread."""
 
-    data_ready = Signal(str, dict)
-    error = Signal(str, str)
+    data_ready = Signal(str, int, dict)
+    error = Signal(str, int, str)
 
-    def __init__(self, db, stat_id, filters, parent=None):
+    def __init__(self, db, stat_id, filters, request_id, parent=None):
         super().__init__(parent)
         self._db = db
         self._stat_id = stat_id
         self._filters = dict(filters)
+        self._request_id = request_id
 
     def run(self):
         try:
             result = GlobalStatsEngine(self._db).compute(
                 self._stat_id, self._filters, limit=50)
-            self.data_ready.emit(self._stat_id, result)
+            self.data_ready.emit(self._stat_id, self._request_id, result)
         except Exception as exc:
-            self.error.emit(self._stat_id, str(exc))
+            self.error.emit(self._stat_id, self._request_id, str(exc))
 
 
 SECTIONS = [
@@ -128,6 +131,10 @@ STAT_CATALOG = [
           "Serie piu lunga di vittorie consecutive su una superficie.",
           "player, surface, tournament_level, season, era",
           "apply surface filter before streak calculation"),
+    _stat("set_streak", "Longest set streak", "streaks", "all_time",
+          "Serie piu lunga di set vinti consecutivi nelle partite del giocatore.",
+          "player, tournament_level, surface, season, era",
+          "flatten set-scores per player ordered by match date; count consecutive sets won"),
     _stat("round_streak_slam_sf_f", "Consecutive Slam SF/F", "rounds", "round",
           "Numero massimo di Slam consecutivi con almeno SF o finale raggiunta.",
           "player, tournament_level, round, season, era",
@@ -324,6 +331,22 @@ STAT_CATALOG = [
           "Titoli vinti senza giocare tiebreak nel torneo.",
           "player, tournament, tournament_level, surface, season, era",
           "for champion tournament run, verify tiebreaks_played=0"),
+    _stat("longest_matches_by_time", "Longest matches", "fun", "all_time",
+          "Le partite piu lunghe per durata in minuti.",
+          "player, tournament_level, surface, season, era",
+          "SELECT *, minutes FROM matches ORDER BY minutes DESC"),
+    _stat("fastest_matches_by_time", "Fastest matches", "fun", "all_time",
+          "Le partite piu veloci per durata in minuti (min 3 set o 1 ora).",
+          "player, tournament_level, surface, season, era",
+          "SELECT *, minutes FROM matches WHERE minutes > 0 ORDER BY minutes ASC"),
+    _stat("fewest_games_won_in_win", "Fewest games won by loser", "fun", "all_time",
+          "Partite dove il perdente ha vinto il minor numero di giochi.",
+          "player, tournament_level, surface, season, era",
+          "parse score; min(games_lost) among losers"),
+    _stat("finals_least_breaks_conceded", "Finals won with fewest breaks conceded", "fun", "all_time",
+          "Finali vinte subendo il minor numero di break nel proprio turno di servizio.",
+          "player, tournament_level, surface, season, era",
+          "SELECT winner, w_bpFaced - w_bpSaved AS breaks_conceded FROM matches WHERE round='F' ORDER BY breaks_conceded ASC"),
 ]
 
 
@@ -343,10 +366,12 @@ class GlobalStatsPage(QWidget):
     """Simple records browser for global tennis leaderboards."""
 
     _RESULT_COLUMNS = [
-        ("Rank", 64),
-        ("Player", 220),
-        ("Value", 120),
-        ("Detail", 420),
+        ("Rank", 50),
+        ("Player", 200),
+        ("Value", 80),
+        ("Detail", 220),
+        ("Sets W-L", 90),
+        ("Breaks", 90),
     ]
 
     def __init__(self, db, parent=None):
@@ -356,6 +381,8 @@ class GlobalStatsPage(QWidget):
         self._filtered_stats = []
         self._current_stat = None
         self._worker = None
+        self._streak_meta = []
+        self._request_id = 0
         self._compute_timer = QTimer(self)
         self._compute_timer.setSingleShot(True)
         self._compute_timer.setInterval(180)
@@ -540,8 +567,10 @@ class GlobalStatsPage(QWidget):
         self.result_table = DataTable(self._RESULT_COLUMNS)
         self.result_table.setObjectName("globalLeaderboard")
         self.result_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.result_table.horizontalHeader().setStretchLastSection(True)
+        self.result_table.horizontalHeader().setStretchLastSection(False)
+        self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.result_table.verticalHeader().setDefaultSectionSize(34)
+        self.result_table.doubleClicked.connect(self._on_leaderboard_double_clicked)
         leaderboard_layout.addWidget(self.result_table, 1)
         splitter.addWidget(leaderboard)
         splitter.setSizes([340, 920])
@@ -705,24 +734,35 @@ class GlobalStatsPage(QWidget):
     def _load_current_stat(self):
         if not self._current_stat:
             return
+        # Disconnect old worker so stale results are silently discarded
         if self._worker and self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait(500)
+            try:
+                self._worker.data_ready.disconnect()
+                self._worker.error.disconnect()
+            except RuntimeError:
+                pass
+        self._request_id += 1
         stat_id = self._current_stat["stat_id"]
         self.load_btn.setEnabled(False)
         self.result_status.setText("Computing...")
+        self.result_table.populate([])
+        self._streak_meta = []
         worker = _GlobalStatWorker(
-            self.db, stat_id, self._current_filters(), parent=self)
+            self.db, stat_id, self._current_filters(),
+            request_id=self._request_id, parent=self)
         worker.data_ready.connect(self._on_result_ready)
         worker.error.connect(self._on_result_error)
         self._worker = worker
         worker.start()
 
-    def _on_result_ready(self, stat_id, result):
+    def _on_result_ready(self, stat_id, request_id, result):
+        if request_id != self._request_id:
+            return  # stale result from an old filter/stat — discard
         if not self._current_stat or stat_id != self._current_stat["stat_id"]:
             return
         self.load_btn.setEnabled(True)
         rows = result.get("rows") or []
+        self._streak_meta = result.get("streaks_meta") or []
         self.result_table.populate(rows)
         note = result.get("note") or ""
         if note:
@@ -732,8 +772,251 @@ class GlobalStatsPage(QWidget):
         else:
             self.result_status.setText("No results")
 
-    def _on_result_error(self, stat_id, message):
+    def _on_leaderboard_double_clicked(self, index):
+        row = index.row()
+        if not self._streak_meta or row >= len(self._streak_meta):
+            return
+        meta = self._streak_meta[row]
+        player = meta["player"]
+        value_item = self.result_table.item(row, 2)
+        streak_len = value_item.text() if value_item else ""
+        detail_item = self.result_table.item(row, 3)
+        detail = detail_item.text() if detail_item else ""
+        streak_type = meta.get("streak_type", "win")
+        if streak_type == "set":
+            title = f"{player} — {streak_len} sets consecutivi  ({detail})"
+            matches = GlobalStatsEngine(self.db).get_set_streak_matches(
+                player=meta["player"],
+                start_date=meta["start_date"],
+                end_date=meta["end_date"],
+                filters=self._current_filters(),
+            )
+            dlg = _SetStreakDetailDialog(title, matches, parent=self)
+        else:
+            title = f"{player} — {streak_len} wins  ({detail})"
+            matches = GlobalStatsEngine(self.db).get_streak_matches(
+                player=meta["player"],
+                start_date=meta["start_date"],
+                end_date=meta["end_date"],
+                filters=self._current_filters(),
+                group_attr=meta["group_attr"],
+                group_value=meta["group_value"],
+            )
+            dlg = _WinStreakDetailDialog(title, matches, parent=self)
+        dlg.exec()
+
+    def _on_result_error(self, stat_id, request_id, message):
+        if request_id != self._request_id:
+            return  # stale error — discard
         if self._current_stat and stat_id == self._current_stat["stat_id"]:
             self.load_btn.setEnabled(True)
             self.result_table.populate([])
             self.result_status.setText(f"Error: {message}")
+
+
+# ---------------------------------------------------------------------------
+# Set-streak detail dialog
+# ---------------------------------------------------------------------------
+
+class _SetStreakDetailDialog(QDialog):
+    """Shows the matches forming a set streak with per-match set scores."""
+
+    def __init__(self, title: str, matches: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Set Streak Detail")
+        self.resize(720, 480)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
+
+        hdr = QLabel(title)
+        hdr.setWordWrap(True)
+        hdr.setStyleSheet(
+            f"font-size: 12pt; font-weight: 700; color: {COLORS['accent']};"
+        )
+        layout.addWidget(hdr)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(4, 4, 4, 4)
+        inner_layout.setSpacing(2)
+        inner.setStyleSheet(f"background-color: {COLORS['bg_card']};")
+
+        if matches:
+            for i, m in enumerate(matches, start=1):
+                won = bool(m.get("won", 1))
+                tourney = m.get("tourney_name") or ""
+                rnd = m.get("round") or ""
+                opponent = m.get("opponent") or ""
+                score_str = m.get("score") or ""
+                date = str(m.get("tourney_date") or "")[:10]
+                breaks_conceded = int(m.get("breaks_conceded") or 0)
+
+                # Build set score tokens for display
+                from ...core.stats_engine import parse_score as _ps
+                parsed = _ps(score_str)
+                sets_display = ""
+                if parsed:
+                    set_parts = []
+                    for w_g, l_g, tb in parsed["set_scores"]:
+                        player_won_set = w_g > l_g if won else l_g > w_g
+                        pg = w_g if won else l_g
+                        og = l_g if won else w_g
+                        tb_str = f"({tb})" if tb is not None else ""
+                        marker = "✓" if player_won_set else "✗"
+                        set_parts.append(f"{marker}{pg}-{og}{tb_str}")
+                    sets_display = "  ".join(set_parts)
+
+                result_tag = "W" if won else "L"
+                parts = [tourney, rnd, f"vs {opponent}" if opponent else "",
+                         sets_display or score_str]
+                line_text = f"{i}.  {date}  [{result_tag}]  —  {',  '.join(p for p in parts if p)}"
+
+                lbl = QLabel(line_text)
+                if not won:
+                    text_color = "#e05555"
+                    bg_color = "#3a1a1a" if i % 2 else "#331515"
+                elif breaks_conceded:
+                    text_color = "#e09055"
+                    bg_color = "transparent" if i % 2 else COLORS.get("bg_secondary", COLORS["bg_card"])
+                else:
+                    text_color = COLORS["text"]
+                    bg_color = "transparent" if i % 2 else COLORS.get("bg_secondary", COLORS["bg_card"])
+                lbl.setStyleSheet(
+                    f"color: {text_color}; font-size: 9pt;"
+                    f" padding: 4px 8px; background-color: {bg_color};"
+                )
+                lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                inner_layout.addWidget(lbl)
+        else:
+            no_data = QLabel("No match data available.")
+            no_data.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 8px;")
+            inner_layout.addWidget(no_data)
+
+        inner_layout.addStretch()
+        scroll.setWidget(inner)
+        layout.addWidget(scroll, 1)
+
+        legend = QLabel("✗ set perso (rosso) · ✓ set vinto · arancione = break subiti")
+        legend.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 8pt;")
+        layout.addWidget(legend)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {COLORS['bg_primary']}; }}"
+            f"QLabel {{ color: {COLORS['text']}; }}"
+            f"QScrollArea {{ background-color: {COLORS['bg_card']};"
+            f"  border: 1px solid {COLORS['border']}; border-radius: 6px; }}"
+            f"QPushButton {{ background-color: {COLORS['bg_card']};"
+            f"  color: {COLORS['text']}; border: 1px solid {COLORS['border']};"
+            f"  padding: 5px 14px; border-radius: 4px; }}"
+            f"QPushButton:hover {{ background-color: {COLORS['bg_hover']}; }}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Win-streak detail dialog
+# ---------------------------------------------------------------------------
+
+class _WinStreakDetailDialog(QDialog):
+    """Shows the chronological list of wins in a win streak."""
+
+    def __init__(self, title: str, matches: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Win Streak Detail")
+        self.resize(680, 460)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
+
+        hdr = QLabel(title)
+        hdr.setWordWrap(True)
+        hdr.setStyleSheet(
+            f"font-size: 12pt; font-weight: 700; color: {COLORS['accent']};"
+        )
+        layout.addWidget(hdr)
+
+        # Scrollable list of match lines
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(4, 4, 4, 4)
+        inner_layout.setSpacing(2)
+        inner.setStyleSheet(f"background-color: {COLORS['bg_card']};")
+
+        if matches:
+            for i, m in enumerate(matches, start=1):
+                tourney = m.get("tourney_name") or ""
+                rnd = m.get("round") or ""
+                opponent = m.get("opponent") or ""
+                score = m.get("score") or ""
+                date = str(m.get("tourney_date") or "")[:10]
+                breaks_conceded = int(m.get("breaks_conceded") or 0)
+
+                parts = [tourney]
+                if rnd:
+                    parts.append(rnd)
+                if opponent:
+                    parts.append(f"vs {opponent}")
+                if score:
+                    parts.append(score)
+                if breaks_conceded:
+                    parts.append(f"[{breaks_conceded} break{'s' if breaks_conceded > 1 else ''} subito]")
+
+                line_text = f"{i}.  {date}  —  {', '.join(parts)}"
+                lbl = QLabel(line_text)
+                if breaks_conceded:
+                    text_color = "#e05555"
+                    bg_color = "#3a1a1a" if i % 2 else "#331515"
+                else:
+                    text_color = COLORS['text']
+                    bg_color = "transparent" if i % 2 else COLORS.get('bg_secondary', COLORS['bg_card'])
+                lbl.setStyleSheet(
+                    f"color: {text_color}; font-size: 9pt;"
+                    f" padding: 4px 8px;"
+                    f" background-color: {bg_color};"
+                )
+                lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                inner_layout.addWidget(lbl)
+        else:
+            no_data = QLabel("No match data available.")
+            no_data.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 8px;")
+            inner_layout.addWidget(no_data)
+
+        inner_layout.addStretch()
+        scroll.setWidget(inner)
+        layout.addWidget(scroll, 1)
+
+        count_lbl = QLabel(f"{len(matches)} matches")
+        count_lbl.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 9pt;")
+        layout.addWidget(count_lbl)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {COLORS['bg_primary']}; }}"
+            f"QLabel {{ color: {COLORS['text']}; }}"
+            f"QScrollArea {{ background-color: {COLORS['bg_card']};"
+            f"  border: 1px solid {COLORS['border']}; border-radius: 6px; }}"
+            f"QPushButton {{ background-color: {COLORS['bg_card']};"
+            f"  color: {COLORS['text']}; border: 1px solid {COLORS['border']};"
+            f"  padding: 5px 14px; border-radius: 4px; }}"
+            f"QPushButton:hover {{ background-color: {COLORS['bg_hover']}; }}"
+        )
+

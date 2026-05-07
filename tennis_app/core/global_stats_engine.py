@@ -336,9 +336,25 @@ class GlobalStatsEngine:
         return results
 
     def _win_streak(self, filters, limit, group_attr=None):
-        cte, params = self._player_match_cte(filters)
-        rows = self._query(cte + """
-            SELECT player, won, tourney_date, tourney_name, tourney_level, surface, round
+        where, params = self._where(filters)
+        rows = self._query(f"""
+            WITH player_matches AS (
+                SELECT winner_name AS player, 1 AS won, tourney_date,
+                       tourney_name, tourney_level, surface, round,
+                       score,
+                       COALESCE(l_bpFaced, 0) - COALESCE(l_bpSaved, 0) AS breaks_made,
+                       COALESCE(w_bpFaced, 0) - COALESCE(w_bpSaved, 0) AS breaks_conceded
+                FROM matches m
+                WHERE {where} AND winner_name IS NOT NULL AND winner_name != ''
+                UNION ALL
+                SELECT loser_name AS player, 0 AS won, tourney_date,
+                       tourney_name, tourney_level, surface, round,
+                       score, 0 AS breaks_made, 0 AS breaks_conceded
+                FROM matches m
+                WHERE {where} AND loser_name IS NOT NULL AND loser_name != ''
+            )
+            SELECT player, won, tourney_date, tourney_name, tourney_level, surface, round,
+                   score, breaks_made, breaks_conceded
             FROM player_matches
             ORDER BY player,
                      CASE WHEN ? = 'level' THEN tourney_level ELSE '' END,
@@ -349,7 +365,7 @@ class GlobalStatsEngine:
                          WHEN 'R128' THEN 4 WHEN 'R64' THEN 5 WHEN 'R32' THEN 6
                          WHEN 'R16' THEN 7 WHEN 'QF' THEN 8 WHEN 'SF' THEN 9
                          WHEN 'F' THEN 10 ELSE 11 END
-        """, params + [group_attr or "", group_attr or ""])
+        """, params + params + [group_attr or "", group_attr or ""])
         groups = defaultdict(list)
         for row in rows:
             extra = ""
@@ -359,30 +375,75 @@ class GlobalStatsEngine:
                 extra = row["surface"] or ""
             groups[(row["player"], extra)].append(row)
 
-        results = []
+        # Each entry: (player, streak_len, detail, start_date, end_date, group_value, sw, sl, bm, bc)
+        full_results = []
         for (player, extra), matches in groups.items():
             current = 0
             current_start = current_end = None
+            streak_sw = streak_sl = streak_bm = streak_bc = 0
             for match in matches:
                 if match["won"]:
                     if current == 0:
                         current_start = match
                     current += 1
                     current_end = match
+                    parsed = parse_score(match.get("score"))
+                    if parsed:
+                        streak_sw += parsed["sets_won"]
+                        streak_sl += parsed["sets_lost"]
+                    streak_bm += int(match["breaks_made"] or 0)
+                    streak_bc += int(match["breaks_conceded"] or 0)
                 else:
                     if current > 0:
                         first_year = self._date_year(current_start["tourney_date"] if current_start else "")
                         last_year = self._date_year(current_end["tourney_date"] if current_end else "")
                         detail = " - ".join(part for part in (extra, f"{first_year}-{last_year}") if part)
-                        results.append((player, current, detail))
+                        full_results.append((
+                            player, current, detail,
+                            current_start["tourney_date"] if current_start else "",
+                            current_end["tourney_date"] if current_end else "",
+                            extra, streak_sw, streak_sl, streak_bm, streak_bc,
+                        ))
                     current = 0
                     current_start = current_end = None
+                    streak_sw = streak_sl = streak_bm = streak_bc = 0
             if current > 0:
                 first_year = self._date_year(current_start["tourney_date"] if current_start else "")
                 last_year = self._date_year(current_end["tourney_date"] if current_end else "")
                 detail = " - ".join(part for part in (extra, f"{first_year}-{last_year}") if part)
-                results.append((player, current, detail))
-        return sorted(results, key=lambda row: (-row[1], row[0]))[:limit]
+                full_results.append((
+                    player, current, detail,
+                    current_start["tourney_date"] if current_start else "",
+                    current_end["tourney_date"] if current_end else "",
+                    extra, streak_sw, streak_sl, streak_bm, streak_bc,
+                ))
+
+        full_results.sort(key=lambda r: (-r[1], r[0]))
+        full_results = full_results[:limit]
+
+        ranked_rows = []
+        for i, r in enumerate(full_results, 1):
+            sw, sl, bm, bc = r[6], r[7], r[8], r[9]
+            sets_str = f"{sw}-{sl}" if (sw or sl) else ""
+            breaks_str = f"{bm}-{bc}" if (bm or bc) else ""
+            ranked_rows.append([str(i), r[0], str(r[1]), r[2], sets_str, breaks_str])
+
+        streaks_meta = [
+            {
+                "player": r[0],
+                "start_date": r[3],
+                "end_date": r[4],
+                "group_attr": group_attr,
+                "group_value": r[5],
+            }
+            for r in full_results
+        ]
+        return {
+            "columns": ["Rank", "Player", "Wins", "Period", "Sets W-L", "Breaks"],
+            "rows": ranked_rows,
+            "streaks_meta": streaks_meta,
+            "note": "",
+        }
 
     def _score_match_rows(self, filters):
         rows = self._ordered_match_rows(filters, include_round=True)
@@ -1111,6 +1172,37 @@ class GlobalStatsEngine:
     def _stat_win_streak_by_surface(self, filters, limit):
         return self._win_streak(filters, limit, group_attr="surface")
 
+    def get_streak_matches(self, player, start_date, end_date, filters,
+                           group_attr=None, group_value=None):
+        """Return the individual wins forming a win streak, ordered chronologically."""
+        where, params = self._where(filters)
+        conditions = [where, "winner_name = ?", "tourney_date >= ?", "tourney_date <= ?"]
+        bind = params + [player, start_date, end_date]
+        if group_attr == "level" and group_value:
+            level_key = next(
+                (k for k, v in LEVEL_LABELS.items() if v == group_value), None
+            )
+            if level_key:
+                conditions.append("tourney_level = ?")
+                bind.append(level_key)
+        elif group_attr == "surface" and group_value:
+            conditions.append("surface = ?")
+            bind.append(group_value)
+        sql = f"""
+            SELECT tourney_date, tourney_name, tourney_level, surface, round,
+                   loser_name AS opponent, score,
+                   COALESCE(w_bpFaced, 0) - COALESCE(w_bpSaved, 0) AS breaks_conceded
+            FROM matches m
+            WHERE {" AND ".join(conditions)}
+            ORDER BY tourney_date,
+                     CASE round
+                         WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3
+                         WHEN 'R128' THEN 4 WHEN 'R64' THEN 5 WHEN 'R32' THEN 6
+                         WHEN 'R16' THEN 7 WHEN 'QF' THEN 8 WHEN 'SF' THEN 9
+                         WHEN 'F' THEN 10 ELSE 11 END
+        """
+        return self._query(sql, bind)
+
     def _stat_round_streak_slam_sf_f(self, filters, limit):
         return self._round_reached_streak(filters, limit, "Grand Slam", default_round="SF")
 
@@ -1455,3 +1547,196 @@ class GlobalStatsEngine:
             "rows": [],
             "note": "This needs point-by-point sequence data with match-point state; the local match_pbp_stats table only stores aggregate PBP metrics.",
         }
+
+    # ------------------------------------------------------------------
+    # Set streak
+    # ------------------------------------------------------------------
+
+    def _stat_set_streak(self, filters, limit):
+        """Longest consecutive sets won across ordered matches."""
+        where, params = self._where(filters)
+        rows = self._query(f"""
+            WITH player_matches AS (
+                SELECT winner_name AS player, 1 AS won, tourney_date, tourney_name,
+                       score, round
+                FROM matches m
+                WHERE {where} AND winner_name IS NOT NULL AND winner_name != ''
+                UNION ALL
+                SELECT loser_name AS player, 0 AS won, tourney_date, tourney_name,
+                       score, round
+                FROM matches m
+                WHERE {where} AND loser_name IS NOT NULL AND loser_name != ''
+            )
+            SELECT player, won, tourney_date, tourney_name, score, round
+            FROM player_matches
+            ORDER BY player, tourney_date, tourney_name,
+                     CASE round
+                         WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3
+                         WHEN 'R128' THEN 4 WHEN 'R64' THEN 5 WHEN 'R32' THEN 6
+                         WHEN 'R16' THEN 7 WHEN 'QF' THEN 8 WHEN 'SF' THEN 9
+                         WHEN 'F' THEN 10 ELSE 11 END
+        """, params + params)
+
+        # Build per-player ordered list of (match_date, match_name, [set_results_from_player_perspective])
+        by_player = defaultdict(list)
+        for row in rows:
+            parsed = parse_score(row.get("score"))
+            if not parsed:
+                continue
+            is_winner = bool(row["won"])
+            set_seq = []
+            for w_g, l_g, _ in parsed["set_scores"]:
+                if is_winner:
+                    set_seq.append(w_g > l_g)
+                else:
+                    set_seq.append(l_g > w_g)
+            by_player[row["player"]].append(
+                (row["tourney_date"], row["tourney_name"], set_seq)
+            )
+
+        # Each entry: (player, streak_len, detail, start_date, end_date)
+        full_results = []
+        for player, match_list in by_player.items():
+            current = 0
+            cur_start = cur_end = None
+            for match_date, match_name, sets in match_list:
+                for won_set in sets:
+                    if won_set:
+                        if current == 0:
+                            cur_start = (match_date, match_name)
+                        current += 1
+                        cur_end = (match_date, match_name)
+                    else:
+                        if current > 0:
+                            s_year = self._date_year(cur_start[0])
+                            e_year = self._date_year(cur_end[0])
+                            full_results.append((player, current, f"{s_year}-{e_year}",
+                                                 cur_start[0], cur_end[0]))
+                        current = 0
+                        cur_start = cur_end = None
+            if current > 0:
+                s_year = self._date_year(cur_start[0])
+                e_year = self._date_year(cur_end[0])
+                full_results.append((player, current, f"{s_year}-{e_year}",
+                                     cur_start[0], cur_end[0]))
+
+        full_results.sort(key=lambda r: (-r[1], r[0]))
+        full_results = full_results[:limit]
+
+        ranked_rows = [[str(i), r[0], str(r[1]), r[2]]
+                       for i, r in enumerate(full_results, 1)]
+        streaks_meta = [
+            {"player": r[0], "start_date": r[3], "end_date": r[4], "streak_type": "set"}
+            for r in full_results
+        ]
+        return {
+            "columns": ["Rank", "Player", "Sets", "Period"],
+            "rows": ranked_rows,
+            "streaks_meta": streaks_meta,
+            "note": "",
+        }
+
+    def get_set_streak_matches(self, player, start_date, end_date, filters):
+        """Return all matches for player in the streak date range, ordered chronologically."""
+        where, params = self._where(filters)
+        sql = f"""
+            SELECT
+                CASE WHEN winner_name = ? THEN 1 ELSE 0 END AS won,
+                tourney_date, tourney_name, round, score,
+                CASE WHEN winner_name = ? THEN loser_name ELSE winner_name END AS opponent,
+                CASE WHEN winner_name = ?
+                     THEN CAST(COALESCE(w_bpFaced,0) - COALESCE(w_bpSaved,0) AS INTEGER)
+                     ELSE CAST(COALESCE(l_bpFaced,0) - COALESCE(l_bpSaved,0) AS INTEGER)
+                END AS breaks_conceded
+            FROM matches m
+            WHERE {where}
+              AND (winner_name = ? OR loser_name = ?)
+              AND tourney_date >= ? AND tourney_date <= ?
+            ORDER BY tourney_date,
+                     CASE round
+                         WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3
+                         WHEN 'R128' THEN 4 WHEN 'R64' THEN 5 WHEN 'R32' THEN 6
+                         WHEN 'R16' THEN 7 WHEN 'QF' THEN 8 WHEN 'SF' THEN 9
+                         WHEN 'F' THEN 10 ELSE 11 END
+        """
+        return self._query(sql, [player, player, player] + params + [player, player,
+                                                                      start_date, end_date])
+
+    # ------------------------------------------------------------------
+    # Longest / fastest matches by time
+    # ------------------------------------------------------------------
+
+    def _stat_longest_matches_by_time(self, filters, limit):
+        where, params = self._where(filters)
+        rows = self._query(f"""
+            SELECT winner_name, loser_name, tourney_name, tourney_date,
+                   round, surface, CAST(minutes AS INTEGER) AS mins
+            FROM matches m
+            WHERE {where} AND minutes IS NOT NULL AND minutes > 0
+            ORDER BY minutes DESC
+            LIMIT ?
+        """, params + [limit])
+        ranked = []
+        for i, r in enumerate(rows, 1):
+            detail = (f"{r['tourney_name']} {self._date_year(r['tourney_date'])}"
+                      f" {r['round'] or ''} — {r['loser_name']}")
+            ranked.append([str(i), r["winner_name"], f"{r['mins']} min", detail])
+        return {"columns": ["Rank", "Winner", "Duration", "Match"], "rows": ranked, "note": ""}
+
+    def _stat_fastest_matches_by_time(self, filters, limit):
+        where, params = self._where(filters)
+        rows = self._query(f"""
+            SELECT winner_name, loser_name, tourney_name, tourney_date,
+                   round, surface, score, CAST(minutes AS INTEGER) AS mins
+            FROM matches m
+            WHERE {where} AND minutes IS NOT NULL AND minutes >= 20
+              AND score NOT LIKE '%W/O%' AND score NOT LIKE '%RET%'
+            ORDER BY minutes ASC
+            LIMIT ?
+        """, params + [limit])
+        ranked = []
+        for i, r in enumerate(rows, 1):
+            detail = (f"{r['tourney_name']} {self._date_year(r['tourney_date'])}"
+                      f" {r['round'] or ''} — {r['loser_name']} ({r['score'] or ''})")
+            ranked.append([str(i), r["winner_name"], f"{r['mins']} min", detail])
+        return {"columns": ["Rank", "Winner", "Duration", "Match"], "rows": ranked, "note": ""}
+
+    # ------------------------------------------------------------------
+    # Fewest games won in a match won
+    # ------------------------------------------------------------------
+
+    def _stat_fewest_games_won_in_win(self, filters, limit):
+        results = []
+        for row, parsed in self._score_match_rows(filters):
+            games_lost = parsed["games_lost"]  # games won by the loser
+            winner = row.get("winner_name") or ""
+            loser = row.get("loser_name") or ""
+            if not winner or not loser:
+                continue
+            tourney = row.get("tourney_name") or ""
+            date = self._date_year(row.get("tourney_date"))
+            rnd = row.get("round") or ""
+            score = row.get("score") or ""
+            detail = f"{tourney} {date} {rnd} — {winner} vs {loser} ({score})"
+            results.append((loser, games_lost, detail))
+        return sorted(results, key=lambda r: (r[1], r[0]))[:limit]
+
+    def _stat_finals_least_breaks_conceded(self, filters, limit):
+        where, params = self._where(filters)
+        rows = self._query(f"""
+            SELECT winner_name AS player,
+                   tourney_name, tourney_date, loser_name, score,
+                   CAST(COALESCE(w_bpFaced, 0) - COALESCE(w_bpSaved, 0) AS INTEGER) AS breaks_conceded
+            FROM matches m
+            WHERE {where} AND round = 'F'
+              AND winner_name != ''
+              AND w_bpFaced IS NOT NULL
+            ORDER BY breaks_conceded ASC, tourney_date DESC
+            LIMIT ?
+        """, params + [limit])
+        ranked = []
+        for i, r in enumerate(rows, 1):
+            detail = (f"{r['tourney_name']} {self._date_year(r['tourney_date'])}"
+                      f" vs {r['loser_name']} ({r['score'] or ''})")
+            ranked.append([str(i), r["player"], str(r["breaks_conceded"]), detail])
+        return {"columns": ["Rank", "Player", "Breaks conceded", "Final"], "rows": ranked, "note": ""}
