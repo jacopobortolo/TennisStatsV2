@@ -1563,17 +1563,17 @@ class GlobalStatsEngine:
         where, params = self._where(filters)
         rows = self._query(f"""
             WITH player_matches AS (
-                SELECT winner_name AS player, 1 AS won, tourney_date, tourney_name,
+                SELECT id AS match_id, winner_name AS player, 1 AS won, tourney_date, tourney_name,
                        score, round
                 FROM matches m
                 WHERE {where} AND winner_name IS NOT NULL AND winner_name != ''
                 UNION ALL
-                SELECT loser_name AS player, 0 AS won, tourney_date, tourney_name,
+                SELECT id AS match_id, loser_name AS player, 0 AS won, tourney_date, tourney_name,
                        score, round
                 FROM matches m
                 WHERE {where} AND loser_name IS NOT NULL AND loser_name != ''
             )
-            SELECT player, won, tourney_date, tourney_name, score, round
+            SELECT match_id, player, won, tourney_date, tourney_name, score, round
             FROM player_matches
             ORDER BY player, tourney_date, tourney_name,
                      CASE round
@@ -1583,7 +1583,7 @@ class GlobalStatsEngine:
                          WHEN 'F' THEN 10 ELSE 11 END
         """, params + params)
 
-        # Build per-player ordered list of (match_date, match_name, [set_results_from_player_perspective])
+        # Build per-player ordered list of matches with set results from the player's perspective.
         by_player = defaultdict(list)
         for row in rows:
             parsed = parse_score(row.get("score"))
@@ -1596,35 +1596,55 @@ class GlobalStatsEngine:
                     set_seq.append(w_g > l_g)
                 else:
                     set_seq.append(l_g > w_g)
-            by_player[row["player"]].append(
-                (row["tourney_date"], row["tourney_name"], set_seq)
-            )
+            by_player[row["player"]].append({
+                "match_id": row["match_id"],
+                "date": row["tourney_date"],
+                "name": row["tourney_name"],
+                "sets": set_seq,
+            })
 
-        # Each entry: (player, streak_len, detail, start_date, end_date)
+        # Each entry: (player, streak_len, detail, start_date, end_date, match_ids, set_indexes)
         full_results = []
         for player, match_list in by_player.items():
             current = 0
             cur_start = cur_end = None
-            for match_date, match_name, sets in match_list:
-                for won_set in sets:
+            cur_match_ids = []
+            cur_set_indexes = defaultdict(list)
+
+            def finish_current_streak():
+                if current <= 0:
+                    return
+                s_year = self._date_year(cur_start[0])
+                e_year = self._date_year(cur_end[0])
+                full_results.append((
+                    player, current, f"{s_year}-{e_year}",
+                    cur_start[0], cur_end[0], list(cur_match_ids),
+                    {str(k): list(v) for k, v in cur_set_indexes.items()},
+                ))
+
+            for match in match_list:
+                match_id = match["match_id"]
+                match_date = match["date"]
+                match_name = match["name"]
+                for set_index, won_set in enumerate(match["sets"]):
                     if won_set:
                         if current == 0:
                             cur_start = (match_date, match_name)
+                            cur_match_ids = []
+                            cur_set_indexes = defaultdict(list)
                         current += 1
                         cur_end = (match_date, match_name)
+                        if not cur_match_ids or cur_match_ids[-1] != match_id:
+                            cur_match_ids.append(match_id)
+                        cur_set_indexes[match_id].append(set_index)
                     else:
-                        if current > 0:
-                            s_year = self._date_year(cur_start[0])
-                            e_year = self._date_year(cur_end[0])
-                            full_results.append((player, current, f"{s_year}-{e_year}",
-                                                 cur_start[0], cur_end[0]))
+                        finish_current_streak()
                         current = 0
                         cur_start = cur_end = None
+                        cur_match_ids = []
+                        cur_set_indexes = defaultdict(list)
             if current > 0:
-                s_year = self._date_year(cur_start[0])
-                e_year = self._date_year(cur_end[0])
-                full_results.append((player, current, f"{s_year}-{e_year}",
-                                     cur_start[0], cur_end[0]))
+                finish_current_streak()
 
         full_results.sort(key=lambda r: (-r[1], r[0]))
         full_results = full_results[:limit]
@@ -1632,7 +1652,10 @@ class GlobalStatsEngine:
         ranked_rows = [[str(i), r[0], str(r[1]), r[2]]
                        for i, r in enumerate(full_results, 1)]
         streaks_meta = [
-            {"player": r[0], "start_date": r[3], "end_date": r[4], "streak_type": "set"}
+            {
+                "player": r[0], "start_date": r[3], "end_date": r[4],
+                "streak_type": "set", "match_ids": r[5], "set_indexes": r[6],
+            }
             for r in full_results
         ]
         return {
@@ -1642,11 +1665,19 @@ class GlobalStatsEngine:
             "note": "",
         }
 
-    def get_set_streak_matches(self, player, start_date, end_date, filters):
-        """Return all matches for player in the streak date range, ordered chronologically."""
+    def get_set_streak_matches(self, player, start_date, end_date, filters,
+                               match_ids=None, set_indexes=None):
+        """Return only the matches containing the set streak, ordered chronologically."""
         where, params = self._where(filters)
+        id_clause = ""
+        id_params = []
+        if match_ids:
+            placeholders = ",".join("?" for _ in match_ids)
+            id_clause = f"AND m.id IN ({placeholders})"
+            id_params = list(match_ids)
         sql = f"""
             SELECT
+                id AS match_id,
                 CASE WHEN winner_name = ? THEN 1 ELSE 0 END AS won,
                 tourney_date, tourney_name, round, score,
                 CASE WHEN winner_name = ? THEN loser_name ELSE winner_name END AS opponent,
@@ -1657,6 +1688,7 @@ class GlobalStatsEngine:
             FROM matches m
             WHERE {where}
               AND (winner_name = ? OR loser_name = ?)
+                            {id_clause}
               AND tourney_date >= ? AND tourney_date <= ?
             ORDER BY tourney_date,
                      CASE round
@@ -1665,8 +1697,15 @@ class GlobalStatsEngine:
                          WHEN 'R16' THEN 7 WHEN 'QF' THEN 8 WHEN 'SF' THEN 9
                          WHEN 'F' THEN 10 ELSE 11 END
         """
-        return self._query(sql, [player, player, player] + params + [player, player,
-                                                                      start_date, end_date])
+        rows = self._query(
+            sql,
+            [player, player, player] + params + [player, player] + id_params
+            + [start_date, end_date],
+        )
+        if set_indexes:
+            for row in rows:
+                row["streak_set_indexes"] = set_indexes.get(str(row.get("match_id")), [])
+        return rows
 
     # ------------------------------------------------------------------
     # Longest / fastest matches by time

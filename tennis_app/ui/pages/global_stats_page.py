@@ -394,31 +394,34 @@ class GlobalStatsPage(QWidget):
         self.setStyleSheet(self._page_stylesheet())
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 18, 22, 20)
-        root.setSpacing(12)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(10)
 
-        header = QFrame()
-        header.setObjectName("globalHeader")
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(18, 16, 18, 16)
-        header_layout.setSpacing(16)
-
-        title_box = QVBoxLayout()
-        title_box.setSpacing(4)
-        header_title = QLabel("Global Tennis Stats")
-        header_title.setObjectName("titleLabel")
-        title_box.addWidget(header_title)
-
-        subtitle = QLabel("Records, rankings and milestones in one clean leaderboard view")
-        subtitle.setObjectName("dimLabel")
-        title_box.addWidget(subtitle)
-        header_layout.addLayout(title_box, 1)
+        header = QLabel("🌐 Global Tennis Stats")
+        header.setObjectName("headerLabel")
+        root.addWidget(header)
 
         self.summary_label = QLabel()
-        self.summary_label.setObjectName("globalSummary")
-        self.summary_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        header_layout.addWidget(self.summary_label)
-        root.addWidget(header)
+        self.summary_label.setVisible(False)
+
+        self._records_panel = QFrame()
+        self._records_panel.setObjectName("recordListPanel")
+        list_layout = QVBoxLayout(self._records_panel)
+        list_layout.setContentsMargins(10, 10, 10, 10)
+        list_layout.setSpacing(6)
+
+        records_label = QLabel("Records")
+        records_label.setObjectName("sectionLabel")
+        list_layout.addWidget(records_label)
+
+        self.stat_count_label = QLabel()
+        self.stat_count_label.setObjectName("dimLabel")
+        list_layout.addWidget(self.stat_count_label)
+
+        self.stat_list = QListWidget()
+        self.stat_list.setObjectName("globalStatList")
+        self.stat_list.currentRowChanged.connect(self._on_stat_selected)
+        list_layout.addWidget(self.stat_list, 1)
 
         category_row = QHBoxLayout()
         category_row.setSpacing(10)
@@ -431,8 +434,25 @@ class GlobalStatsPage(QWidget):
         filters = QFrame()
         filters.setObjectName("globalFilters")
         filters_layout = QVBoxLayout(filters)
-        filters_layout.setContentsMargins(12, 10, 12, 10)
+        filters_layout.setContentsMargins(12, 8, 12, 10)
         filters_layout.setSpacing(8)
+
+        filters_header = QHBoxLayout()
+        filters_header.setContentsMargins(0, 0, 0, 0)
+        filters_title = QLabel("Filters")
+        filters_title.setObjectName("sectionLabel")
+        filters_header.addWidget(filters_title)
+        filters_header.addStretch()
+        self.filter_toggle = QPushButton("Hide filters")
+        self.filter_toggle.setObjectName("accentBtn")
+        self.filter_toggle.clicked.connect(self._toggle_filters)
+        filters_header.addWidget(self.filter_toggle)
+        filters_layout.addLayout(filters_header)
+
+        self.filters_body = QWidget()
+        body_layout = QVBoxLayout(self.filters_body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(8)
 
         search_row = QHBoxLayout()
         search_row.setContentsMargins(0, 0, 0, 0)
@@ -441,7 +461,7 @@ class GlobalStatsPage(QWidget):
         self.search_bar.searched.connect(lambda _: self._apply_filters())
         self.search_bar.line_edit.textChanged.connect(lambda _: self._apply_filters())
         search_row.addWidget(self.search_bar, 1)
-        filters_layout.addLayout(search_row)
+        body_layout.addLayout(search_row)
 
         self.tour_pills = self._filter_pills(["All", "ATP", "WTA"])
         self.level_pills = self._filter_pills([
@@ -460,7 +480,7 @@ class GlobalStatsPage(QWidget):
                 ("Surface", self.surface_pills),
                 ("Era", self.era_pills),
                 ("Round", self.round_pills)]:
-            filters_layout.addLayout(self._filter_row(label, pills))
+            body_layout.addLayout(self._filter_row(label, pills))
 
         numeric_row = QHBoxLayout()
         numeric_row.setContentsMargins(0, 0, 0, 0)
@@ -491,66 +511,16 @@ class GlobalStatsPage(QWidget):
         self.min_matches.valueChanged.connect(lambda _: self._on_filter_changed())
         numeric_row.addWidget(self.min_matches)
         numeric_row.addStretch()
-
-        self.load_btn = QPushButton("Refresh")
-        self.load_btn.setObjectName("accentBtn")
-        self.load_btn.clicked.connect(self._load_current_stat)
-        numeric_row.addWidget(self.load_btn)
-        filters_layout.addLayout(numeric_row)
+        body_layout.addLayout(numeric_row)
+        filters_layout.addWidget(self.filters_body)
         root.addWidget(filters)
 
-        root.addWidget(Separator())
-
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        root.addWidget(splitter, 1)
-
-        list_panel = QFrame()
-        list_panel.setObjectName("recordListPanel")
-        list_layout = QVBoxLayout(list_panel)
-        list_layout.setContentsMargins(12, 12, 12, 12)
-        list_layout.setSpacing(8)
-
-        records_label = QLabel("Records")
-        records_label.setObjectName("sectionLabel")
-        list_layout.addWidget(records_label)
-
-        self.stat_count_label = QLabel()
-        self.stat_count_label.setObjectName("dimLabel")
-        list_layout.addWidget(self.stat_count_label)
-
-        self.stat_list = QListWidget()
-        self.stat_list.setObjectName("globalStatList")
-        self.stat_list.currentRowChanged.connect(self._on_stat_selected)
-        list_layout.addWidget(self.stat_list, 1)
-        splitter.addWidget(list_panel)
-
-        leaderboard = QWidget()
-        leaderboard_layout = QVBoxLayout(leaderboard)
-        leaderboard_layout.setContentsMargins(14, 0, 0, 0)
-        leaderboard_layout.setSpacing(10)
-
-        info_panel = QFrame()
-        info_panel.setObjectName("leaderInfoPanel")
-        info_layout = QVBoxLayout(info_panel)
-        info_layout.setContentsMargins(16, 13, 16, 13)
-        info_layout.setSpacing(6)
+        self.load_btn = None
 
         self.detail_title = QLabel("Select a record")
         self.detail_title.setObjectName("recordTitle")
         self.detail_title.setWordWrap(True)
-        info_layout.addWidget(self.detail_title)
-
-        self.detail_description = QLabel("")
-        self.detail_description.setObjectName("dimLabel")
-        self.detail_description.setWordWrap(True)
-        info_layout.addWidget(self.detail_description)
-
-        self.detail_meta = QLabel("")
-        self.detail_meta.setObjectName("recordMeta")
-        self.detail_meta.setWordWrap(True)
-        info_layout.addWidget(self.detail_meta)
-        leaderboard_layout.addWidget(info_panel)
+        root.addWidget(self.detail_title)
 
         status_row = QHBoxLayout()
         status_row.setSpacing(8)
@@ -562,7 +532,7 @@ class GlobalStatsPage(QWidget):
         self.result_status.setObjectName("dimLabel")
         self.result_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         status_row.addWidget(self.result_status)
-        leaderboard_layout.addLayout(status_row)
+        root.addLayout(status_row)
 
         self.result_table = DataTable(self._RESULT_COLUMNS)
         self.result_table.setObjectName("globalLeaderboard")
@@ -571,14 +541,11 @@ class GlobalStatsPage(QWidget):
         self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.result_table.verticalHeader().setDefaultSectionSize(34)
         self.result_table.doubleClicked.connect(self._on_leaderboard_double_clicked)
-        leaderboard_layout.addWidget(self.result_table, 1)
-        splitter.addWidget(leaderboard)
-        splitter.setSizes([340, 920])
+        root.addWidget(self.result_table, 1)
 
     def _page_stylesheet(self):
         return f"""
-        QFrame#globalHeader, QFrame#globalFilters, QFrame#recordListPanel,
-        QFrame#leaderInfoPanel {{
+        QFrame#globalFilters, QFrame#recordListPanel {{
             background-color: {COLORS['bg_secondary']};
             border: 1px solid {COLORS['border']};
             border-radius: 8px;
@@ -646,6 +613,14 @@ class GlobalStatsPage(QWidget):
         label.setObjectName("dimLabel")
         return label
 
+    def records_panel(self):
+        return self._records_panel
+
+    def _toggle_filters(self):
+        visible = self.filters_body.isVisible()
+        self.filters_body.setVisible(not visible)
+        self.filter_toggle.setText("Show filters" if visible else "Hide filters")
+
     def _on_category_changed(self, category):
         self._category = category
         self._apply_filters()
@@ -698,16 +673,11 @@ class GlobalStatsPage(QWidget):
         if not stat:
             self._current_stat = None
             self.detail_title.setText("No records found")
-            self.detail_description.setText("Try another category or search term.")
-            self.detail_meta.setText("")
             self.result_table.populate([])
             self.result_status.setText("")
             return
         self._current_stat = stat
         self.detail_title.setText(stat["name"])
-        self.detail_description.setText(stat["description"])
-        self.detail_meta.setText(
-            f"{stat['category']} - {stat['scope']} - {stat['stat_id']}")
         self.result_table.populate([])
         self._schedule_compute()
 
@@ -743,7 +713,8 @@ class GlobalStatsPage(QWidget):
                 pass
         self._request_id += 1
         stat_id = self._current_stat["stat_id"]
-        self.load_btn.setEnabled(False)
+        if self.load_btn:
+            self.load_btn.setEnabled(False)
         self.result_status.setText("Computing...")
         self.result_table.populate([])
         self._streak_meta = []
@@ -760,7 +731,8 @@ class GlobalStatsPage(QWidget):
             return  # stale result from an old filter/stat — discard
         if not self._current_stat or stat_id != self._current_stat["stat_id"]:
             return
-        self.load_btn.setEnabled(True)
+        if self.load_btn:
+            self.load_btn.setEnabled(True)
         rows = result.get("rows") or []
         self._streak_meta = result.get("streaks_meta") or []
         self.result_table.populate(rows)
@@ -790,6 +762,8 @@ class GlobalStatsPage(QWidget):
                 start_date=meta["start_date"],
                 end_date=meta["end_date"],
                 filters=self._current_filters(),
+                match_ids=meta.get("match_ids"),
+                set_indexes=meta.get("set_indexes"),
             )
             dlg = _SetStreakDetailDialog(title, matches, parent=self)
         else:
@@ -809,7 +783,8 @@ class GlobalStatsPage(QWidget):
         if request_id != self._request_id:
             return  # stale error — discard
         if self._current_stat and stat_id == self._current_stat["stat_id"]:
-            self.load_btn.setEnabled(True)
+            if self.load_btn:
+                self.load_btn.setEnabled(True)
             self.result_table.populate([])
             self.result_status.setText(f"Error: {message}")
 
@@ -849,6 +824,7 @@ class _SetStreakDetailDialog(QDialog):
         inner.setStyleSheet(f"background-color: {COLORS['bg_card']};")
 
         if matches:
+            total_matches = len(matches)
             for i, m in enumerate(matches, start=1):
                 won = bool(m.get("won", 1))
                 tourney = m.get("tourney_name") or ""
@@ -864,7 +840,13 @@ class _SetStreakDetailDialog(QDialog):
                 sets_display = ""
                 if parsed:
                     set_parts = []
-                    for w_g, l_g, tb in parsed["set_scores"]:
+                    streak_set_indexes = m.get("streak_set_indexes") or []
+                    streak_set_indexes = set(streak_set_indexes)
+                    show_full_match = i == 1 or i == total_matches
+                    for set_index, (w_g, l_g, tb) in enumerate(parsed["set_scores"]):
+                        if (not show_full_match and streak_set_indexes
+                                and set_index not in streak_set_indexes):
+                            continue
                         player_won_set = w_g > l_g if won else l_g > w_g
                         pg = w_g if won else l_g
                         og = l_g if won else w_g
@@ -903,7 +885,7 @@ class _SetStreakDetailDialog(QDialog):
         scroll.setWidget(inner)
         layout.addWidget(scroll, 1)
 
-        legend = QLabel("✗ set perso (rosso) · ✓ set vinto · arancione = break subiti")
+        legend = QLabel("✗ match perso (rosso) · ✓ set vinto · arancione = break subiti")
         legend.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 8pt;")
         layout.addWidget(legend)
 

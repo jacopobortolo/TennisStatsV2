@@ -1164,21 +1164,35 @@ class TennisDatabase:
 
         sql = f"""
             SELECT side, score, tourney_level FROM (
-                SELECT 'W' AS side, score, tourney_date, match_num,
+                SELECT 'W' AS side, score, tourney_date, match_num, round,
                        tourney_level
                 FROM matches m
                 WHERE {win_match}{tour_cond}
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND UPPER(COALESCE(score,'')) NOT LIKE '%W/O%'
                 UNION ALL
-                SELECT 'L' AS side, score, tourney_date, match_num,
+                SELECT 'L' AS side, score, tourney_date, match_num, round,
                        tourney_level
                 FROM matches m
                 WHERE {lose_match}{tour_cond}
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND UPPER(COALESCE(score,'')) NOT LIKE '%W/O%'
             )
-            ORDER BY tourney_date ASC, match_num ASC
+            ORDER BY tourney_date ASC,
+                CASE round
+                    WHEN 'Q1' THEN 1
+                    WHEN 'Q2' THEN 2
+                    WHEN 'Q3' THEN 3
+                    WHEN 'R128' THEN 4
+                    WHEN 'R64' THEN 5
+                    WHEN 'R32' THEN 6
+                    WHEN 'R16' THEN 7
+                    WHEN 'QF' THEN 8
+                    WHEN 'SF' THEN 9
+                    WHEN 'F' THEN 10
+                    ELSE 11
+                END,
+                match_num DESC
         """
         rows = self.conn.execute(
             sql, win_p + tour_params + lose_p + tour_params
@@ -1587,7 +1601,21 @@ class TennisDatabase:
             SELECT * FROM matches
             WHERE {where}
               AND (is_upcoming = 0 OR is_upcoming IS NULL)
-            ORDER BY tourney_date DESC, match_num DESC
+            ORDER BY tourney_date ASC,
+                CASE round
+                    WHEN 'Q1' THEN 1
+                    WHEN 'Q2' THEN 2
+                    WHEN 'Q3' THEN 3
+                    WHEN 'R128' THEN 4
+                    WHEN 'R64' THEN 5
+                    WHEN 'R32' THEN 6
+                    WHEN 'R16' THEN 7
+                    WHEN 'QF' THEN 8
+                    WHEN 'SF' THEN 9
+                    WHEN 'F' THEN 10
+                    ELSE 11
+                END,
+                match_num DESC
         """, params)
         results = [dict(r) for r in cur.fetchall()]
         self._fill_missing_ranks(results)
@@ -1612,7 +1640,21 @@ class TennisDatabase:
         cur = self.conn.execute(f"""
             SELECT * FROM doubles_matches
             WHERE {where}
-            ORDER BY tourney_date DESC, match_num DESC
+            ORDER BY tourney_date ASC,
+                CASE round
+                    WHEN 'Q1' THEN 1
+                    WHEN 'Q2' THEN 2
+                    WHEN 'Q3' THEN 3
+                    WHEN 'R128' THEN 4
+                    WHEN 'R64' THEN 5
+                    WHEN 'R32' THEN 6
+                    WHEN 'R16' THEN 7
+                    WHEN 'QF' THEN 8
+                    WHEN 'SF' THEN 9
+                    WHEN 'F' THEN 10
+                    ELSE 11
+                END,
+                match_num DESC
         """, params)
         return [dict(r) for r in cur.fetchall()]
 
@@ -1930,7 +1972,20 @@ class TennisDatabase:
                      CAST(SUBSTR(tourney_date, 1, 4) AS INTEGER),
                      round
             HAVING ioc_count >= ?
-            ORDER BY year DESC, tourney_level, round
+            ORDER BY year DESC, tourney_level,
+                CASE round
+                    WHEN 'Q1' THEN 1
+                    WHEN 'Q2' THEN 2
+                    WHEN 'Q3' THEN 3
+                    WHEN 'R128' THEN 4
+                    WHEN 'R64' THEN 5
+                    WHEN 'R32' THEN 6
+                    WHEN 'R16' THEN 7
+                    WHEN 'QF' THEN 8
+                    WHEN 'SF' THEN 9
+                    WHEN 'F' THEN 10
+                    ELSE 11
+                END
         """
         params = (
             [tour, year_from, year_to, ioc, ioc, tour] + level_params + round_params
@@ -1980,8 +2035,10 @@ class TennisDatabase:
         if prev_round:
             projected_union = f"""
                 UNION ALL
-                SELECT m.winner_name AS player_name,
-                       'P' AS side,
+                  SELECT m.winner_name AS player_name,
+                      'P' AS side,
+                      m.tourney_date AS tourney_date,
+                      m.tour AS tourney_tour,
                        m.tourney_name || ' (' || SUBSTR(m.tourney_date,1,4) || ')' AS tourney_info
                 FROM matches m
                 WHERE m.tour = ? AND m.round = ? AND m.tourney_level = ?
@@ -2014,10 +2071,13 @@ class TennisDatabase:
                    COUNT(*) AS appearances,
                    SUM(CASE WHEN side='W' THEN 1 ELSE 0 END) AS wins,
                    SUM(CASE WHEN side='L' THEN 1 ELSE 0 END) AS losses,
-                   GROUP_CONCAT(side || '|' || tourney_info) AS tournaments
+                     GROUP_CONCAT(side || '|' || tourney_date || '|' || tourney_tour || '|' || tourney_info) AS tournaments
             FROM (
-                SELECT winner_name AS player_name,
-                       'W' AS side,
+                  SELECT * FROM (
+                  SELECT winner_name AS player_name,
+                      'W' AS side,
+                      tourney_date,
+                      tour AS tourney_tour,
                        tourney_name || ' (' || SUBSTR(tourney_date,1,4) || ')' AS tourney_info
                 FROM matches
                 WHERE tour = ? AND round = ? AND tourney_level = ?
@@ -2025,8 +2085,10 @@ class TennisDatabase:
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_winner}
                 UNION ALL
-                SELECT loser_name AS player_name,
-                       'L' AS side,
+                  SELECT loser_name AS player_name,
+                      'L' AS side,
+                      tourney_date,
+                      tour AS tourney_tour,
                        tourney_name || ' (' || SUBSTR(tourney_date,1,4) || ')' AS tourney_info
                 FROM matches
                 WHERE tour = ? AND round = ? AND tourney_level = ?
@@ -2034,6 +2096,8 @@ class TennisDatabase:
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_loser}
                 {projected_union}
+                )
+                ORDER BY LOWER(TRIM(player_name)), tourney_date DESC, tourney_info
             )
             GROUP BY LOWER(TRIM(player_name))
             ORDER BY appearances DESC, player_name

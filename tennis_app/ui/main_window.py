@@ -177,6 +177,7 @@ class MainWindow(QMainWindow):
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(10, 20, 10, 20)
         sidebar_layout.setSpacing(4)
+        self._sidebar_layout = sidebar_layout
 
         for label, key in NAV_ITEMS:
             btn = QPushButton(label)
@@ -185,6 +186,13 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda checked=False, k=key: self._switch_page(k))
             sidebar_layout.addWidget(btn)
             self._nav_buttons[key] = btn
+
+        self._global_records_host = QWidget()
+        self._global_records_host.setVisible(False)
+        self._global_records_layout = QVBoxLayout(self._global_records_host)
+        self._global_records_layout.setContentsMargins(0, 10, 0, 0)
+        self._global_records_layout.setSpacing(0)
+        sidebar_layout.addWidget(self._global_records_host, 1)
 
         sidebar_layout.addStretch()
 
@@ -254,6 +262,17 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(page)
         if key == "matches" and hasattr(page, "navigate_to_tournament"):
             page.navigate_to_tournament.connect(self._on_navigate_to_tournament)
+        if key == "nations" and hasattr(page, "navigate_to_tournament"):
+            page.navigate_to_tournament.connect(self._on_navigate_to_tournament)
+
+    def _attach_global_records_panel(self):
+        page = self._pages.get("global_stats")
+        if not page or not hasattr(page, "records_panel"):
+            return
+        panel = page.records_panel()
+        if panel.parent() is not self._global_records_host:
+            self._global_records_layout.addWidget(panel)
+        panel.setVisible(True)
 
     def _on_navigate_to_tournament(self, tourney_name: str, year_str: str,
                                    tour: str):
@@ -270,6 +289,10 @@ class MainWindow(QMainWindow):
             return
         self._current_page = key
         self.stack.setCurrentWidget(self._pages[key])
+
+        if key == "global_stats":
+            self._attach_global_records_panel()
+        self._global_records_host.setVisible(key == "global_stats")
 
         # Update nav button states
         for k, btn in self._nav_buttons.items():

@@ -5,7 +5,7 @@ Player Search & Profile page.
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QStackedWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QSizePolicy, QPushButton,
+    QSizePolicy, QPushButton, QGridLayout,
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -328,8 +328,14 @@ class PlayerPage(QWidget):
             layout.addWidget(row_widget)
         layout.addWidget(Separator())
 
-        # --- Tournament level ---
-        layout.addWidget(SectionHeader("Record by Tournament Level"))
+        # --- Tournament level + round record ---
+        record_grid = QGridLayout()
+        record_grid.setContentsMargins(0, 0, 0, 0)
+        record_grid.setHorizontalSpacing(14)
+        record_grid.setVerticalSpacing(8)
+        record_grid.setColumnStretch(0, 3)
+        record_grid.setColumnStretch(1, 2)
+        record_grid.addWidget(SectionHeader("Record by Tournament Level"), 0, 0)
 
         level_order = [
             "Grand Slam",
@@ -370,7 +376,36 @@ class PlayerPage(QWidget):
             ])
         level_table.populate(level_rows)
         self._fit_table(level_table)
-        layout.addWidget(level_table)
+        record_grid.addWidget(level_table, 1, 0, Qt.AlignTop)
+        record_grid.addWidget(SectionHeader("Record by Round"), 0, 1)
+
+        round_names = {
+            "F": "Final", "SF": "Semi-Final", "QF": "Quarter-Final",
+            "R16": "Round of 16", "R32": "Round of 32",
+            "R64": "Round of 64", "R128": "Round of 128", "RR": "Round Robin",
+        }
+        round_order = ["F", "SF", "QF", "R16", "R32", "R64", "R128", "RR"]
+        round_table = DataTable([
+            ("Round", 120), ("Wins", 70), ("Losses", 70), ("Win %", 70),
+        ])
+        rounds_data = stats.get("rounds", {})
+        round_rows = []
+        for rnd in round_order:
+            rec = rounds_data.get(rnd)
+            if not rec:
+                continue
+            w, l = rec["wins"], rec["losses"]
+            p = round(w / (w + l) * 100, 1) if (w + l) else 0
+            round_rows.append([
+                round_names.get(rnd, rnd), str(w), str(l), f"{p}%"
+            ])
+        round_table.populate(round_rows)
+        self._fit_table(round_table)
+        record_grid.addWidget(round_table, 1, 1, Qt.AlignTop)
+
+        record_widget = QWidget()
+        record_widget.setLayout(record_grid)
+        layout.addWidget(record_widget)
 
         # Streak table: Overall + per-level
         if streaks:
@@ -441,33 +476,6 @@ class PlayerPage(QWidget):
                 layout.addWidget(chart_wk)
 
             layout.addWidget(Separator())
-
-        # --- By round ---
-        layout.addWidget(SectionHeader("Record by Round"))
-
-        round_names = {
-            "F": "Final", "SF": "Semi-Final", "QF": "Quarter-Final",
-            "R16": "Round of 16", "R32": "Round of 32",
-            "R64": "Round of 64", "R128": "Round of 128", "RR": "Round Robin",
-        }
-        round_order = ["F", "SF", "QF", "R16", "R32", "R64", "R128", "RR"]
-        round_table = DataTable([
-            ("Round", 120), ("Wins", 80), ("Losses", 80), ("Win %", 80),
-        ])
-        rounds_data = stats.get("rounds", {})
-        round_rows = []
-        for rnd in round_order:
-            rec = rounds_data.get(rnd)
-            if not rec:
-                continue
-            w, l = rec["wins"], rec["losses"]
-            p = round(w / (w + l) * 100, 1) if (w + l) else 0
-            round_rows.append([
-                round_names.get(rnd, rnd), str(w), str(l), f"{p}%"
-            ])
-        round_table.populate(round_rows)
-        self._fit_table(round_table)
-        layout.addWidget(round_table)
 
     def _go_to_stats(self, player_name: str):
         """Navigate to the Stats tab and load this player."""

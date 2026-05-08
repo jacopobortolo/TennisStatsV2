@@ -86,8 +86,9 @@ class _YearsWorker(QThread):
         self.finished.emit(result)
 
 ROUND_ORDER = {
-    "F": 0, "SF": 1, "QF": 2, "R16": 3, "R32": 4,
-    "R64": 5, "R128": 6, "RR": 7, "ER": 8, "BR": 9,
+    "Q1": 0, "Q2": 1, "Q3": 2,
+    "R128": 3, "R64": 4, "R32": 5, "R16": 6,
+    "QF": 7, "SF": 8, "F": 9, "RR": 10, "ER": 11, "BR": 12,
 }
 
 
@@ -314,14 +315,19 @@ class TournamentsPage(QWidget):
 
     def _on_draw_loaded(self, matches, tourney_name, year_text, is_doubles):
         self.draw_header.setText(f"{tourney_name} ({year_text})")
-        matches.sort(key=lambda m: ROUND_ORDER.get(m.get("round", ""), 99))
+        matches.sort(
+            key=lambda m: (
+                ROUND_ORDER.get(m.get("round", ""), 99),
+                -(int(m.get("match_num") or 0)),
+            )
+        )
 
         # Store for double-click handler
         self._current_draw_matches = list(matches)
         round_names = {
             "F": "Final", "SF": "Semi-Final", "QF": "Quarter-Final",
             "R16": "R16", "R32": "R32", "R64": "R64", "R128": "R128",
-            "RR": "Round Robin",
+            "RR": "Round Robin", "Q3": "Q3", "Q2": "Q2", "Q1": "Q1",
         }
 
         rows = []

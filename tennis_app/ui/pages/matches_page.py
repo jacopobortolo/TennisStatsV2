@@ -122,13 +122,9 @@ class MatchesPage(QWidget):
 
         filter_row.addWidget(QLabel("Round:"))
         self.round_pills = MultiPillButtonGroup(
-            ["All", "F", "SF", "QF", "R16", "R32", "R64", "R128", "RR"])
-        filter_row.addWidget(self.round_pills)
-
-        self.level_pills = MultiPillButtonGroup(
-            ["All", "GS", "M", "ATP", "CH",
-             "DC", "Fin"])
-        filter_row.addWidget(self.level_pills)
+            ["All", "F", "SF", "QF", "R16", "R32", "R64", "R128",
+             "RR", "Q3", "Q2", "Q1"])
+        filter_row.addWidget(self.round_pills, 1)
 
         filter_row.addWidget(QLabel("Rows:"))
         self.rows_combo = QComboBox()
@@ -160,18 +156,32 @@ class MatchesPage(QWidget):
         self.rank_pills = PillButtonGroup(
             ["All", "Top 5", "Top 10", "Top 20", "Top 50", "Top 100"])
         rank_row.addWidget(self.rank_pills)
-        self.wl_label = QLabel("")
-        self.wl_label.setObjectName("dimLabel")
-        rank_row.addWidget(self.wl_label)
+
+        rank_row.addWidget(QLabel("Tournament Level:"))
+        self.level_pills = MultiPillButtonGroup(
+            ["All", "GS", "M", "ATP", "CH",
+             "DC", "Fin"])
+        rank_row.addWidget(self.level_pills, 1)
         rank_row.addStretch()
         layout.addLayout(rank_row)
+
+        table_header_row = QHBoxLayout()
+        table_header_row.setContentsMargins(0, 0, 0, 0)
+        table_header_row.addStretch()
+        self.wl_label = QLabel("")
+        self.wl_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.wl_label.setStyleSheet(
+            f"color: {COLORS['accent']}; font-size: 14pt; font-weight: 800;"
+        )
+        table_header_row.addWidget(self.wl_label)
+        layout.addLayout(table_header_row)
 
         # --- Table ---
         self.table = DataTable([
             ("Date", 90), ("Tournament", 170), ("Level", 80),
             ("Surface", 65), ("Round", 55), ("Winner", 160),
             ("Loser", 160), ("W Rk", 50), ("L Rk", 50),
-            ("Score", 140), ("Min", 45),
+            ("Score", 210), ("Min", 45),
         ])
         self.table.doubleClicked.connect(self._on_match_double_clicked)
         layout.addWidget(self.table, 1)

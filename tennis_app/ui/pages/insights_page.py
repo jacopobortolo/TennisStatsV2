@@ -99,6 +99,8 @@ class _InsightsWorker(QThread):
 class InsightsPage(QWidget):
     """Nations & Fun Facts page."""
 
+    navigate_to_tournament = Signal(str, str, str)
+
     _BREAKDOWN_COLS = [
         ("Level",          140),
         ("Round",           60),
@@ -641,13 +643,56 @@ class _RoundPlayersDialog(QDialog):
         tree.header().setStretchLastSection(True)
         tree.setSelectionMode(QAbstractItemView.SingleSelection)
 
-        def _entry_sort_key(e: str):
-            # P (projected) first, then W, then L; within each group reverse-alpha
-            if e.startswith("P|"):
-                return (0, e)
-            if e.startswith("W|"):
-                return (1, e)
-            return (2, e)
+        def _parse_entry(e: str):
+            parts = e.split("|", 3)
+            if len(parts) == 4:
+                side, date_text, tour, tourney = parts
+            elif len(parts) == 2:
+                side, tourney = parts
+                date_text = ""
+                tour = getattr(self.parent(), "_last_search_params", {}).get("tour", "atp")
+            else:
+                side = ""
+                date_text = ""
+                tour = getattr(self.parent(), "_last_search_params", {}).get("tour", "atp")
+                tourney = e
+            display = tourney.strip()
+            name = display
+            year = str(date_text or "")[:4]
+            if display.endswith(")") and "(" in display:
+                base, suffix = display.rsplit("(", 1)
+                maybe_year = suffix[:-1]
+                if maybe_year.isdigit():
+                    name = base.strip()
+                    year = year or maybe_year
+            return {
+                "side": side,
+                "date": str(date_text or ""),
+                "tour": tour or "atp",
+                "display": display,
+                "name": name,
+                "year": year,
+            }
+
+        def _entry_sort_key(entry: dict):
+            try:
+                date_value = -int(entry.get("date") or 0)
+            except ValueError:
+                date_value = 0
+            return (date_value, entry.get("display", ""))
+
+        def _open_tournament(item: QTreeWidgetItem, column: int):
+            info = item.data(1, Qt.UserRole)
+            if not info:
+                return
+            parent_page = self.parent()
+            if hasattr(parent_page, "navigate_to_tournament"):
+                parent_page.navigate_to_tournament.emit(
+                    info.get("name", ""), info.get("year", ""), info.get("tour", "atp")
+                )
+                self.accept()
+
+        tree.itemDoubleClicked.connect(_open_tournament)
 
         for d in data:
             wins   = d.get("wins", 0) or 0
@@ -663,11 +708,12 @@ class _RoundPlayersDialog(QDialog):
                 tree.addTopLevelItem(player_item)
                 continue
             first = True
-            for entry in sorted(entries, key=_entry_sort_key):
-                if "|" in entry:
-                    side, tourney = entry.split("|", 1)
-                else:
-                    side, tourney = "", entry
+            parsed_entries = sorted(
+                (_parse_entry(entry) for entry in entries),
+                key=_entry_sort_key,
+            )
+            for entry in parsed_entries:
+                side = entry["side"]
                 if side == "W":
                     result_str = "W"
                     color = QColor(COLORS["green"])
@@ -680,10 +726,15 @@ class _RoundPlayersDialog(QDialog):
                 totale_str = f"{wins}W–{losses}L" if first else ""
                 item = QTreeWidgetItem([
                     d.get("player_name", "") if first else "",
-                    tourney.strip(),
+                    entry["display"],
                     result_str,
                     totale_str,
                 ])
+                item.setData(1, Qt.UserRole, {
+                    "name": entry["name"],
+                    "year": entry["year"],
+                    "tour": entry["tour"],
+                })
                 item.setForeground(2, QBrush(color))
                 if not first:
                     item.setForeground(0, QBrush(QColor(COLORS["text_dim"])))
