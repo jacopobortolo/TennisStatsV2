@@ -1746,6 +1746,7 @@ class TennisDatabase:
         year_from: int = 1968,
         year_to: int = 2099,
         tourney_levels: list | None = None,
+        historic_olympics: bool = False,
     ) -> list[dict]:
         """
         For each (tourney_level, round) return appearances and unique_players.
@@ -1753,11 +1754,27 @@ class TennisDatabase:
         name for recently-scraped matches that have empty winner_ioc/loser_ioc.
         """
         level_clause = ""
+        level_clause_w = ""
         level_params: list = []
         if tourney_levels:
-            placeholders = ",".join("?" * len(tourney_levels))
-            level_clause = f"AND tourney_level IN ({placeholders})"
-            level_params = list(tourney_levels)
+            if historic_olympics and "A" in tourney_levels:
+                non_a = [c for c in tourney_levels if c != "A"]
+                oly_cond = "(tourney_level = 'A' AND tourney_name LIKE '%lympic%')"
+                oly_cond_w = "(w.tourney_level = 'A' AND w.tourney_name LIKE '%lympic%')"
+                if non_a:
+                    ph = ",".join("?" * len(non_a))
+                    level_clause = f"AND (tourney_level IN ({ph}) OR {oly_cond})"
+                    level_clause_w = f"AND (w.tourney_level IN ({ph}) OR {oly_cond_w})"
+                    level_params = non_a
+                else:
+                    level_clause = f"AND {oly_cond}"
+                    level_clause_w = f"AND {oly_cond_w}"
+                    level_params = []
+            else:
+                placeholders = ",".join("?" * len(tourney_levels))
+                level_clause = f"AND tourney_level IN ({placeholders})"
+                level_clause_w = f"AND w.tourney_level IN ({placeholders})"
+                level_params = list(tourney_levels)
 
         # ioc_match_w / ioc_match_l: true when the player's nationality is ioc,
         # either via the stored IOC column or via a name lookup in the players table.
@@ -1831,7 +1848,7 @@ class TennisDatabase:
                           SELECT name_first||' '||name_last FROM players
                           WHERE ioc=? AND tour=?))
                   )
-                  {level_clause.replace('tourney_level', 'w.tourney_level')}
+                  {level_clause_w}
                   -- Exclude if a match already exists at the projected round
                   AND NOT EXISTS (
                       SELECT 1 FROM matches nx
@@ -1870,6 +1887,7 @@ class TennisDatabase:
         year_to: int = 2099,
         tourney_levels: list | None = None,
         rounds: list | None = None,
+        historic_olympics: bool = False,
     ) -> list[dict]:
         """
         Return tournament-year-round instances where >= min_count distinct players
@@ -1877,11 +1895,27 @@ class TennisDatabase:
         Uses name-based IOC fallback for scraped matches with missing IOC column.
         """
         level_clause = ""
+        level_clause_m = ""
         level_params: list = []
         if tourney_levels:
-            placeholders = ",".join("?" * len(tourney_levels))
-            level_clause = f"AND tourney_level IN ({placeholders})"
-            level_params = list(tourney_levels)
+            if historic_olympics and "A" in tourney_levels:
+                non_a = [c for c in tourney_levels if c != "A"]
+                oly_cond = "(tourney_level = 'A' AND tourney_name LIKE '%lympic%')"
+                oly_cond_m = "(m.tourney_level = 'A' AND m.tourney_name LIKE '%lympic%')"
+                if non_a:
+                    ph = ",".join("?" * len(non_a))
+                    level_clause = f"AND (tourney_level IN ({ph}) OR {oly_cond})"
+                    level_clause_m = f"AND (m.tourney_level IN ({ph}) OR {oly_cond_m})"
+                    level_params = non_a
+                else:
+                    level_clause = f"AND {oly_cond}"
+                    level_clause_m = f"AND {oly_cond_m}"
+                    level_params = []
+            else:
+                placeholders = ",".join("?" * len(tourney_levels))
+                level_clause = f"AND tourney_level IN ({placeholders})"
+                level_clause_m = f"AND m.tourney_level IN ({placeholders})"
+                level_params = list(tourney_levels)
 
         round_clause = ""
         round_params: list = []
@@ -1908,7 +1942,6 @@ class TennisDatabase:
             "     SELECT name_first||' '||name_last FROM players"
             "     WHERE ioc=? AND tour=?)))"
         )
-        level_clause_m = level_clause.replace("tourney_level", "m.tourney_level")
 
         sql = f"""
             SELECT tourney_name, tourney_level, surface,
@@ -2005,6 +2038,7 @@ class TennisDatabase:
         tour: str = "atp",
         year_from: int = 1968,
         year_to: int = 2099,
+        historic_olympics: bool = False,
     ) -> list[dict]:
         """
         For a given IOC + level + round, return each player with their
@@ -2013,6 +2047,17 @@ class TennisDatabase:
         already won the previous round but have no match yet at this round.
         Ordered by appearances DESC.
         """
+        # Build the tourney_level condition — for historical Olympics data
+        # (tourney_level='A' with Olympic name) we need a name-based filter
+        # combined with the modern 'O' code.
+        if historic_olympics and tourney_level == "A":
+            level_cond = "(tourney_level = 'O' OR (tourney_level = 'A' AND tourney_name LIKE '%lympic%'))"
+            level_cond_m = "(m.tourney_level = 'O' OR (m.tourney_level = 'A' AND m.tourney_name LIKE '%lympic%'))"
+            level_params: list = []
+        else:
+            level_cond = "tourney_level = ?"
+            level_cond_m = "m.tourney_level = ?"
+            level_params = [tourney_level]
         ioc_winner = (
             "(winner_ioc = ?"
             " OR (COALESCE(winner_ioc,'')='' AND winner_name IN ("
@@ -2041,7 +2086,7 @@ class TennisDatabase:
                       m.tour AS tourney_tour,
                        m.tourney_name || ' (' || SUBSTR(m.tourney_date,1,4) || ')' AS tourney_info
                 FROM matches m
-                WHERE m.tour = ? AND m.round = ? AND m.tourney_level = ?
+                WHERE m.tour = ? AND m.round = ? AND {level_cond_m}
                   AND CAST(SUBSTR(m.tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
                   AND (m.is_upcoming = 0 OR m.is_upcoming IS NULL)
                   AND (
@@ -2062,10 +2107,10 @@ class TennisDatabase:
                         AND nx.round = ?
                   )
             """
-            projected_params = [
-                tour, prev_round, tourney_level, year_from, year_to,
-                ioc, ioc, tour, round_,
-            ]
+            projected_params = (
+                [tour, prev_round] + level_params + [year_from, year_to,
+                ioc, ioc, tour, round_]
+            )
         sql = f"""
             SELECT player_name,
                    COUNT(*) AS appearances,
@@ -2080,7 +2125,7 @@ class TennisDatabase:
                       tour AS tourney_tour,
                        tourney_name || ' (' || SUBSTR(tourney_date,1,4) || ')' AS tourney_info
                 FROM matches
-                WHERE tour = ? AND round = ? AND tourney_level = ?
+                WHERE tour = ? AND round = ? AND {level_cond}
                   AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_winner}
@@ -2091,7 +2136,7 @@ class TennisDatabase:
                       tour AS tourney_tour,
                        tourney_name || ' (' || SUBSTR(tourney_date,1,4) || ')' AS tourney_info
                 FROM matches
-                WHERE tour = ? AND round = ? AND tourney_level = ?
+                WHERE tour = ? AND round = ? AND {level_cond}
                   AND CAST(SUBSTR(tourney_date,1,4) AS INTEGER) BETWEEN ? AND ?
                   AND (is_upcoming = 0 OR is_upcoming IS NULL)
                   AND {ioc_loser}
@@ -2102,10 +2147,10 @@ class TennisDatabase:
             GROUP BY LOWER(TRIM(player_name))
             ORDER BY appearances DESC, player_name
         """
-        params = [
-            tour, round_, tourney_level, year_from, year_to, ioc, ioc, tour,
-            tour, round_, tourney_level, year_from, year_to, ioc, ioc, tour,
-        ] + projected_params
+        params = (
+            [tour, round_] + level_params + [year_from, year_to, ioc, ioc, tour]
+            + [tour, round_] + level_params + [year_from, year_to, ioc, ioc, tour]
+        ) + projected_params
         cur = self.conn.execute(sql, params)
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]

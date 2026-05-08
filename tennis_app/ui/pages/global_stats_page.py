@@ -50,7 +50,7 @@ SECTIONS = [
     },
     {
         "title": "Tournament Type Stats",
-        "description": "Focused records for Grand Slams, Masters 1000, ATP Finals, Olympics, ATP 500/250, and Challengers.",
+        "description": "Focused records for Grand Slams, Masters 1000, ATP/WTA Finals, Olympics, ATP/WTA 500/250, and Challengers.",
         "filters": "tournament_level, tournament, surface, season, era, round",
     },
     {
@@ -465,13 +465,22 @@ class GlobalStatsPage(QWidget):
 
         self.tour_pills = self._filter_pills(["All", "ATP", "WTA"])
         self.level_pills = self._filter_pills([
-            "All", "Grand Slam", "Masters 1000", "ATP Finals",
-            "Olympics", "ATP 500", "ATP 250", "Challenger",
+            "All", "Grand Slam", "Masters 1000", "ATP/WTA Finals",
+            "Olympics", "ATP/WTA 500", "ATP/WTA 250", "Challenger",
         ])
         self.surface_pills = self._filter_pills(["All", "Hard", "Clay", "Grass", "Carpet"])
         self.era_pills = self._filter_pills(["All-time", "Open Era", "2000s", "2010s", "2020s"])
         self.round_pills = self._filter_pills([
             "All", "F", "SF", "QF", "R16", "R32", "R64", "R128", "RR", "Q3", "Q2", "Q1",
+        ])
+
+        # Default selections: all levels except Challenger; all rounds except qualifiers
+        self.level_pills.set_values([
+            "Grand Slam", "Masters 1000", "ATP/WTA Finals",
+            "Olympics", "ATP/WTA 500", "ATP/WTA 250",
+        ])
+        self.round_pills.set_values([
+            "F", "SF", "QF", "R16", "R32", "R64", "R128", "RR",
         ])
 
         for label, pills in [

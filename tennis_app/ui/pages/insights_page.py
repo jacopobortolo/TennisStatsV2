@@ -80,12 +80,14 @@ class _InsightsWorker(QThread):
                     ioc=p["ioc"], tour=p["tour"],
                     year_from=p["year_from"], year_to=p["year_to"],
                     tourney_levels=p.get("levels"),
+                    historic_olympics=p.get("filter_hist_oly", False),
                 )
             else:
                 data = self._db.get_ioc_concentration_instances(
                     ioc=p["ioc"], min_count=p["min_count"], tour=p["tour"],
                     year_from=p["year_from"], year_to=p["year_to"],
                     tourney_levels=p.get("levels"), rounds=p.get("rounds"),
+                    historic_olympics=p.get("filter_hist_oly", False),
                 )
             self.data_ready.emit(data, self._mode)
         except Exception as exc:
@@ -159,7 +161,7 @@ class InsightsPage(QWidget):
 
         fa.addWidget(QLabel("Level:"))
         self.level_pills = MultiPillButtonGroup(
-            ["All", "GS", "M", "ATP", "CH", "DC", "Fin"])
+            ["All", "GS", "M", "ATP/WTA", "CH", "DC/BJKC", "Fin", "Oly"])
         fa.addWidget(self.level_pills)
 
         fa.addWidget(QLabel("From:"))
@@ -257,13 +259,30 @@ class InsightsPage(QWidget):
     def _current_tour(self) -> str:
         return self.tour_pills.value().lower()
 
-    def _active_levels(self) -> list[str] | None:
-        """Return list of tourney_level codes, or None if All."""
-        _map = {"GS": "G", "M": "M", "ATP": "A", "CH": "C", "DC": "D", "Fin": "F"}
+    def _active_levels(self) -> tuple[list[str] | None, bool]:
+        """Return (list of tourney_level codes or None if All, filter_hist_oly flag)."""
+        _map = {
+            "GS": ["G"], "M": ["M", "PM"],
+            "ATP/WTA": ["A", "P", "I"], "CH": ["C"], "DC/BJKC": ["D"], "Fin": ["F", "E"],
+            "Oly": ["O"],
+        }
         selected = self.level_pills.values()
         if not selected:
-            return None
-        return [_map[v] for v in selected if v in _map] or None
+            return None, False
+        result: list[str] = []
+        for v in selected:
+            for code in _map.get(v, []):
+                if code not in result:
+                    result.append(code)
+        # Historical Olympics: pre-modern data uses tourney_level='A' with
+        # tourney_name containing 'lympic'. When 'Oly' is selected but 'A' is
+        # not already present (user didn't choose ATP/WTA 500/250), add 'A'
+        # and signal that DB must apply the name filter.
+        filter_hist_oly = False
+        if "O" in result and "A" not in result:
+            result.append("A")
+            filter_hist_oly = True
+        return result or None, filter_hist_oly
 
     def _reload_ioc_list(self, tour: str):
         self.ioc_combo.blockSignals(True)
@@ -299,18 +318,20 @@ class InsightsPage(QWidget):
         year_to = self.year_to.value()
         if year_from > year_to:
             year_from, year_to = year_to, year_from
-        levels = self._active_levels()
+        levels, filter_hist_oly = self._active_levels()
 
         self._last_search_params = {
             "ioc": ioc, "tour": tour,
             "year_from": year_from, "year_to": year_to,
+            "filter_hist_oly": filter_hist_oly,
         }
         self.search_btn.setEnabled(False)
         self.status_label.setText("Searching...")
         self._start_insights_worker(
             "breakdown",
             {"ioc": ioc, "tour": tour, "year_from": year_from,
-             "year_to": year_to, "levels": levels},
+             "year_to": year_to, "levels": levels,
+             "filter_hist_oly": filter_hist_oly},
         )
 
     def _run_concentration(self):
@@ -324,13 +345,14 @@ class InsightsPage(QWidget):
         year_to = self.year_to.value()
         if year_from > year_to:
             year_from, year_to = year_to, year_from
-        levels = self._active_levels()
+        levels, filter_hist_oly = self._active_levels()
         rounds = self.conc_round_pills.values() or None
         min_count = self.min_count_spin.value()
 
         self._last_search_params = {
             "ioc": ioc, "tour": tour,
             "year_from": year_from, "year_to": year_to,
+            "filter_hist_oly": filter_hist_oly,
         }
         self.find_btn.setEnabled(False)
         self.instance_status_label.setText("Searching...")
@@ -338,7 +360,8 @@ class InsightsPage(QWidget):
             "concentration",
             {"ioc": ioc, "min_count": min_count, "tour": tour,
              "year_from": year_from, "year_to": year_to,
-             "levels": levels, "rounds": rounds},
+             "levels": levels, "rounds": rounds,
+             "filter_hist_oly": filter_hist_oly},
         )
 
     def _start_insights_worker(self, mode, params):
@@ -533,6 +556,7 @@ class InsightsPage(QWidget):
                 tour=p["tour"],
                 year_from=p["year_from"],
                 year_to=p["year_to"],
+                historic_olympics=p.get("filter_hist_oly", False) and d["tourney_level"] == "A",
             )
         except Exception as exc:
             self.status_label.setText(f"Detail query error: {exc}")

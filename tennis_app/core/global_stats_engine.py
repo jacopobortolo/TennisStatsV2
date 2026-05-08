@@ -11,18 +11,25 @@ from .stats_engine import parse_score
 LEVEL_LABELS = {
     "G": "Grand Slam",
     "M": "Masters 1000",
-    "F": "ATP Finals",
+    "PM": "Premier Mandatory",
+    "F": "Tour Finals",
+    "E": "Elite Trophy",
     "A": "Tour-level",
+    "P": "Premier",
+    "I": "International",
     "C": "Challenger",
     "D": "Team Cup",
+    "O": "Olympics",
 }
+# Each UI label maps to a list of DB tourney_level codes (ATP + WTA equivalents)
 LEVEL_FILTERS = {
-    "Grand Slam": "G",
-    "Masters 1000": "M",
-    "ATP Finals": "F",
-    "ATP 500": "A",
-    "ATP 250": "A",
-    "Challenger": "C",
+    "Grand Slam":      ["G"],
+    "Masters 1000":    ["M", "PM"],    # ATP Masters 1000 + WTA Premier Mandatory
+    "ATP/WTA Finals":  ["F", "E"],    # ATP/WTA Tour Finals + WTA Elite Trophy
+    "Olympics":        ["O"],          # modern code; historical 'A' handled in _where
+    "ATP/WTA 500":     ["A", "P"],    # ATP 500 + WTA Premier
+    "ATP/WTA 250":     ["A", "I"],    # ATP 250 + WTA International
+    "Challenger":      ["C"],
 }
 
 
@@ -122,12 +129,41 @@ class GlobalStatsEngine:
             surface_values = self._filter_values(filters.get("surface"))
             self._add_in_filter(conditions, params, f"{alias}.surface", surface_values)
         if include_level:
+            selected_levels = self._filter_values(filters.get("level"))
             level_values = []
-            for level in self._filter_values(filters.get("level")):
-                level_code = LEVEL_FILTERS.get(level)
-                if level_code and level_code not in level_values:
-                    level_values.append(level_code)
-            self._add_in_filter(conditions, params, f"{alias}.tourney_level", level_values)
+            include_historical_olympics = False
+            for level in selected_levels:
+                if level == "Olympics":
+                    include_historical_olympics = True
+                codes = LEVEL_FILTERS.get(level)
+                if codes is None:
+                    continue
+                if isinstance(codes, str):
+                    codes = [codes]
+                for code in codes:
+                    if code not in level_values:
+                        level_values.append(code)
+            if level_values or include_historical_olympics:
+                if include_historical_olympics and "A" not in level_values:
+                    # Historical Olympics are coded 'A'; add an explicit OR branch
+                    if level_values:
+                        ph = ", ".join("?" for _ in level_values)
+                        conditions.append(
+                            f"({alias}.tourney_level IN ({ph})"
+                            f" OR ({alias}.tourney_level = 'A'"
+                            f" AND {alias}.tourney_name LIKE '%lympic%'))"
+                        )
+                        params.extend(level_values)
+                    else:
+                        conditions.append(
+                            f"({alias}.tourney_level = 'O'"
+                            f" OR ({alias}.tourney_level = 'A'"
+                            f" AND {alias}.tourney_name LIKE '%lympic%'))"
+                        )
+                else:
+                    # 'A' already included (ATP/WTA 500/250) or no Olympics selected
+                    self._add_in_filter(conditions, params,
+                                        f"{alias}.tourney_level", level_values)
         min_year = filters.get("min_year")
         max_year = filters.get("max_year")
         if not min_year and not max_year:

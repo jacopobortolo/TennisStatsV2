@@ -110,6 +110,16 @@ class _StatsComputeWorker(QThread):
                 tourney_level=filters["tourney_level"],
                 round_=filters.get("round_"),
             )
+            # Historical Olympics post-filter: 'A' was added to catch pre-modern
+            # Olympics data (tourney_level='A', tourney_name contains 'lympic').
+            # Remove non-Olympic 'A'-level matches when the user chose Olympics
+            # without also selecting ATP/WTA 500/250 events.
+            if filters.get("filter_hist_oly"):
+                filtered = [
+                    m for m in filtered
+                    if m.get("tourney_level") != "A"
+                    or "lympic" in (m.get("tourney_name") or "")
+                ]
 
             if not filtered:
                 self.data_ready.emit({"no_matches": True})
@@ -305,7 +315,7 @@ class StatsPage(QWidget):
         level_label.setStyleSheet("background: transparent;")
         filter_row.addWidget(level_label)
         self.level_pills = MultiPillButtonGroup(
-            ["All", "G", "M", "A", "F", "D"])
+            ["All", "G", "M", "A", "F", "D", "O"])
         self.level_pills.changed.connect(lambda _: self._filter_timer.start())
         filter_row.addWidget(self.level_pills)
 
@@ -334,13 +344,34 @@ class StatsPage(QWidget):
     def _get_filters(self):
         surface = self.surface_pills.value()
         year = self.year_combo.currentText()
-        levels = self.level_pills.values() or None
+        _wta_extra = {"M": ["PM"], "A": ["P", "I"], "F": ["E"], "O": []}
+        raw_levels = self.level_pills.values()
+        filter_hist_oly = False
+        if raw_levels:
+            expanded: list[str] = []
+            for lv in raw_levels:
+                if lv not in expanded:
+                    expanded.append(lv)
+                for extra in _wta_extra.get(lv, []):
+                    if extra not in expanded:
+                        expanded.append(extra)
+            # Historical Olympics: pre-modern data uses tourney_level='A' with
+            # tourney_name containing 'lympic'. When 'O' is selected but 'A' is
+            # not (user didn't explicitly select regular ATP/WTA 500/250 events),
+            # add 'A' and flag for post-filtering.
+            if "O" in expanded and "A" not in expanded:
+                expanded.append("A")
+                filter_hist_oly = True
+            levels = expanded
+        else:
+            levels = None
         rounds = self.round_pills.values() or None
         return {
             "surface": surface if surface != "All" else None,
             "year": year if year != "All" else None,
             "tourney_level": levels,
             "round_": rounds,
+            "filter_hist_oly": filter_hist_oly,
         }
 
     def _on_player_selected(self, player):

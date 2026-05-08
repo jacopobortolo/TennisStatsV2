@@ -27,7 +27,8 @@ class _MatchesWorker(QThread):
     error = Signal(str)
 
     def __init__(self, db, player_id, player_name, tour,
-                 surface, tourney_level, year, rounds, parent=None):
+                 surface, tourney_level, year, rounds,
+                 filter_historical_olympics=False, parent=None):
         super().__init__(parent)
         self._db = db
         self._player_id = player_id
@@ -37,6 +38,7 @@ class _MatchesWorker(QThread):
         self._tourney_level = tourney_level
         self._year = year
         self._rounds = rounds
+        self._filter_historical_olympics = filter_historical_olympics
 
     def run(self):
         try:
@@ -48,6 +50,13 @@ class _MatchesWorker(QThread):
                 round_=self._rounds,
                 tour=self._tour,
             )
+            if self._filter_historical_olympics:
+                # Keep 'A' only when tourney_name contains 'lympic'
+                matches = [
+                    m for m in matches
+                    if m.get("tourney_level") != "A"
+                    or "lympic" in (m.get("tourney_name") or "")
+                ]
             upcoming = None
             if self._player_name:
                 try:
@@ -159,8 +168,8 @@ class MatchesPage(QWidget):
 
         rank_row.addWidget(QLabel("Tournament Level:"))
         self.level_pills = MultiPillButtonGroup(
-            ["All", "GS", "M", "ATP", "CH",
-             "DC", "Fin"])
+            ["All", "GS", "M", "ATP/WTA", "CH",
+             "DC/BJKC", "Fin", "Oly"])
         rank_row.addWidget(self.level_pills, 1)
         rank_row.addStretch()
         layout.addLayout(rank_row)
@@ -286,11 +295,25 @@ class MatchesPage(QWidget):
         rounds = self.round_pills.values() or None
 
         _level_map = {
-            "GS": "G", "M": "M",
-            "ATP": "A", "CH": "C", "DC": "D", "Fin": "F",
+            "GS": ["G"], "M": ["M", "PM"],
+            "ATP": ["A", "P", "I"], "ATP/WTA": ["A", "P", "I"],
+            "CH": ["C"], "DC": ["D"], "DC/BJKC": ["D"], "Fin": ["F", "E"],
+            "Oly": ["O"],
         }
-        tourney_level = [_level_map[v] for v in self.level_pills.values()
-                         if v in _level_map] or None
+        selected_pills = self.level_pills.values()
+        oly_selected = "Oly" in selected_pills
+        atp_selected = "ATP" in selected_pills or "ATP/WTA" in selected_pills
+        _tl: list[str] = []
+        for v in selected_pills:
+            for code in _level_map.get(v, []):
+                if code not in _tl:
+                    _tl.append(code)
+        # Historical Olympics are coded 'A'; add 'A' when Oly is selected
+        # without ATP (which already includes 'A')
+        filter_hist_oly = oly_selected and not atp_selected
+        if filter_hist_oly and "A" not in _tl:
+            _tl.append("A")
+        tourney_level = _tl or None
 
         # Stop any previous query
         if self._matches_worker and self._matches_worker.isRunning():
@@ -305,6 +328,7 @@ class MatchesPage(QWidget):
             self._current_player,
             self._current_player_tour,
             surface, tourney_level, year, rounds,
+            filter_historical_olympics=filter_hist_oly,
             parent=self,
         )
         worker.data_ready.connect(self._on_matches_loaded)
@@ -395,8 +419,11 @@ class MatchesPage(QWidget):
             page = filtered
 
         level_map = {
-            "G": "Grand Slam", "M": "Masters", "A": "ATP",
-            "D": "Davis Cup", "F": "Finals", "C": "Challenger",
+            "G": "Grand Slam",
+            "M": "Masters", "PM": "W-Premier M",
+            "A": "ATP", "P": "W-Premier", "I": "W-Intl",
+            "F": "Finals", "E": "W-Elite",
+            "D": "Davis Cup", "C": "Challenger", "O": "Olympics",
         }
 
         rows = []
