@@ -830,6 +830,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
         entry["name"] = name_map.get(entry["name"], entry["name"])
 
     player_names = [e["name"] for e in rankings]
+    rank_by_name = {e["name"]: e.get("rank") for e in rankings}
     logger.info("Selected %d players for scraping (ranks %s\u2013%s: %s \u2026 %s, source=%s)",
                 len(rankings),
                 rankings[0].get("rank") if rankings else "?",
@@ -872,6 +873,17 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
     # issuing two queries per player (1000+ remote calls for top-1000).
     cache_snapshot = db.get_all_scrape_cache() if db is not None else {}
 
+    def _scrape_cache_lookup(name):
+        storage_name = clean_player_name(name) or name
+        if storage_name in cache_snapshot:
+            return storage_name, cache_snapshot[storage_name]
+        if name in cache_snapshot:
+            return name, cache_snapshot[name]
+        return storage_name, None
+
+    cache_keys = {}
+    cache_rows = {}
+
     # Players with at least one upcoming match whose date is <= today.
     # Those rows should now have a completed result on tennisabstract,
     # so force a re-scrape regardless of fingerprint state.  This catches
@@ -894,7 +906,9 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
             stale_reasons[name] = "no_db"
             continue
 
-        cache_row = cache_snapshot.get(name)
+        cache_key, cache_row = _scrape_cache_lookup(name)
+        cache_keys[name] = cache_key
+        cache_rows[name] = cache_row
         # Trigger re-scrape whenever a local upcoming placeholder is due.
         # Confirmation is handled after the HTTP scrape by comparing the
         # completed-match signature; unconfirmed scrapes are not imported,
@@ -920,7 +934,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                     fingerprints[name] = fp
                     logger.debug("Skipping %s (%s)", name, status)
                     continue
-                if _retry_cooldown_active(cache_row, entry.get("rank")):
+                if _retry_cooldown_active(cache_row, rank_by_name.get(name)):
                     report["retry_cooldown"] += 1
                     logger.info(
                         "Skipping %s (retry cooldown until %s)",
@@ -960,7 +974,8 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
         if name not in stale:
             fp = fingerprints.get(name)
             if db is not None and fp is not None:
-                skipped_updates.append((fp, name))
+                cache_key = cache_keys.get(name) or (clean_player_name(name) or name)
+                skipped_updates.append((fp, cache_key))
             logger.info("Skipping %s (cache still valid)", name)
             report["skipped"] += 1
             continue
@@ -1036,15 +1051,16 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                 # negative-cache marker to avoid retry storms on players
                 # who simply have no tennisabstract presence.
                 non_empty = df is not None and not df.empty
-                had_cache = name in cache_snapshot
-                cache_row = cache_snapshot.get(name)
+                cache_key = cache_keys.get(name) or (clean_player_name(name) or name)
+                cache_row = cache_rows.get(name)
+                had_cache = cache_row is not None
                 needs_confirmed_activity = (
                     stale_reasons.get(name) in _CONFIRMED_ACTIVITY_REASONS)
                 baseline_signature = None
                 if (needs_confirmed_activity and had_cache
                         and (not cache_row or len(cache_row) < 4
                              or not cache_row[3])):
-                    baseline_signature = _db_match_signature(db, name, tour)
+                    baseline_signature = _db_match_signature(db, cache_key, tour)
                 compare_row = cache_row
                 if baseline_signature:
                     compare_row = (
@@ -1077,7 +1093,7 @@ def scrape_top_players_matches(top_n=50, tour="atp", progress_callback=None,
                 if db is not None:
                     try:
                         db.update_scrape_cache(
-                            name,
+                            cache_key,
                             len(df) if df is not None else 0,
                             last_match_date=last_match_date,
                             match_signature=(match_signature
