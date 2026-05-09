@@ -348,27 +348,29 @@ class GlobalStatsEngine:
         for event in event_rows:
             grouped[label_func(event)].append(event)
         for label, events in grouped.items():
-            best = current = 0
-            best_start = best_end = current_start = None
+            current = 0
+            current_start = current_end = None
+            player = label[0] if isinstance(label, tuple) else label
+            extra = label[1] if isinstance(label, tuple) and len(label) > 1 else ""
+
+            def _flush():
+                if current:
+                    first_year = self._date_year(current_start["tourney_date"] if current_start else "")
+                    last_year = self._date_year(current_end["tourney_date"] if current_end else "")
+                    detail_parts = [part for part in (extra, f"{first_year}-{last_year}") if part]
+                    results.append((player, current, " - ".join(detail_parts)))
+
             for event in events:
                 if success_func(event):
                     if current == 0:
                         current_start = event
                     current += 1
-                    if current > best:
-                        best = current
-                        best_start = current_start
-                        best_end = event
+                    current_end = event
                 else:
+                    _flush()
                     current = 0
-                    current_start = None
-            if best:
-                player = label[0] if isinstance(label, tuple) else label
-                extra = label[1] if isinstance(label, tuple) and len(label) > 1 else ""
-                first_year = self._date_year(best_start["tourney_date"] if best_start else "")
-                last_year = self._date_year(best_end["tourney_date"] if best_end else "")
-                detail_parts = [part for part in (extra, f"{first_year}-{last_year}") if part]
-                results.append((player, best, " - ".join(detail_parts)))
+                    current_start = current_end = None
+            _flush()
         return results
 
     def _win_streak(self, filters, limit, group_attr=None):
@@ -814,15 +816,20 @@ class GlobalStatsEngine:
     def _main_draw_age(self, filters, limit, direction):
         where, params = self._where(filters, include_round=False)
         rows = self._query(f"""
-            WITH ages AS (
+            WITH appearances AS (
                 SELECT winner_name AS player, winner_age AS age, tourney_name, tourney_date FROM matches m
                 WHERE {where} AND round NOT LIKE 'Q%' AND winner_age IS NOT NULL AND winner_name != ''
                 UNION ALL
                 SELECT loser_name AS player, loser_age AS age, tourney_name, tourney_date FROM matches m
                 WHERE {where} AND round NOT LIKE 'Q%' AND loser_age IS NOT NULL AND loser_name != ''
+            ),
+            dedup AS (
+                SELECT player, MIN(age) AS age, tourney_name, tourney_date
+                FROM appearances
+                GROUP BY player, tourney_name, tourney_date
             )
             SELECT player, age, tourney_name || ' ' || SUBSTR(tourney_date,1,4) AS detail
-            FROM ages
+            FROM dedup
             ORDER BY age {direction}, tourney_date ASC
             LIMIT ?
         """, params + params + [limit])
@@ -1020,16 +1027,21 @@ class GlobalStatsEngine:
             tour_name = key[0]
             indexes = date_index.get(tour_name, {})
             next_dates = next_date.get(tour_name, {})
-            best_weeks = current_weeks = 0
-            best_start = best_end = start = current_end = prev = None
+            current_weeks = 0
+            start = current_end = prev = None
+            player_name = names_by_key.get(key, key[1])
+
+            def _flush():
+                if current_weeks:
+                    s = start.strftime("%Y-%m-%d") if start else ""
+                    e = current_end.strftime("%Y-%m-%d") if current_end else ""
+                    results.append((player_name, current_weeks, f"{s} to {e}"))
+
             for date in dates:
                 current_index = indexes.get(date)
                 previous_index = indexes.get(prev) if prev is not None else None
                 if prev is None or current_index is None or previous_index is None or current_index != previous_index + 1:
-                    if current_weeks > best_weeks:
-                        best_weeks = current_weeks
-                        best_start = start
-                        best_end = current_end
+                    _flush()
                     current_weeks = 0
                     start = date
 
@@ -1039,14 +1051,8 @@ class GlobalStatsEngine:
                 current_end = coverage_end - timedelta(days=1)
                 prev = date
 
-            if current_weeks > best_weeks:
-                best_weeks = current_weeks
-                best_start = start
-                best_end = current_end
-            if best_weeks:
-                start_text = best_start.strftime("%Y-%m-%d") if best_start else ""
-                end_text = best_end.strftime("%Y-%m-%d") if best_end else ""
-                results.append((names_by_key.get(key, key[1]), best_weeks, f"{start_text} to {end_text}"))
+            _flush()
+
         return sorted(results, key=lambda r: (-r[1], r[0]))[:limit]
 
     # ------------------------------------------------------------------
@@ -1207,6 +1213,60 @@ class GlobalStatsEngine:
 
     def _stat_win_streak_by_surface(self, filters, limit):
         return self._win_streak(filters, limit, group_attr="surface")
+
+    def _stat_loss_streak_overall(self, filters, limit):
+        """Longest consecutive loss streak across all matches."""
+        where, params = self._where(filters)
+        rows = self._query(f"""
+            WITH player_matches AS (
+                SELECT winner_name AS player, 1 AS won, tourney_date,
+                       tourney_name, tourney_level, surface, round
+                FROM matches m
+                WHERE {where} AND winner_name IS NOT NULL AND winner_name != ''
+                UNION ALL
+                SELECT loser_name AS player, 0 AS won, tourney_date,
+                       tourney_name, tourney_level, surface, round
+                FROM matches m
+                WHERE {where} AND loser_name IS NOT NULL AND loser_name != ''
+            )
+            SELECT player, won, tourney_date, tourney_name
+            FROM player_matches
+            ORDER BY player, tourney_date, tourney_name,
+                     CASE round
+                         WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3
+                         WHEN 'R128' THEN 4 WHEN 'R64' THEN 5 WHEN 'R32' THEN 6
+                         WHEN 'R16' THEN 7 WHEN 'QF' THEN 8 WHEN 'SF' THEN 9
+                         WHEN 'F' THEN 10 ELSE 11 END
+        """, params + params)
+
+        full_results = []
+        by_player = defaultdict(list)
+        for row in rows:
+            by_player[row["player"]].append(row)
+
+        for player, matches in by_player.items():
+            current = 0
+            current_start = current_end = None
+            for match in matches:
+                if not match["won"]:
+                    if current == 0:
+                        current_start = match
+                    current += 1
+                    current_end = match
+                else:
+                    if current > 0:
+                        first_year = self._date_year(current_start["tourney_date"] if current_start else "")
+                        last_year = self._date_year(current_end["tourney_date"] if current_end else "")
+                        full_results.append((player, current, f"{first_year}-{last_year}"))
+                    current = 0
+                    current_start = current_end = None
+            if current > 0:
+                first_year = self._date_year(current_start["tourney_date"] if current_start else "")
+                last_year = self._date_year(current_end["tourney_date"] if current_end else "")
+                full_results.append((player, current, f"{first_year}-{last_year}"))
+
+        full_results.sort(key=lambda r: (-r[1], r[0]))
+        return full_results[:limit]
 
     def get_streak_matches(self, player, start_date, end_date, filters,
                            group_attr=None, group_value=None):

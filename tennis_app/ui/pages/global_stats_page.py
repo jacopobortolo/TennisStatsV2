@@ -9,7 +9,7 @@ registry first; individual rows can later be wired to concrete SQL queries.
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
     QListWidget, QListWidgetItem, QSplitter, QFrame, QPushButton,
-    QSizePolicy, QDialog, QDialogButtonBox, QScrollArea,
+    QSizePolicy, QDialog, QDialogButtonBox, QScrollArea, QLineEdit,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QColor
@@ -36,7 +36,7 @@ class _GlobalStatWorker(QThread):
     def run(self):
         try:
             result = GlobalStatsEngine(self._db).compute(
-                self._stat_id, self._filters, limit=50)
+                self._stat_id, self._filters, limit=500)
             self.data_ready.emit(self._stat_id, self._request_id, result)
         except Exception as exc:
             self.error.emit(self._stat_id, self._request_id, str(exc))
@@ -131,6 +131,10 @@ STAT_CATALOG = [
           "Serie piu lunga di vittorie consecutive su una superficie.",
           "player, surface, tournament_level, season, era",
           "apply surface filter before streak calculation"),
+    _stat("loss_streak_overall", "Longest loss streak", "streaks", "all_time",
+          "Striscia piu lunga di sconfitte consecutive in partite ATP/WTA.",
+          "player, tournament_level, surface, season, era",
+          "order matches by date; increment streak on loss, reset on win"),
     _stat("set_streak", "Longest set streak", "streaks", "all_time",
           "Serie piu lunga di set vinti consecutivi nelle partite del giocatore.",
           "player, tournament_level, surface, season, era",
@@ -382,6 +386,8 @@ class GlobalStatsPage(QWidget):
         self._current_stat = None
         self._worker = None
         self._streak_meta = []
+        self._all_rows = []
+        self._current_page = 1
         self._request_id = 0
         self._compute_timer = QTimer(self)
         self._compute_timer.setSingleShot(True)
@@ -429,6 +435,19 @@ class GlobalStatsPage(QWidget):
         self.category_pills = PillButtonGroup(list(CATEGORY_GROUPS.keys()), "All")
         self.category_pills.changed.connect(self._on_category_changed)
         category_row.addWidget(self.category_pills, 1)
+
+        category_row.addWidget(self._label("Player"))
+        self.player_filter_edit = QLineEdit()
+        self.player_filter_edit.setPlaceholderText("Filter by player…")
+        self.player_filter_edit.setFixedWidth(180)
+        self.player_filter_edit.setStyleSheet(
+            f"background-color: {COLORS['bg_card']};"
+            f" color: {COLORS['text']};"
+            f" border: 1px solid {COLORS['border']};"
+            f" border-radius: 4px; padding: 4px 8px;"
+        )
+        self.player_filter_edit.textChanged.connect(self._apply_player_filter)
+        category_row.addWidget(self.player_filter_edit)
         root.addLayout(category_row)
 
         filters = QFrame()
@@ -551,6 +570,29 @@ class GlobalStatsPage(QWidget):
         self.result_table.verticalHeader().setDefaultSectionSize(34)
         self.result_table.doubleClicked.connect(self._on_leaderboard_double_clicked)
         root.addWidget(self.result_table, 1)
+
+        # --- Pagination row ---
+        page_row = QHBoxLayout()
+        page_row.setSpacing(8)
+        self.prev_btn = QPushButton("◀ Prev")
+        self.prev_btn.setObjectName("accentBtn")
+        self.prev_btn.setCursor(Qt.PointingHandCursor)
+        self.prev_btn.clicked.connect(self._prev_page)
+        self.prev_btn.setEnabled(False)
+        page_row.addWidget(self.prev_btn)
+
+        self.page_label = QLabel("")
+        self.page_label.setObjectName("dimLabel")
+        page_row.addWidget(self.page_label)
+
+        self.next_btn = QPushButton("Next ▶")
+        self.next_btn.setObjectName("accentBtn")
+        self.next_btn.setCursor(Qt.PointingHandCursor)
+        self.next_btn.clicked.connect(self._next_page)
+        self.next_btn.setEnabled(False)
+        page_row.addWidget(self.next_btn)
+        page_row.addStretch()
+        root.addLayout(page_row)
 
     def _page_stylesheet(self):
         return f"""
@@ -727,6 +769,12 @@ class GlobalStatsPage(QWidget):
         self.result_status.setText("Computing...")
         self.result_table.populate([])
         self._streak_meta = []
+        self._streak_meta_filtered = []
+        self._all_rows = []
+        self._current_page = 1
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
+        self.page_label.setText("")
         worker = _GlobalStatWorker(
             self.db, stat_id, self._current_filters(),
             request_id=self._request_id, parent=self)
@@ -744,7 +792,8 @@ class GlobalStatsPage(QWidget):
             self.load_btn.setEnabled(True)
         rows = result.get("rows") or []
         self._streak_meta = result.get("streaks_meta") or []
-        self.result_table.populate(rows)
+        self._all_rows = rows
+        self._apply_player_filter()
         note = result.get("note") or ""
         if note:
             self.result_status.setText(note)
@@ -753,11 +802,67 @@ class GlobalStatsPage(QWidget):
         else:
             self.result_status.setText("No results")
 
+    _PAGE_SIZE = 50
+
+    def _apply_player_filter(self):
+        """Filter the loaded leaderboard rows by player name (column 1) and show current page."""
+        query = self.player_filter_edit.text().strip().lower()
+        meta_src = self._streak_meta if self._streak_meta else [None] * len(self._all_rows)
+        if query:
+            pairs = [(r, m) for r, m in zip(self._all_rows, meta_src) if query in r[1].lower()]
+        else:
+            pairs = list(zip(self._all_rows, meta_src))
+        filtered_rows = [p[0] for p in pairs]
+        self._streak_meta_filtered = [p[1] for p in pairs]
+
+        total = len(filtered_rows)
+        total_pages = max(1, (total + self._PAGE_SIZE - 1) // self._PAGE_SIZE)
+        self._current_page = max(1, min(self._current_page, total_pages))
+
+        start = (self._current_page - 1) * self._PAGE_SIZE
+        page_rows = filtered_rows[start:start + self._PAGE_SIZE]
+
+        # Re-rank with absolute rank number (not resetting per page)
+        reranked = []
+        for i, r in enumerate(page_rows, start + 1):
+            reranked.append([str(i)] + list(r[1:]))
+        self.result_table.populate(reranked)
+
+        self.prev_btn.setEnabled(self._current_page > 1)
+        self.next_btn.setEnabled(self._current_page < total_pages)
+        if total_pages > 1:
+            self.page_label.setText(f"Page {self._current_page} of {total_pages}")
+        else:
+            self.page_label.setText("")
+
+        suffix = f" (filtered from {len(self._all_rows)})" if query else ""
+        self.result_status.setText(f"{total} rows{suffix}")
+
+    def _prev_page(self):
+        if self._current_page > 1:
+            self._current_page -= 1
+            self._apply_player_filter()
+
+    def _next_page(self):
+        query = self.player_filter_edit.text().strip().lower()
+        meta_src = self._streak_meta if self._streak_meta else [None] * len(self._all_rows)
+        if query:
+            total = sum(1 for r in self._all_rows if query in r[1].lower())
+        else:
+            total = len(self._all_rows)
+        total_pages = max(1, (total + self._PAGE_SIZE - 1) // self._PAGE_SIZE)
+        if self._current_page < total_pages:
+            self._current_page += 1
+            self._apply_player_filter()
+
     def _on_leaderboard_double_clicked(self, index):
         row = index.row()
-        if not self._streak_meta or row >= len(self._streak_meta):
+        # Map visible row to absolute index in the filtered list (accounting for pagination)
+        abs_row = (self._current_page - 1) * self._PAGE_SIZE + row
+        meta_list = self._streak_meta_filtered if hasattr(self, "_streak_meta_filtered") and self._streak_meta_filtered else self._streak_meta
+        if not meta_list or abs_row >= len(meta_list):
             return
-        meta = self._streak_meta[row]
+        meta = meta_list[abs_row]
         player = meta["player"]
         value_item = self.result_table.item(row, 2)
         streak_len = value_item.text() if value_item else ""
@@ -865,9 +970,13 @@ class _SetStreakDetailDialog(QDialog):
                     sets_display = "  ".join(set_parts)
 
                 result_tag = "W" if won else "L"
+                breaks_str = (
+                    f"  [{breaks_conceded} break{'s' if breaks_conceded > 1 else ''} subito]"
+                    if breaks_conceded and won else ""
+                )
                 parts = [tourney, rnd, f"vs {opponent}" if opponent else "",
                          sets_display or score_str]
-                line_text = f"{i}.  {date}  [{result_tag}]  —  {',  '.join(p for p in parts if p)}"
+                line_text = f"{i}.  {date}  [{result_tag}]  —  {',  '.join(p for p in parts if p)}{breaks_str}"
 
                 lbl = QLabel(line_text)
                 if not won:
@@ -919,12 +1028,12 @@ class _SetStreakDetailDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class _WinStreakDetailDialog(QDialog):
-    """Shows the chronological list of wins in a win streak."""
+    """Shows the chronological list of wins in a win streak with per-set markers."""
 
     def __init__(self, title: str, matches: list[dict], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Win Streak Detail")
-        self.resize(680, 460)
+        self.resize(720, 480)
         self.setModal(True)
 
         layout = QVBoxLayout(self)
@@ -938,7 +1047,6 @@ class _WinStreakDetailDialog(QDialog):
         )
         layout.addWidget(hdr)
 
-        # Scrollable list of match lines
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -950,36 +1058,57 @@ class _WinStreakDetailDialog(QDialog):
         inner.setStyleSheet(f"background-color: {COLORS['bg_card']};")
 
         if matches:
+            from ...core.stats_engine import parse_score as _ps
             for i, m in enumerate(matches, start=1):
                 tourney = m.get("tourney_name") or ""
                 rnd = m.get("round") or ""
                 opponent = m.get("opponent") or ""
-                score = m.get("score") or ""
+                score_str = m.get("score") or ""
                 date = str(m.get("tourney_date") or "")[:10]
                 breaks_conceded = int(m.get("breaks_conceded") or 0)
 
-                parts = [tourney]
-                if rnd:
-                    parts.append(rnd)
-                if opponent:
-                    parts.append(f"vs {opponent}")
-                if score:
-                    parts.append(score)
-                if breaks_conceded:
-                    parts.append(f"[{breaks_conceded} break{'s' if breaks_conceded > 1 else ''} subito]")
+                # Parse sets — all matches here are wins (won=True)
+                parsed = _ps(score_str)
+                sets_display = ""
+                if parsed:
+                    set_parts = []
+                    sets_lost_count = 0
+                    for w_g, l_g, tb in parsed["set_scores"]:
+                        player_won_set = w_g > l_g   # always winner perspective
+                        if not player_won_set:
+                            sets_lost_count += 1
+                        pg, og = w_g, l_g
+                        tb_str = f"({tb})" if tb is not None else ""
+                        marker = "✓" if player_won_set else "✗"
+                        set_parts.append(f"{marker}{pg}-{og}{tb_str}")
+                    sets_display = "  ".join(set_parts)
+                else:
+                    sets_lost_count = 0
 
-                line_text = f"{i}.  {date}  —  {', '.join(parts)}"
+                breaks_str = (
+                    f"  [{breaks_conceded} break{'s' if breaks_conceded > 1 else ''} subito]"
+                    if breaks_conceded else ""
+                )
+                parts = [tourney, rnd, f"vs {opponent}" if opponent else "",
+                         sets_display or score_str]
+                line_text = (
+                    f"{i}.  {date}  —  "
+                    f"{',  '.join(p for p in parts if p)}{breaks_str}"
+                )
+
                 lbl = QLabel(line_text)
-                if breaks_conceded:
+                if sets_lost_count:
                     text_color = "#e05555"
                     bg_color = "#3a1a1a" if i % 2 else "#331515"
+                elif breaks_conceded:
+                    text_color = "#e09055"
+                    bg_color = "transparent" if i % 2 else COLORS.get("bg_secondary", COLORS["bg_card"])
                 else:
-                    text_color = COLORS['text']
-                    bg_color = "transparent" if i % 2 else COLORS.get('bg_secondary', COLORS['bg_card'])
+                    text_color = COLORS["text"]
+                    bg_color = "transparent" if i % 2 else COLORS.get("bg_secondary", COLORS["bg_card"])
                 lbl.setStyleSheet(
                     f"color: {text_color}; font-size: 9pt;"
-                    f" padding: 4px 8px;"
-                    f" background-color: {bg_color};"
+                    f" padding: 4px 8px; background-color: {bg_color};"
                 )
                 lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
                 inner_layout.addWidget(lbl)
@@ -992,9 +1121,9 @@ class _WinStreakDetailDialog(QDialog):
         scroll.setWidget(inner)
         layout.addWidget(scroll, 1)
 
-        count_lbl = QLabel(f"{len(matches)} matches")
-        count_lbl.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 9pt;")
-        layout.addWidget(count_lbl)
+        legend = QLabel("✓ set vinto · ✗ set perso (rosso) · arancione = break subiti (senza set persi)")
+        legend.setStyleSheet(f"color: {COLORS['text_dim']}; font-size: 8pt;")
+        layout.addWidget(legend)
 
         btns = QDialogButtonBox(QDialogButtonBox.Close)
         btns.rejected.connect(self.reject)
