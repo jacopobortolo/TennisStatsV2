@@ -942,6 +942,30 @@ class GlobalStatsEngine:
         """, params + [limit])
         return [(r["player"], r["value"], r["detail"] or "") for r in rows]
 
+    def _stat_lowest_ranked_win_vs_top5(self, filters, limit):
+        return self._lowest_ranked_win_vs_rank(filters, limit, 5)
+
+    def _stat_lowest_ranked_win_vs_top10(self, filters, limit):
+        return self._lowest_ranked_win_vs_rank(filters, limit, 10)
+
+    def _lowest_ranked_win_vs_rank(self, filters, limit, rank_limit):
+        where, params = self._where(filters)
+        rows = self._query(f"""
+            SELECT winner_name AS player,
+                   CAST(winner_rank AS INTEGER) AS value,
+                   loser_name || ' (#' || CAST(loser_rank AS INTEGER) || ') - '
+                       || tourney_name || ' ' || SUBSTR(tourney_date,1,4) AS detail
+            FROM matches m
+            WHERE {where}
+              AND winner_name != '' AND loser_name != ''
+              AND winner_rank IS NOT NULL AND loser_rank IS NOT NULL
+              AND CAST(winner_rank AS INTEGER) > ?
+              AND CAST(loser_rank AS INTEGER) <= ?
+            ORDER BY value DESC, tourney_date DESC
+            LIMIT ?
+        """, params + [rank_limit, rank_limit, limit])
+        return [(r["player"], f"#{int(r['value'])}", r["detail"] or "") for r in rows]
+
     def _stat_streak_weeks_at_no1(self, filters, limit):
         return self._ranking_streak(filters, limit, 1)
 
