@@ -807,13 +807,18 @@ class GlobalStatsPage(QWidget):
     def _apply_player_filter(self):
         """Filter the loaded leaderboard rows by player name (column 1) and show current page."""
         query = self.player_filter_edit.text().strip().lower()
-        meta_src = self._streak_meta if self._streak_meta else [None] * len(self._all_rows)
         if query:
-            pairs = [(r, m) for r, m in zip(self._all_rows, meta_src) if query in r[1].lower()]
+            indexed_rows = [
+                (i, r) for i, r in enumerate(self._all_rows)
+                if query in r[1].lower()
+            ]
         else:
-            pairs = list(zip(self._all_rows, meta_src))
-        filtered_rows = [p[0] for p in pairs]
-        self._streak_meta_filtered = [p[1] for p in pairs]
+            indexed_rows = list(enumerate(self._all_rows))
+        filtered_rows = [r for _, r in indexed_rows]
+        self._streak_meta_filtered = [
+            self._streak_meta[i] if i < len(self._streak_meta) else None
+            for i, _ in indexed_rows
+        ]
 
         total = len(filtered_rows)
         total_pages = max(1, (total + self._PAGE_SIZE - 1) // self._PAGE_SIZE)
@@ -845,7 +850,6 @@ class GlobalStatsPage(QWidget):
 
     def _next_page(self):
         query = self.player_filter_edit.text().strip().lower()
-        meta_src = self._streak_meta if self._streak_meta else [None] * len(self._all_rows)
         if query:
             total = sum(1 for r in self._all_rows if query in r[1].lower())
         else:
@@ -863,6 +867,8 @@ class GlobalStatsPage(QWidget):
         if not meta_list or abs_row >= len(meta_list):
             return
         meta = meta_list[abs_row]
+        if not isinstance(meta, dict):
+            return
         player = meta["player"]
         value_item = self.result_table.item(row, 2)
         streak_len = value_item.text() if value_item else ""
