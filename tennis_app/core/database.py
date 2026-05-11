@@ -1918,11 +1918,21 @@ class TennisDatabase:
                 level_params = list(tourney_levels)
 
         round_clause = ""
+        projected_round_clause = ""
         round_params: list = []
+        projected_round_params: list = []
         if rounds:
             placeholders = ",".join("?" * len(rounds))
             round_clause = f"AND round IN ({placeholders})"
             round_params = list(rounds)
+            projected_round_clause = f"""
+                  AND (CASE m.round
+                         WHEN 'R128' THEN 'R64'  WHEN 'R64' THEN 'R32'
+                         WHEN 'R32'  THEN 'R16'  WHEN 'R16' THEN 'QF'
+                         WHEN 'QF'   THEN 'SF'   WHEN 'SF'  THEN 'F'
+                       END) IN ({placeholders})
+            """
+            projected_round_params = list(rounds)
 
         ioc_winner = (
             "(winner_ioc = ?"
@@ -1985,6 +1995,7 @@ class TennisDatabase:
                   AND (m.is_upcoming = 0 OR m.is_upcoming IS NULL)
                   AND {ioc_winner_m}
                   {level_clause_m}
+                  {projected_round_clause}
                   AND NOT EXISTS (
                       SELECT 1 FROM matches nx
                       WHERE nx.tour = m.tour
@@ -2023,7 +2034,7 @@ class TennisDatabase:
         params = (
             [tour, year_from, year_to, ioc, ioc, tour] + level_params + round_params
             + [tour, year_from, year_to, ioc, ioc, tour] + level_params + round_params
-            + [tour, year_from, year_to, ioc, ioc, tour] + level_params
+            + [tour, year_from, year_to, ioc, ioc, tour] + level_params + projected_round_params
             + [min_count]
         )
         cur = self.conn.execute(sql, params)
